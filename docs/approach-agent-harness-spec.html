@@ -153,7 +153,7 @@
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.3</span></div>
+  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.4</span></div>
   <h1 class="title">Wrapping Claude Code into a persistent agent — <span class="call">APPROACH</span></h1>
   <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — with its own thin channel adapters, running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the part that is real work.</p>
   <div class="meta">
@@ -276,7 +276,7 @@ flowchart TB
   subgraph MEM["④ Memory & tasks · build"]
     direction LR
     MM["MEMORY.md<br/>facts"]:::mem
-    DL["daily logs"]:::mem
+    DL["log_entries<br/>(daily .md renders)"]:::mem
     FTS["FTS5 index"]:::mem
     BD["beads task graph<br/>bd · git JSONL"]:::mem
   end
@@ -319,10 +319,10 @@ flowchart TB
       <tr><td><span class="cid">C2</span></td><td><b>Reasoning engine</b></td><td><code>claude -p --output-format stream-json</code>; full tool loop per turn.</td><td><span class="tag have">Have</span></td><td><span class="eff s">P0</span></td></tr>
       <tr><td><span class="cid">C3</span></td><td><b>Skill library</b></td><td><code>.claude/skills/*/SKILL.md</code>; portable across harnesses.</td><td><span class="tag have">Have</span></td><td><span class="eff s">P0</span></td></tr>
       <tr><td><span class="cid">C4</span></td><td><b>Session router + store</b></td><td>SQLite <code>thread_key → session_id</code> with a per-channel key contract (§6). Resolve, then <code>--resume</code>; new thread → daemon <b>pre-generates the UUID</b> and spawns with <code>--session-id</code> (never captured from output), inserting <code>creating</code> under a partial unique index — one live session per thread is a schema constraint, not a convention (§4.1, §6). Rotation on <code>/new</code>, idle TTL, or turn cap — one transaction, rotated rows kept; fresh session is seeded by C6. Resume failure auto-rotates with a note (§4.6).</td><td><span class="tag build">Build</span></td><td><span class="eff m">S–M</span></td></tr>
-      <tr><td><span class="cid">C5</span></td><td><b>Scheduler / heartbeat</b></td><td><code>systemd</code> timers poke the daemon socket — heartbeat is just another event kind, with a manufactured identity: <code>(schedule_id, occurrence_time)</code> is its dedup key, and misfires coalesce-with-staleness-flag after downtime (§4.2). Fresh session per fire (never <code>--resume</code>); silence = no <code>notify</code> tool call, not a sentinel string. <code>schedules</code> table for NL-cron; <code>notifications</code> ledger stops re-nagging (§4.2, §6).</td><td><span class="tag build">Build</span></td><td><span class="eff m">S–M</span></td></tr>
-      <tr><td><span class="cid">C6</span></td><td><b>Context assembler</b></td><td>Injected via <code>UserPromptSubmit</code> hook (pinned — not prompt prefix). Full fact package only on session start/rotation; per-turn injects the <em>retrieval delta</em> — facts matching this input not already in-session.</td><td><span class="tag build">Build</span></td><td><span class="eff l">M–L</span></td></tr>
-      <tr><td><span class="cid">C7</span></td><td><b>Curated memory store</b></td><td>SQLite <code>facts</code> table is the source of truth (provenance, supersession, decay — §6); <code>MEMORY.md</code> is a rendered, git-committed view. Daily logs append-only; <b>FTS5</b> over facts + logs.</td><td><span class="tag partial">Partial</span></td><td><span class="eff l">M–L</span></td></tr>
-      <tr><td><span class="cid">C8</span></td><td><b>Reflection / learning loop</b></td><td><code>Stop</code>/<code>SessionEnd</code> hook or nightly nudge → reflector run: extract facts, synthesize skills, compact logs. Review gate = Codex critique (C12) + human approve.</td><td><span class="tag build">Build</span></td><td><span class="eff xl">L–XL</span></td></tr>
+      <tr><td><span class="cid">C5</span></td><td><b>Scheduler / heartbeat</b></td><td><code>systemd</code> timers poke the daemon socket — heartbeat is just another event kind (<code>trust=system</code>, daemon-stamped), with a manufactured identity: <code>(schedule_id, occurrence_time)</code> is its dedup key; misfires coalesce-with-staleness-flag, live overlap skips-and-records (§4.2). Fresh session per fire (never <code>--resume</code>); silence = no <code>notify</code> tool call, not a sentinel string. <code>schedules</code> table (IANA tz, DST-aware) for NL-cron; <code>notifications</code> ledger keyed <code>(item, target)</code> stops re-nagging (§4.2, §6).</td><td><span class="tag build">Build</span></td><td><span class="eff m">S–M</span></td></tr>
+      <tr><td><span class="cid">C6</span></td><td><b>Context assembler</b></td><td>Injected via <code>UserPromptSubmit</code> hook (pinned — not prompt prefix). Full fact package only on session start/rotation; per-turn injects the <em>retrieval delta</em> — facts matching this input not already in the <code>session_facts</code> ledger (§4.3, §6), under a top-k/token budget.</td><td><span class="tag build">Build</span></td><td><span class="eff l">M–L</span></td></tr>
+      <tr><td><span class="cid">C7</span></td><td><b>Curated memory store</b></td><td>SQLite is the source of truth twice over: <code>facts</code> (+ <code>fact_sources</code>, confidence, supersession — §6) rendered to <code>MEMORY.md</code>, and append-only <code>log_entries</code> rendered to daily <code>.md</code> files. <b>FTS5</b> ×2 (external-content, trigger-synced, <code>approach reindex</code> rebuilds).</td><td><span class="tag partial">Partial</span></td><td><span class="eff l">M–L</span></td></tr>
+      <tr><td><span class="cid">C8</span></td><td><b>Reflection / learning loop</b></td><td>Durable <code>reflection_jobs</code> (lease + watermark — §5, §6); nightly sweep is the guarantee, <code>Stop</code>/<code>SessionEnd</code> enqueues are freshness only. Extract facts (F1), compact logs (F3); skill synthesis (F2) deferred (§10). Review gate when F2 lands = Codex critique (C12) + human approve.</td><td><span class="tag build">Build</span></td><td><span class="eff xl">L–XL</span></td></tr>
       <tr><td><span class="cid">C9</span></td><td><b>Policy gate</b></td><td><code>PreToolUse</code> hooks answering from the policy matrix (§7), including the taint column-shift. Gated verbs use the deny-and-resume approval flow (§4.4): durable <code>pending_approvals</code> rows bound to a canonical argument digest, 1h expiry, owner-surface authorization, atomic match-and-consume.</td><td><span class="tag partial">Partial</span></td><td><span class="eff m">M</span></td></tr>
       <tr><td><span class="cid">C10</span></td><td><b>Sandbox</b></td><td>Container backend for <b>all Bash, every trust level</b> (§7): pinned image, non-root, read-only root, cwd-only mount, zero credentials, caps dropped, no Docker socket, resource limits; egress per session class (assistant: none · workers: read-only dependency allowlist). Host reachable only via always-ask <code>host_exec</code>.</td><td><span class="tag build">Build</span></td><td><span class="eff m">M</span></td></tr>
       <tr><td><span class="cid">C11</span></td><td><b>Observability</b></td><td><code>turns</code> table populated from <code>stream-json</code> result events: model, tokens, cost, tool calls, duration, outcome. Feeds the cost alarm (§7), the token-bloat check (§4.3), and P4 tuning data.</td><td><span class="tag build">Build</span></td><td><span class="eff s">S</span></td></tr>
@@ -372,13 +372,13 @@ sequenceDiagram
   B->>U: message
   B-->>R: send ack
   R->>S: event → replied
-  Note over C,S: Stop hook appends turn to daily log (async)
+  Note over C,S: Stop hook appends log_entries row (async) · daily .md re-rendered
     </pre>
     <figcaption><b>Fig 2.</b> Inbound turn. Durability = step 3 (persist before anything); persistence = resolve + <code>--resume</code>; safety = the <code>PreToolUse</code> loop; delivery = <code>completed → replied</code> only on bridge ack (at-least-once); accretion = the async note. Failure at any step recovers per §4.6.</figcaption>
   </figure>
 
   <h3>4.2 &nbsp;Heartbeat (proactivity)</h3>
-  <p>A timer, not a message, drives this. The agent reads a checklist and exercises <em>judgment on a schedule</em>; a no-op result is swallowed so silence is the default. Run it on a cheap model (Haiku) to keep idle cost near zero. Three protocol decisions: heartbeats run in a <b>fresh session every fire</b> (a persistent heartbeat session accumulates cruft and cost); "something to say" is expressed as a <b><code>notify</code> tool call, never a sentinel string parsed out of free text</b> — no tool call means silence; and the prompt reads/writes a <code>notifications</code> ledger (<code>item_key, notified_at, snooze_until</code>) so a 30-minute timer doesn't re-nag the same deadline 16 times a day. NL-cron ("brief me at 8am") is a <code>schedules</code> row the agent inserts via a skill — the scheduler fires rows, not just <code>HEARTBEAT.md</code>. Every fire has a manufactured identity — <code>(schedule_id, occurrence_time)</code> is the event's idempotency key — and misfires <b>coalesce with a staleness flag</b>: after downtime, at most one catch-up event fires per schedule, keyed to the newest missed occurrence and carrying <code>missed_count</code> + lateness so the <em>model</em> judges whether a 3-hour-late brief still ships; older occurrences are recorded as skipped, never enqueued. One standing checklist item: <code>bd ready</code> — unblocked task-graph work is surfaced (or picked up, §4.5) through the same judgment-on-a-schedule loop. The heartbeat is the <em>only</em> component that asks beads what's ready; beads never initiates.</p>
+  <p>A timer, not a message, drives this. The agent reads a checklist and exercises <em>judgment on a schedule</em>; a no-op result is swallowed so silence is the default. Run it on a cheap model (Haiku) to keep idle cost near zero. Three protocol decisions: heartbeats run in a <b>fresh session every fire</b> (a persistent heartbeat session accumulates cruft and cost); "something to say" is expressed as a <b><code>notify</code> tool call, never a sentinel string parsed out of free text</b> — no tool call means silence; and the prompt reads/writes a <code>notifications</code> ledger (<code>item_key, notified_at, snooze_until</code>) so a 30-minute timer doesn't re-nag the same deadline 16 times a day. NL-cron ("brief me at 8am") is a <code>schedules</code> row the agent inserts via a skill — the scheduler fires rows, not just <code>HEARTBEAT.md</code>. Every fire has a manufactured identity — <code>(schedule_id, occurrence_time)</code> is the event's idempotency key — and misfires <b>coalesce with a staleness flag</b>: after downtime, at most one catch-up event fires per schedule, keyed to the newest missed occurrence and carrying <code>missed_count</code> + lateness so the <em>model</em> judges whether a 3-hour-late brief still ships; older occurrences are recorded as skipped, never enqueued. Three more contract points. <b>Trust:</b> system-generated events (heartbeat, cron, reflection triggers) carry <code>trust=system</code> — stampable only by the daemon itself, never by an adapter; it reads like owner for reads, notify, and task-graph operations, but can never satisfy an approval, and its sends are restricted to configured targets. <b>Time:</b> each schedule stores an IANA timezone; cron expressions are DST-aware local wall-clock (a nonexistent 2:30am fires at the next valid instant; a repeated one fires once), and occurrences are recorded UTC + zone. <b>Overlap:</b> <code>max_overlap = 1</code> by default — an occurrence due while the previous fire's session still runs is recorded as a skipped event row, never enqueued; fires and skips alike are event rows, so the per-fire audit trail is the <code>events</code> table itself, and a chronically-skipping schedule shows up in the digest as a tuning signal. One standing checklist item: <code>bd ready</code> — unblocked task-graph work is surfaced (or picked up, §4.5) through the same judgment-on-a-schedule loop. The heartbeat is the <em>only</em> component that asks beads what's ready; beads never initiates.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
@@ -403,15 +403,15 @@ sequenceDiagram
   </figure>
 
   <h3>4.3 &nbsp;Context assembly</h3>
-  <p>What actually goes into each turn. Keep it lean: the model gets a <em>skills list</em> (names + descriptions, not bodies) and only the facts that retrieve against the current input — this is where a black-box harness quietly bloats your token bill. Mechanism is pinned: the <code>UserPromptSubmit</code> hook, not a prompt prefix. And because <code>--resume</code> already carries the session's history, the full fact package is injected <b>only on session start/rotation</b>; per-turn injection is the <em>retrieval delta</em> — facts matching this input that aren't already in-session. Re-paying the whole fact block every turn is exactly the bloat this figure warns about.</p>
+  <p>What actually goes into each turn. Keep it lean: the model gets a <em>skills list</em> (names + descriptions, not bodies) and only the facts that retrieve against the current input — this is where a black-box harness quietly bloats your token bill. Mechanism is pinned: the <code>UserPromptSubmit</code> hook, not a prompt prefix. And because <code>--resume</code> already carries the session's history, the full fact package is injected <b>only on session start/rotation</b>; per-turn injection is the <em>retrieval delta</em> — facts matching this input that aren't already in-session. "Already in-session" is a ledger, not a guess: the assembler records every injected fact id in <code>session_facts</code> (§6), and each turn injects FTS hits minus that set — ranked by match score, confidence, and recency, capped by a top-k / token budget in <code>approach.toml</code> (start k=8). Re-paying the whole fact block every turn is exactly the bloat this figure warns about.</p>
   <figure>
     <pre class="mermaid">
 flowchart LR
-  IN["Incoming turn"]:::appr --> Q["FTS5 query over<br/>MEMORY.md + logs"]:::mem
+  IN["Incoming turn"]:::appr --> Q["FTS5 query<br/>mem_fts + log_fts"]:::mem
   BASE["CLAUDE.md base<br/>+ persona"]:::eng --> PKG
   Q --> SEL["Top-k relevant facts"]:::mem
   SEL --> PKG["Assembled<br/>context package"]:::appr
-  RECENT["Recent daily log"]:::mem --> PKG
+  RECENT["Recent log_entries"]:::mem --> PKG
   SKILLS["Skill list · names only"]:::eng --> PKG
   PKG --> CC["claude -p --resume"]:::eng
   classDef appr fill:#FBF1E1,stroke:#B07016,color:#3a2a10;
@@ -509,7 +509,8 @@ flowchart LR
     <li><b>Fact curation is lossy and adversarial to itself.</b> Naive "append what you learned" produces contradictory, duplicated, stale facts within days. You need dedup/merge, supersession ("X moved from A to B"), and decay — a small ontology problem, not a prompt. The <code>facts</code> table in §6 makes these row operations instead of markdown surgery, which is why SQLite (not <code>MEMORY.md</code>) holds the truth. <b>V1 posture:</b> the reflector auto-writes facts with provenance, confidence, and supersession links; decay is passive (stale facts rank down in retrieval, never auto-delete); a periodic owner-DM digest lists new/merged/superseded facts for one-tap pruning — human oversight without a blocking queue. Facts derived from trajectories containing untrusted content are stored immediately but <em>excluded from context assembly until acknowledged in a digest</em> — the trust split applied at read time (§7, §11).</li>
     <li><b>Skill synthesis needs a taste filter — which is why it's deferred.</b> Auto-generating a <code>SKILL.md</code> from one lucky run yields brittle, over-fit skills. The honest version watches for <em>repeated</em> success, drafts, and puts a review gate in front of anything that lands in the skill dir — an open-ended tuning project, deferred behind the evidence trigger in §10. The gate's cheap concrete mechanism, when it lands, is <b>cross-model critique</b>: Claude drafts the skill, <code>codex exec</code> (C12) attacks it with a different model lineage — de-correlated errors are exactly what a same-family self-review can't give you — and you approve. C12 ships at launch as an on-demand critic, so the mechanism is proven before F2 needs it.</li>
     <li><b>Retrieval quality caps everything.</b> Start with SQLite FTS5 — fast, transparent, no embedding infra. Add vectors only if lexical recall provably misses. Resist the urge to over-build here first.</li>
-    <li><b>Compaction is where memory rots silently.</b> Summarizing yesterday's logs discards detail you can't get back. Keep raw logs append-only; compact into <em>additional</em> rollups, never destructively.</li>
+    <li><b>Compaction is where memory rots silently.</b> Summarizing yesterday's logs discards detail you can't get back. <code>log_entries</code> rows are append-only; compaction writes <em>additional</em> rollup rows (rendered into <code>rollups/</code>), never destructively — the raw rows survive every summary pass.</li>
+    <li><b>Reflection is a job, not a hook side effect.</b> Every run is a <code>reflection_jobs</code> row (§6) under a single-holder lease with a durable watermark over <code>log_entries</code> + closed sessions. <b>The nightly sweep is the correctness guarantee</b> — it reflects everything from the last watermark to now, so nothing is ever missed; <code>Stop</code>/<code>SessionEnd</code> triggers are opportunistic freshness enqueues of the same job kinds, deduped by the unique <code>(kind, range)</code> key — nice when they run, harmless when the daemon dies (tonight's sweep covers it). A fact merge is one transaction: insert the merged fact, set <code>superseded_by</code> on the olds, copy <code>fact_sources</code> rows, append the digest entry — no partially-merged state is ever visible.</li>
   </ul>
   <div class="callout mem"><b>Decision hinge — resolved.</b> C4/C5/C6 are a weekend or two of plumbing over primitives you already have. Within C8, the open-ended part is F2 skill synthesis; F1 fact curation is bounded by the v1 posture above (auto-write + digest + append-only means curation errors are recoverable, not compounding). §10 records the decision: build F1/F3 now, defer F2 behind an evidence trigger, Hermes rejected.</div>
 </section>
@@ -532,11 +533,13 @@ flowchart LR
 │  └─ skills/&lt;name&gt;/SKILL.md
 ├─ memory/
 │  ├─ MEMORY.md           # RENDERED view of facts table — regenerate, don't hand-edit
-│  ├─ 2026-07-08.md       # append-only daily log
-│  └─ rollups/            # non-destructive compactions
+│  ├─ 2026-07-08.md       # RENDERED view of log_entries rows (§6) — same rule as MEMORY.md
+│  └─ rollups/            # non-destructive compactions (rows in log_entries, rendered here)
 ├─ .beads/                # task graph (C13): issues.jsonl (git-synced truth) + bd SQLite cache
 └─ state/
-   └─ approach.db         # SQLite: events · dead_letters · sessions · facts · approvals · notifications · schedules · turns · FTS5</pre>
+   └─ approach.db         # SQLite: events · dead_letters · sessions · facts · fact_sources ·
+                          #   log_entries · reflection_jobs · session_facts · approvals ·
+                          #   notifications · schedules · turns · mem_fts · log_fts</pre>
 
   <h3>Inbound event schema (C1 → C4 contract)</h3>
   <p>The daemon's channel-adapter layer (C1) normalizes every entry point — message, heartbeat, webhook, cron, approval — into one shape. The <code>trust</code> field is load-bearing: policy (§7) and sandbox routing key off it, and it is <b>assigned by the adapter from channel identity — code you own by construction (§10) — never inferred from content</b>.</p>
@@ -550,7 +553,9 @@ flowchart LR
                                            //   webhook → provider delivery id, else content hash
                                            //   heartbeat/cron → (schedule_id, occurrence_time)
   "sender": "brian",
-  "trust": "owner",                        // owner | known | untrusted — set by bridge, keys §7
+  "trust": "owner",                        // owner | known | untrusted | system — keys §7;
+                                           //   adapters may stamp the first three; system is
+                                           //   daemon-only (heartbeat/cron/reflection — §4.2)
   "kind": "message",                       // message | heartbeat | webhook | cron | approval
   "occurrence": null,                      // cron/heartbeat only: ISO occurrence_time +
                                            //   missed_count when coalescing a misfire (§4.2)
@@ -607,13 +612,44 @@ CREATE TABLE facts (                 -- SOURCE OF TRUTH; MEMORY.md is rendered f
   fact TEXT NOT NULL,
   provenance TEXT NOT NULL,          -- 'owner' | 'agent-reflection' | 'untrusted-derived'
                                      --   (untrusted-derived: excluded from assembly until digest-ack — §5)
-  source TEXT,                       -- thread_key or log ref it came from
+  confidence REAL DEFAULT 0.7,       -- reflector-assigned; decays passively via ranking, never deletes
   created INTEGER,
   superseded_by INTEGER REFERENCES facts(id),  -- non-destructive supersession
-  confirmed_count INTEGER DEFAULT 1, last_used INTEGER
+  confirmed_count INTEGER DEFAULT 1, -- cache; derived from fact_sources
+  last_used INTEGER
 );
--- lexical recall over facts + logs
-CREATE VIRTUAL TABLE mem_fts USING fts5(fact, source, ts UNINDEXED);
+CREATE TABLE fact_sources (          -- confirmations are ROWS, not an overwritten column
+  fact_id INTEGER NOT NULL REFERENCES facts(id),
+  source_ref TEXT NOT NULL,          -- thread_key, log_entries id, or event id it came from
+  trust TEXT NOT NULL,               -- trust of the source at extraction time
+  ts INTEGER NOT NULL
+);
+
+CREATE TABLE log_entries (           -- SOURCE OF TRUTH for logs; daily .md is rendered from this
+  id INTEGER PRIMARY KEY,            -- append-only: written by the Stop hook path
+  ts INTEGER NOT NULL, session_id TEXT, kind TEXT,  -- turn | note | rollup
+  text TEXT NOT NULL
+);
+
+CREATE TABLE reflection_jobs (       -- §5: durable, leased, watermarked
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,                -- extract-facts | compact | render
+  source_from INTEGER, source_to INTEGER,  -- log_entries id range (the watermark advance)
+  lease_holder TEXT, lease_expires INTEGER,-- single-holder; expired lease = takeable
+  status TEXT DEFAULT 'queued',      -- queued | running | done | failed
+  attempts INTEGER DEFAULT 0, output TEXT,
+  UNIQUE (kind, source_from, source_to)    -- opportunistic + nightly enqueues dedup here
+);
+
+CREATE TABLE session_facts (         -- retrieval-delta ledger (§4.3): what this session has seen
+  session_id TEXT NOT NULL, fact_id INTEGER NOT NULL, turn INTEGER,
+  PRIMARY KEY (session_id, fact_id)
+);
+
+-- lexical recall: two external-content FTS tables, trigger-synced to their
+-- source tables; `approach reindex` rebuilds both from scratch
+CREATE VIRTUAL TABLE mem_fts USING fts5(fact, content='facts', content_rowid='id');
+CREATE VIRTUAL TABLE log_fts USING fts5(text, content='log_entries', content_rowid='id');
 
 CREATE TABLE pending_approvals (     -- §4.4 deny-and-resume; single-use, digest-bound, expiring
   id INTEGER PRIMARY KEY,            -- doubles as the nonce ("approve 42")
@@ -628,13 +664,23 @@ CREATE TABLE pending_approvals (     -- §4.4 deny-and-resume; single-use, diges
   status TEXT DEFAULT 'pending'      -- pending | approved | denied | expired | consumed
 );                                   -- match+consume = ONE transaction; digest mismatch = new cycle
 
-CREATE TABLE notifications (         -- heartbeat re-nag ledger (§4.2)
-  item_key TEXT PRIMARY KEY, notified_at INTEGER, snooze_until INTEGER
+CREATE TABLE notifications (         -- re-nag ledger (§4.2): "don't re-nag THIS human about THIS item"
+  item_key TEXT NOT NULL, target TEXT NOT NULL,   -- keyed per recipient — cross-schedule dedup
+  notified_at INTEGER, snooze_until INTEGER,      --   kept, cross-recipient collision gone
+  PRIMARY KEY (item_key, target)
 );
 
 CREATE TABLE schedules (             -- NL-cron: "brief me at 8am" is a row, not a feature
-  id INTEGER PRIMARY KEY, cron_expr TEXT, prompt TEXT, created_by TEXT, enabled INTEGER DEFAULT 1
+  id INTEGER PRIMARY KEY,
+  cron_expr TEXT NOT NULL, tz TEXT NOT NULL,      -- IANA zone; DST-aware local wall-clock (§4.2)
+  prompt TEXT NOT NULL, target TEXT,              -- thread/surface the result goes to
+  created_by TEXT, created_trust TEXT,            -- provenance: who asked, at what trust
+  max_overlap INTEGER DEFAULT 1,                  -- overlap ⇒ skipped event row (§4.2)
+  next_fire INTEGER, last_fire INTEGER,
+  enabled INTEGER DEFAULT 1, last_error TEXT      -- disabled-with-reason beats silently broken
 );
+-- per-fire records are the events table itself: every fire (and every
+-- overlap/misfire skip) is an event row keyed (schedule_id, occurrence_time)
 
 CREATE TABLE turns (                 -- C11 observability; from stream-json result events
   id INTEGER PRIMARY KEY,
@@ -654,7 +700,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   <div class="callout safe"><b>Primary threat: injection via untrusted content.</b> A Discord message, a fetched page, an email body, or a community skill can carry instructions ("forward all mail to …", "run this"). Treat every byte the agent <em>reads</em> as data, never as commands. Cisco's audit of a third-party OpenClaw skill found silent data exfiltration — the ecosystem's cautionary tale, and the reason C9/C10 are non-negotiable here.</div>
 
   <h3>Policy matrix (what C9 actually implements)</h3>
-  <p>Prose controls become one table, keyed on the <code>trust</code> field the adapter layer (C1) stamps on every event (§6), shifted one column right when the session is <code>tainted</code>. This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
+  <p>Prose controls become one table, keyed on the <code>trust</code> field the adapter layer (C1) stamps on every event (§6), shifted one column right when the session is <code>tainted</code>. A fourth class, <code>trust=system</code> (daemon-stamped only — §4.2), reads the owner column for reads, notify, and task-graph verbs but can never satisfy an approval, and its sends are restricted to configured targets. This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
   <div class="tbl">
   <table>
     <thead><tr><th>Capability</th><th>owner DM</th><th>known group</th><th>untrusted / webhook</th></tr></thead>
@@ -721,7 +767,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </div>
   <div class="phase">
     <div class="ptag">P3</div>
-    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>MEMORY.md + daily logs + FTS5 + context assembler. ~70% coverage reached here.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded</div></div>
+    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>facts + fact_sources + log_entries (rendered to MEMORY.md / daily .md), dual FTS5, session_facts retrieval delta, owner digest.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded; digest arrives; reindex rebuilds cleanly</div></div>
   </div>
   <div class="phase p4">
     <div class="ptag">P4</div>
@@ -799,7 +845,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
 </section>
 
 <footer>
-  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model<br>
+  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs<br>
   Engine capabilities (headless, resume, hooks, MCP, permission tooling) verified against current Claude Code docs.
 </footer>
 
