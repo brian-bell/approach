@@ -59,6 +59,14 @@ auth = "weak"
 	if sms.MayApprove() {
 		t.Error("weak channel must never satisfy an approval (§6)")
 	}
+	// §6: weak channels are clamped read-only, not just capped at known —
+	// a spoofable sender must never reach the known column's mutating verbs.
+	if discord.ReadOnly() {
+		t.Error("strong channel should not be read-only")
+	}
+	if !sms.ReadOnly() {
+		t.Error("weak channel must be read-only (§6)")
+	}
 }
 
 // validChannels defines one strong and one weak channel for identity tests.

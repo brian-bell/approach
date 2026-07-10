@@ -147,6 +147,16 @@ func (ch Channel) MayApprove() bool {
 	return ch.Auth == "strong"
 }
 
+// ReadOnly reports whether sessions entered from this channel are
+// restricted to non-mutating verbs. Weak channels are clamped read-only
+// (§6), not just capped at known trust: without this, a spoofable SMS
+// sender enrolled as known would reach the known column's mutating
+// actions. C9 must consult this alongside the stamped trust when
+// answering from the policy matrix.
+func (ch Channel) ReadOnly() bool {
+	return ch.Auth == "weak"
+}
+
 // Models routes event kinds to engine models (§8). Message and Heartbeat
 // are required — the interactive model is pinned here deliberately, never
 // settings-derived. Fixed fields make a typo'd event kind an unknown-key

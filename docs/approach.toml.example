@@ -18,7 +18,8 @@ critique  = "codex"             # optional: C12 on-demand critique
 # Channel bindings with auth grading (§6). strong = platform- or
 # network-authenticated (discord, slack, tailscale UI); weak = spoofable
 # (sms e164, email From). A weak channel is clamped to at most 'known'
-# trust and can never satisfy an approval.
+# trust, is read-only (no mutating verbs), and can never satisfy an
+# approval.
 [channels.discord]
 auth = "strong"
 
