@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -397,6 +398,17 @@ COMMIT;
 CREATE TABLE b (id INTEGER PRIMARY KEY);`,
 		"rollback": `CREATE TABLE a (id INTEGER PRIMARY KEY);
 ROLLBACK;`,
+		// Reopening variants: the batch transaction is gone, but a
+		// replacement transaction is active — the guard must see
+		// through the impostor.
+		"commit_begin": `CREATE TABLE a (id INTEGER PRIMARY KEY);
+COMMIT;
+BEGIN;
+CREATE TABLE b (id INTEGER PRIMARY KEY);`,
+		"rollback_begin": `CREATE TABLE a (id INTEGER PRIMARY KEY);
+ROLLBACK;
+BEGIN IMMEDIATE;
+CREATE TABLE b (id INTEGER PRIMARY KEY);`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			db := openBare(t)
@@ -410,8 +422,11 @@ ROLLBACK;`,
 				t.Errorf("error %q does not name the offending file", err)
 			}
 
-			// The store must not be left wedged: the write lock is free
-			// and user_version was not bumped past the failure.
+			// The store must not be left wedged for writes, and the
+			// version must never have advanced to the batch target: an
+			// escaped COMMIT may persist the in-flight sentinel (those
+			// statements are beyond unwinding), but a successful-looking
+			// version is what would mask the corruption.
 			if _, err := db.Exec(`CREATE TABLE post_escape (id INTEGER PRIMARY KEY)`); err != nil {
 				t.Errorf("store refuses writes after detected escape: %v", err)
 			}
@@ -419,8 +434,8 @@ ROLLBACK;`,
 			if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 				t.Fatalf("read user_version: %v", err)
 			}
-			if version != 0 {
-				t.Errorf("user_version = %d after failed batch, want 0", version)
+			if version >= 1 {
+				t.Errorf("user_version = %d after failed batch, want < 1", version)
 			}
 		})
 	}
@@ -454,5 +469,113 @@ END;`,
 	}
 	if n != 1 {
 		t.Errorf("trigger fired %d times, want 1", n)
+	}
+}
+
+// TestMigrateRefusesUserVersionWrites: user_version belongs to the
+// runner — it tracks the schema version and polices the batch
+// transaction (a migration could otherwise forge the in-flight
+// sentinel with ROLLBACK; BEGIN; PRAGMA user_version = -1). Refused at
+// load time, before anything executes.
+func TestMigrateRefusesUserVersionWrites(t *testing.T) {
+	db := openBare(t)
+	fsys := migrationFS(map[string]string{
+		"0001_forge.sql": `CREATE TABLE a (id INTEGER PRIMARY KEY);
+ROLLBACK;
+BEGIN;
+PRAGMA user_version = -1;`,
+	})
+
+	err := migrate(context.Background(), db, fsys)
+	if err == nil {
+		t.Fatal("migrate accepted a migration that sets user_version, want refusal")
+	}
+	for _, want := range []string{"0001_forge.sql", "user_version"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_schema WHERE name = 'a'`).Scan(&count); err != nil {
+		t.Fatalf("inspect schema: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("refused migration was partially applied; the set must be rejected before execution")
+	}
+}
+
+// TestMigrateSingleConnectionPool: the escape guard observes committed
+// state through a second pooled connection, so a pool capped at one
+// connection must fail fast with a clear error — not block startup
+// forever waiting for a connection the runner itself is holding.
+func TestMigrateSingleConnectionPool(t *testing.T) {
+	db := openBare(t)
+	db.SetMaxOpenConns(1)
+	fsys := migrationFS(map[string]string{
+		"0001_a.sql": `CREATE TABLE a (id INTEGER PRIMARY KEY);`,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := migrate(ctx, db, fsys)
+	if err == nil {
+		t.Fatal("migrate succeeded on a single-connection pool, want a capacity error")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("migrate blocked until the test deadline instead of failing fast: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection") {
+		t.Errorf("error %q does not explain the pool capacity requirement", err)
+	}
+}
+
+// TestMigrateConcurrentCallersSharedPool: two migrations racing on the
+// SAME handle with the pool capped at two must not deadlock — without
+// serialization each grabs an observer connection and blocks forever
+// waiting for a batch connection the other holds.
+func TestMigrateConcurrentCallersSharedPool(t *testing.T) {
+	db := openBare(t)
+	db.SetMaxOpenConns(2)
+	fsys := migrationFS(map[string]string{
+		"0001_a.sql": `CREATE TABLE a (id INTEGER PRIMARY KEY);`,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() { errs <- migrate(ctx, db, fsys) }()
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent migrate on shared pool: %v", err)
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatal("migrations deadlocked until the test deadline")
+	}
+}
+
+// TestMigrateWaitersRespectCancellation: a migration waiting its turn
+// behind another run must honor its context — a stalled run elsewhere
+// (even on an unrelated database) must not pin canceled callers.
+func TestMigrateWaitersRespectCancellation(t *testing.T) {
+	migrateGate <- struct{}{} // occupy the gate, simulating a stalled run
+	defer func() { <-migrateGate }()
+
+	db := openBare(t)
+	fsys := migrationFS(map[string]string{
+		"0001_a.sql": `CREATE TABLE a (id INTEGER PRIMARY KEY);`,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := migrate(ctx, db, fsys)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("canceled waiter stayed blocked for %v", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
 	}
 }

@@ -6,5 +6,9 @@
 --   * names are NNNN_description.sql, numbered contiguously from 0001
 --   * the whole pending batch applies in ONE transaction — do not
 --     toggle pragmas here (foreign_keys cannot change mid-transaction)
+--     and never COMMIT/ROLLBACK/BEGIN
+--   * the schema-version pragma belongs to the runner: it tracks the
+--     version and polices the batch transaction, so migrations must
+--     not mention it at all (enforced lexically at load)
 --   * multi-statement files are fine
 SELECT 1;
