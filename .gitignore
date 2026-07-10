@@ -1,3 +1,11 @@
+# Build output
+/bin/
+
+# Test artifacts
+coverage.out
+
+# Runtime state (spec §6: state/approach.db lives outside git)
+/state/
 
 # Beads / Dolt files (added by bd init)
 .dolt/
