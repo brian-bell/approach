@@ -1,0 +1,63 @@
+# approach.toml — the single config file (spec §6, §8): model routing,
+# channel bindings, identities, session TTLs, policy matrix.
+#
+# This file is security-load-bearing, so the loader fails loud: unknown
+# keys are errors, enums are closed, missing policy cells mean deny.
+# Never put credentials here — every secret lives with the verb that
+# uses it (daemon/systemd credentials or an MCP server), per §7.
+
+# Model routing, keyed on event kind (§8). message and heartbeat are
+# required: the interactive model is pinned here deliberately — the
+# CLI's own default is settings-derived, don't rely on it.
+[models]
+heartbeat = "claude-haiku-4-5"
+message   = "claude-sonnet-5"
+heavy     = "claude-opus-4-8"   # optional: heavy work
+critique  = "codex"             # optional: C12 on-demand critique
+
+# Channel bindings with auth grading (§6). strong = platform- or
+# network-authenticated (discord, slack, tailscale UI); weak = spoofable
+# (sms e164, email From). A weak channel is clamped to at most 'known'
+# trust and can never satisfy an approval.
+[channels.discord]
+auth = "strong"
+
+[channels.sms]
+auth = "weak"
+
+# Hand-enrolled identities seeding the identities table (§6).
+# (channel, native_id) -> trust; anyone unlisted is untrusted,
+# deny-by-default. owner rows need owner_id — the canonical principal
+# shared across all the owner's surfaces (cross-surface approval, §4.4).
+# Owner trust on a weak-auth channel is rejected at load time.
+[[identity]]
+channel   = "discord"
+native_id = "000000000000000000"
+trust     = "owner"
+owner_id  = "brian"
+label     = "Brian (Discord)"
+
+[[identity]]
+channel   = "sms"
+native_id = "+15555550100"
+trust     = "known"
+label     = "Brian (SMS — weak channel, read-only)"
+
+# Session rotation inputs (C4, §4.1). Defaults shown.
+[sessions]
+idle_ttl = "4h"
+turn_cap = 50
+
+# Policy matrix overrides (§7) — capability x {owner, known, untrusted}
+# with actions allow | ask | gate | deny | sandbox. Omit this section to
+# get the spec's default table. An override replaces its capability's
+# whole row; a column left out is DENY, not the default cell.
+# Capabilities: read, schedule, web_fetch, bash, edit, host_exec,
+# git_push, send_same_thread, send_other_surface, memory_write, codex,
+# task_graph_write.
+#
+# Example: tighten web fetch for known-group sessions.
+[policy.matrix.web_fetch]
+owner     = "allow"
+known     = "ask"
+untrusted = "sandbox"

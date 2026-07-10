@@ -1,0 +1,3 @@
+# Invalid on purpose: missing required models.message.
+[models]
+heartbeat = "h"
