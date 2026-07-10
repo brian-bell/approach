@@ -39,11 +39,13 @@ func Open(path string) (*sql.DB, error) {
 	if err := requireMode(path, 0o600); err != nil {
 		return nil, err
 	}
-	// WAL sidecars from an earlier run carry recent database pages and
-	// SQLite will keep appending to them, so they get the same posture
-	// check as the main file. Absent sidecars are fine — SQLite creates
-	// them inheriting the main file's 0600.
-	for _, suffix := range []string{"-wal", "-shm"} {
+	// Sidecars from an earlier run carry database pages and SQLite will
+	// keep using them, so they get the same posture check as the main
+	// file: -wal/-shm are live under WAL, and a -journal left by a tool
+	// that opened the db in rollback mode is consumed during recovery.
+	// Absent sidecars are fine — SQLite creates them inheriting the main
+	// file's 0600.
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		sidecar := path + suffix
 		if _, err := os.Stat(sidecar); os.IsNotExist(err) {
 			continue

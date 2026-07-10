@@ -148,7 +148,7 @@ func TestOpenRefusesLooseFilePermissions(t *testing.T) {
 }
 
 func TestOpenRefusesLooseSidecarPermissions(t *testing.T) {
-	for _, suffix := range []string{"-wal", "-shm"} {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		t.Run(suffix, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "state")
 			if err := os.Mkdir(dir, 0o700); err != nil {
