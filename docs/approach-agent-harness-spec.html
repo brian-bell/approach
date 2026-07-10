@@ -153,12 +153,12 @@
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.2</span></div>
+  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.3</span></div>
   <h1 class="title">Wrapping Claude Code into a persistent agent — <span class="call">APPROACH</span></h1>
-  <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — reusing <code>cc-connect</code> for channels and running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the ~30% that is real work.</p>
+  <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — with its own thin channel adapters, running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the part that is real work.</p>
   <div class="meta">
     <span>ENGINE&nbsp; <b>Claude Code (headless) + Codex (subordinate)</b></span>
-    <span>CHANNELS&nbsp; <b>cc-connect</b></span>
+    <span>CHANNELS&nbsp; <b>native adapters · build</b></span>
     <span>TASKS&nbsp; <b>beads (git-native)</b></span>
     <span>HOST&nbsp; <b>Linux + Tailscale</b></span>
     <span>STATUS&nbsp; <b>draft for build-vs-buy</b></span>
@@ -172,7 +172,7 @@
     </div>
     <div class="bar"><div class="have"></div><div class="todo"></div></div>
     <div class="subs">
-      <div class="sub on"><span class="led"></span><div><div class="sname">Channel adapters</div><div class="sstat">installed · cc-connect</div></div></div>
+      <div class="sub build"><span class="led"></span><div><div class="sname">Channel adapters</div><div class="sstat">build · thin — native (cc-connect rejected, §10)</div></div></div>
       <div class="sub on"><span class="led"></span><div><div class="sname">Reasoning engine</div><div class="sstat">installed · claude -p</div></div></div>
       <div class="sub on"><span class="led"></span><div><div class="sname">Skill library</div><div class="sstat">installed · SKILL.md</div></div></div>
       <div class="sub build"><span class="led"></span><div><div class="sname">Session router</div><div class="sstat">build · thin</div></div></div>
@@ -216,19 +216,20 @@
 <section>
   <div class="snum">§2</div>
   <h2>The gap, precisely</h2>
-  <p class="lead">Claude Code + skills + <code>cc-connect</code> already covers the expensive-to-build parts. The delta is not capability — it's the harness around the engine: persistence, scheduling, and a curated memory loop.</p>
+  <p class="lead">Claude Code + skills already covers the expensive-to-build part: the reasoning engine and its tool loop. The delta is the harness around it — channels, persistence, scheduling, and a curated memory loop.</p>
 
   <h3>What the engine already gives you (P0 — installed)</h3>
   <ul>
-    <li><b>Headless agent loop.</b> <code>claude -p "…"</code> runs the full tool-using loop and exits; <code>--output-format stream-json</code> gives you an event stream to relay through <code>cc-connect</code>.</li>
+    <li><b>Headless agent loop.</b> <code>claude -p "…"</code> runs the full tool-using loop and exits; <code>--output-format stream-json</code> gives you an event stream the daemon relays out to channels.</li>
     <li><b>Session resume.</b> Pin a UUID at spawn with <code>--session-id</code>, then <code>--resume &lt;id&gt;</code> on every later turn (capture from <code>--output-format json</code> also exists, but the harness pre-pins — §4.1). This is the primitive the whole persistence layer is built on — you don't reimplement conversation state, you index into Claude Code's.</li>
     <li><b>Deterministic hooks.</b> A ~30-event lifecycle (<code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PostToolUse</code>, <code>Stop</code>, <code>SessionEnd</code>, <code>PreCompact</code> …) that fire regardless of model cooperation. This is your enforcement + reflection substrate.</li>
     <li><b>MCP + skills.</b> <code>.mcp.json</code> servers and <code>.claude/skills/*/SKILL.md</code> — plain-file skills that live in the workspace and travel with git.</li>
     <li><b>A memory head-start.</b> Claude Code already persists context under <code>~/.claude/projects/&lt;proj&gt;/memory/</code> with a <code>MEMORY.md</code> index that auto-splits into topic files. It's rudimentary, but it means you're extending an existing store, not starting from zero.</li>
   </ul>
 
-  <h3>What's missing (the 30%)</h3>
+  <h3>What's missing (the build)</h3>
   <ul>
+    <li><span class="layerdot" style="background:var(--chan, #2E6F9E)"></span><b>Channel adapters</b> — thin, native connectors (discordgo, slack-go) for the 2–3 surfaces you actually use, normalizing every entry point into the §6 event contract and stamping <code>trust</code>/<code>thread_key</code>/<code>dedup_key</code> in code you own. Small per surface. (cc-connect was evaluated for this role and rejected — §10.)</li>
     <li><span class="layerdot" style="background:var(--sched)"></span><b>Session router + scheduler</b> — mapping channel threads to sessions, and a heartbeat that invokes the agent unprompted. Thin-to-small; mostly plumbing over primitives that already exist.</li>
     <li><span class="layerdot" style="background:var(--mem)"></span><b>Curated memory + recall</b> — agent-authored facts, relevance retrieval (FTS5), and log compaction that you control rather than accept as a black box. Moderate.</li>
     <li><span class="layerdot" style="background:var(--mem)"></span><b>Self-improvement loop</b> — reflection that extracts durable facts and <em>synthesizes new skills from successful runs</em>. The genuinely hard part is the synthesis half — deliberately deferred (§10): v1 ships fact extraction and rollups; skill synthesis waits on an evidence trigger.</li>
@@ -241,20 +242,18 @@
 <section>
   <div class="snum">§3</div>
   <h2>System architecture</h2>
-  <p class="lead">Five layers. Two you already run (channels, engine), three you build (APPROACH harness, memory, policy). <span class="mono">APPROACH</span> is <b>one small resident daemon</b> that sequences events onto the engine — approach control handing traffic to the runway.</p>
+  <p class="lead">Five layers. One you already run (engine), four you build (channels, APPROACH harness, memory, policy) — though the channel layer is thin. <span class="mono">APPROACH</span> is <b>one small resident daemon</b> that owns its channel adapters and sequences events onto the engine — approach control handing traffic to the runway.</p>
 
   <figure>
     <pre class="mermaid">
 flowchart TB
-  subgraph CH["① Channels · cc-connect · installed"]
+  subgraph CH["① Channels · native adapters · build"]
     direction LR
     DIS["Discord"]:::chan
     SLK["Slack"]:::chan
-    SMS["SMS"]:::chan
-    BR["cc-connect<br/>Go bridge"]:::chan
+    BR["adapter layer<br/>discordgo · slack-go<br/>stamps trust + dedup_key"]:::chan
     DIS --> BR
     SLK --> BR
-    SMS --> BR
   end
   subgraph AP["② APPROACH · daemon · build"]
     direction LR
@@ -316,7 +315,7 @@ flowchart TB
   <table>
     <thead><tr><th>ID</th><th>Component</th><th>Mechanism</th><th>Status</th><th>Effort</th></tr></thead>
     <tbody>
-      <tr><td><span class="cid">C1</span></td><td><b>Channel bridge</b><br><span class="mono" style="color:var(--ink-soft)">cc-connect</span></td><td>Your Go bridge; normalizes inbound msgs, relays engine stream out to Discord/Slack/SMS.</td><td><span class="tag have">Have</span></td><td><span class="eff s">P0</span></td></tr>
+      <tr><td><span class="cid">C1</span></td><td><b>Channel adapters</b><br><span class="mono" style="color:var(--ink-soft)">native · in-daemon</span></td><td>Thin connectors (discordgo, slack-go) inside the daemon for the 2–3 surfaces actually used; normalize inbound msgs into the §6 contract, stamp <code>trust</code>/<code>thread_key</code>/<code>dedup_key</code> in owned code, relay the engine stream out. cc-connect (third-party harness) evaluated and rejected for this role — §10; kept as reference code for platform quirks.</td><td><span class="tag build">Build</span></td><td><span class="eff m">S–M</span></td></tr>
       <tr><td><span class="cid">C2</span></td><td><b>Reasoning engine</b></td><td><code>claude -p --output-format stream-json</code>; full tool loop per turn.</td><td><span class="tag have">Have</span></td><td><span class="eff s">P0</span></td></tr>
       <tr><td><span class="cid">C3</span></td><td><b>Skill library</b></td><td><code>.claude/skills/*/SKILL.md</code>; portable across harnesses.</td><td><span class="tag have">Have</span></td><td><span class="eff s">P0</span></td></tr>
       <tr><td><span class="cid">C4</span></td><td><b>Session router + store</b></td><td>SQLite <code>thread_key → session_id</code> with a per-channel key contract (§6). Resolve, then <code>--resume</code>; new thread → daemon <b>pre-generates the UUID</b> and spawns with <code>--session-id</code> (never captured from output), inserting <code>creating</code> under a partial unique index — one live session per thread is a schema constraint, not a convention (§4.1, §6). Rotation on <code>/new</code>, idle TTL, or turn cap — one transaction, rotated rows kept; fresh session is seeded by C6. Resume failure auto-rotates with a note (§4.6).</td><td><span class="tag build">Build</span></td><td><span class="eff m">S–M</span></td></tr>
@@ -324,8 +323,8 @@ flowchart TB
       <tr><td><span class="cid">C6</span></td><td><b>Context assembler</b></td><td>Injected via <code>UserPromptSubmit</code> hook (pinned — not prompt prefix). Full fact package only on session start/rotation; per-turn injects the <em>retrieval delta</em> — facts matching this input not already in-session.</td><td><span class="tag build">Build</span></td><td><span class="eff l">M–L</span></td></tr>
       <tr><td><span class="cid">C7</span></td><td><b>Curated memory store</b></td><td>SQLite <code>facts</code> table is the source of truth (provenance, supersession, decay — §6); <code>MEMORY.md</code> is a rendered, git-committed view. Daily logs append-only; <b>FTS5</b> over facts + logs.</td><td><span class="tag partial">Partial</span></td><td><span class="eff l">M–L</span></td></tr>
       <tr><td><span class="cid">C8</span></td><td><b>Reflection / learning loop</b></td><td><code>Stop</code>/<code>SessionEnd</code> hook or nightly nudge → reflector run: extract facts, synthesize skills, compact logs. Review gate = Codex critique (C12) + human approve.</td><td><span class="tag build">Build</span></td><td><span class="eff xl">L–XL</span></td></tr>
-      <tr><td><span class="cid">C9</span></td><td><b>Policy gate</b></td><td><code>PreToolUse</code> hooks answering from the policy matrix (§7). Gated verbs use the deny-and-resume approval flow (§4.4) backed by a durable <code>pending_approvals</code> table.</td><td><span class="tag partial">Partial</span></td><td><span class="eff m">M</span></td></tr>
-      <tr><td><span class="cid">C10</span></td><td><b>Sandbox</b></td><td>Docker exec backend for untrusted skills / group sessions; deny network by default.</td><td><span class="tag build">Build</span></td><td><span class="eff m">M</span></td></tr>
+      <tr><td><span class="cid">C9</span></td><td><b>Policy gate</b></td><td><code>PreToolUse</code> hooks answering from the policy matrix (§7), including the taint column-shift. Gated verbs use the deny-and-resume approval flow (§4.4): durable <code>pending_approvals</code> rows bound to a canonical argument digest, 1h expiry, owner-surface authorization, atomic match-and-consume.</td><td><span class="tag partial">Partial</span></td><td><span class="eff m">M</span></td></tr>
+      <tr><td><span class="cid">C10</span></td><td><b>Sandbox</b></td><td>Container backend for <b>all Bash, every trust level</b> (§7): pinned image, non-root, read-only root, cwd-only mount, zero credentials, caps dropped, no Docker socket, resource limits; egress per session class (assistant: none · workers: read-only dependency allowlist). Host reachable only via always-ask <code>host_exec</code>.</td><td><span class="tag build">Build</span></td><td><span class="eff m">M</span></td></tr>
       <tr><td><span class="cid">C11</span></td><td><b>Observability</b></td><td><code>turns</code> table populated from <code>stream-json</code> result events: model, tokens, cost, tool calls, duration, outcome. Feeds the cost alarm (§7), the token-bloat check (§4.3), and P4 tuning data.</td><td><span class="tag build">Build</span></td><td><span class="eff s">S</span></td></tr>
       <tr><td><span class="cid">C12</span></td><td><b>Second engine</b><br><span class="mono" style="color:var(--ink-soft)">Codex · subordinate</span></td><td><code>codex exec --json</code> via a critic skill, called <em>inside</em> Claude turns; sandbox pinned read-only; output treated as untrusted-adjacent data. Advises, never acts (§7, §10).</td><td><span class="tag build">Build</span></td><td><span class="eff s">S</span></td></tr>
       <tr><td><span class="cid">C13</span></td><td><b>Task graph</b><br><span class="mono" style="color:var(--ink-soft)">beads</span></td><td><code>bd</code> CLI + git-synced JSONL (own truth model, deliberately scoped: <b>facts = knowledge, beads = work</b>). Heartbeat polls <code>bd ready</code>; worker sessions keyed <code>task:&lt;issue-id&gt;</code> take, advance, and close issues (§4.5). Writes gated like memory (§7). Pin the version — young project.</td><td><span class="tag have">Adopt</span></td><td><span class="eff m">S–M</span></td></tr>
@@ -333,7 +332,7 @@ flowchart TB
   </table>
   </div>
   <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">Effort scale — S: hours–1d · M: 2–4d · L: 1–2wk · XL: weeks + ongoing tuning.</p>
-  <div class="callout"><b>Shape decision.</b> APPROACH is a <b>single small Go daemon</b> (or a package inside <code>cc-connect</code>), not a per-event dispatcher. Four requirements force it: per-thread serialization (a lock that must span processes), live <code>stream-json</code> relay, durable pending approvals, and a durable event queue written on receipt (§4.1). One resident process with a per-thread goroutine + queue over the <code>events</code> table makes all four trivial; systemd timers shrink to socket pokes, and the daemon spawns each session from its recorded cwd (§6) — which also closes the <code>--resume</code> cwd-scope trap (§11).</div>
+  <div class="callout"><b>Shape decision.</b> APPROACH is a <b>single small Go daemon</b> — channel adapters included — not a per-event dispatcher. Four requirements force it: per-thread serialization (a lock that must span processes), live <code>stream-json</code> relay, durable pending approvals, and a durable event queue written on receipt (§4.1). One resident process with a per-thread goroutine + queue over the <code>events</code> table makes all four trivial; systemd timers shrink to socket pokes, and the daemon spawns each session from its recorded cwd (§6) — which also closes the <code>--resume</code> cwd-scope trap (§11).</div>
 </section>
 
 <!-- 4. CONTROL FLOWS -->
@@ -342,13 +341,13 @@ flowchart TB
   <h2>Control flows</h2>
 
   <h3>4.1 &nbsp;Inbound message</h3>
-  <p>The hot path. First act on receipt: <b>persist the event row</b> (§6) — gateway channels don't redeliver, so receipt is the last moment durability is free; everything after is recoverable from the table. The engine never invents a session — the router resolves it from the store — and the <code>Stop</code> hook records the turn asynchronously so the reply isn't blocked on memory writes. Queues are <b>keyed by <code>thread_key</code>, not <code>session_id</code>, and claimed <em>before</em> resolution</b>: two simultaneous first-messages to a new thread serialize in the queue, and the sessions schema's partial unique index (§6) backstops the one-active-session-per-thread invariant even against daemon bugs. In-memory queues are just an index over unprocessed event rows — per-thread FIFO by receipt order, rebuilt from the table on restart. The reply leg is <b>at-least-once</b>: the event advances to <code>replied</code> only after the bridge acks the channel send, so a crash in that window re-sends on restart — a rare duplicated chat message is accepted; a silently eaten reply is not.</p>
+  <p>The hot path. First act on receipt: <b>persist the event row</b> (§6) — gateway channels don't redeliver, so receipt is the last moment durability is free; everything after is recoverable from the table. The engine never invents a session — the router resolves it from the store — and the <code>Stop</code> hook records the turn asynchronously so the reply isn't blocked on memory writes. Queues are <b>keyed by <code>thread_key</code>, not <code>session_id</code>, and claimed <em>before</em> resolution</b>: two simultaneous first-messages to a new thread serialize in the queue, and the sessions schema's partial unique index (§6) backstops the one-active-session-per-thread invariant even against daemon bugs. In-memory queues are just an index over unprocessed event rows — per-thread FIFO by receipt order, rebuilt from the table on restart. The reply leg is <b>at-least-once</b>: the event advances to <code>replied</code> only after the channel adapter confirms the platform accepted the send, so a crash in that window re-sends on restart — a rare duplicated chat message is accepted; a silently eaten reply is not.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
   autonumber
   actor U as You · Discord
-  participant B as cc-connect
+  participant B as channel adapter (C1)
   participant R as APPROACH router
   participant S as Session store
   participant A as Context assembler
@@ -387,7 +386,7 @@ sequenceDiagram
   participant T as systemd timer
   participant SC as Scheduler
   participant C as Claude Code (-p, Haiku)
-  participant B as cc-connect
+  participant B as channel adapter (C1)
   actor U as You
   T->>SC: fire · every 30m (socket poke)
   SC->>C: claude -p · fresh session · HEARTBEAT.md + due schedules rows
@@ -423,7 +422,7 @@ flowchart LR
   </figure>
 
   <h3>4.4 &nbsp;Approval round-trip (gated verbs)</h3>
-  <p>The hardest flow in the system, so it's pinned: <b>deny-and-resume</b>. Hooks are synchronous with timeouts — the gate never holds a turn open waiting for a human. It records the intended call, denies with a reason, and lets the turn end gracefully; your approval arrives later as just another inbound event that resumes the session. Approvals are durable rows, so they survive restarts, and a gated call can never fire without a matching approved row.</p>
+  <p>The hardest flow in the system, so it's pinned: <b>deny-and-resume</b>. Hooks are synchronous with timeouts — the gate never holds a turn open waiting for a human. It records the intended call, denies with a reason, and lets the turn end gracefully; your approval arrives later as just another inbound event that resumes the session. Approvals are durable rows, so they survive restarts, and a gated call can never fire without a matching approved row. The binding is cryptographic, not textual: the row stores the canonical tool name and a <b>digest of the normalized JSON arguments</b> (the rendered string is display-only), plus the requesting event id, session, and timestamps; the approval id doubles as the nonce. <b>Authorization:</b> an approval event is valid iff its sender resolves to the owner identity on a <code>trust=owner</code> surface — any owner surface, not just the requesting one (approve from Slack what Discord asked; it's the same authenticated human). <b>Expiry: 1 hour</b> — a stale "approve 42" can't fire tomorrow against forgotten context; expired means a fresh request cycle. Match-and-consume is one transaction; if the resumed model re-issues a call whose digest differs from what was approved, that is a <em>new approval cycle</em>, never a fuzzy match.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
@@ -431,21 +430,21 @@ sequenceDiagram
   participant C as Claude Code (turn N)
   participant P as PreToolUse gate
   participant D as APPROACH daemon
-  participant B as cc-connect
+  participant B as channel adapter (C1)
   actor U as You
   C->>P: send_email(…)
-  P->>D: insert pending_approvals #42 (exact call)
+  P->>D: insert pending_approvals #42 (canonical digest · 1h expiry)
   P-->>C: deny · "queued for approval #42"
   C-->>D: turn ends · "awaiting your approval"
-  D->>B: approval request · rendered call verbatim
+  D->>B: approval request · rendered call for display
   B->>U: "approve 42?"
-  U->>B: approve 42
-  B->>D: approval event
+  U->>B: approve 42 (any owner surface)
+  B->>D: approval event · sender must resolve to owner
   D->>C: claude -p --resume · "approval granted for #42"
   C->>P: send_email(…) retry
-  P-->>C: allow · matches approved row · row consumed
+  P-->>C: digest match → allow · consume (one transaction)
     </pre>
-    <figcaption><b>Fig 5.</b> Deny-and-resume (C9). The approval is single-use and bound to the exact rendered call — a fooled model can't swap arguments between approval and execution.</figcaption>
+    <figcaption><b>Fig 5.</b> Deny-and-resume (C9). Single-use, bound to a canonical argument digest with a 1-hour expiry, approvable from any authenticated owner surface, matched and consumed in one transaction — a fooled model can't swap arguments between approval and execution, and a digest mismatch starts a fresh cycle.</figcaption>
   </figure>
 
   <h3>4.5 &nbsp;Task orchestration (coding-agent work)</h3>
@@ -473,7 +472,7 @@ flowchart LR
   <ul>
     <li><b>Daemon crash mid-turn.</b> On restart, events found in <code>processing</code> become <code>interrupted</code> — <em>never auto-rerun</em>. The side effects of a half-finished turn are mechanically unknowable (the email may or may not have gone out), so the daemon posts to the originating thread: what it was doing, and an offer to retry. Interrupted events <b>park out-of-band</b> — the thread's queue keeps flowing; a "retry" re-enqueues the old event at the tail, executing against current session state (<code>--resume</code> re-reads the transcript, which is exactly what absorbs the staleness). A frozen assistant that won't answer "hello?" until you adjudicate a crash report would be the worse failure.</li>
     <li><b>Engine failure, daemon alive</b> (non-zero exit, timeout, rate limit). Here the daemon has what the crash case lacks: live <code>PostToolUse</code> accounting for the turn. If <em>zero</em> side-effecting tool calls were observed: auto-retry, up to 2 attempts with backoff, honoring rate-limit signals. If <em>any</em> side-effecting call fired before the failure: no retry — same <code>interrupted</code> + surface path as a crash. Timeouts kill the child, then apply the same test.</li>
-    <li><b>Reply undelivered.</b> Turn completed but the bridge never acked the send (§4.1): re-send on restart. At-least-once, duplicate accepted.</li>
+    <li><b>Reply undelivered.</b> Turn completed but the platform send was never confirmed (§4.1): re-send on restart. At-least-once, duplicate accepted.</li>
     <li><b>Resume failure.</b> The pinned session UUID points into Claude Code's store under <code>~/.claude/projects/</code>; if that transcript is gone or unreachable (GC, corruption, moved cwd — §11), the row is marked <code>resume_failed</code> (a rotation cause, kept for forensics), a fresh session is created and seeded with the assembler's full fact package, the event processes there, and the reply carries a one-line note: <em>"lost this thread's conversation history — facts intact, starting fresh."</em> Transcript loss degrades to amnesia-with-notes, not an error; facts in <code>approach.db</code> are the durable memory by design. (Backing up the Claude-side store is a §6 ownership question.)</li>
     <li><b>Dead letters.</b> Terminal failures land in <code>dead_letters</code> (§6): retry budget exhausted, malformed or unroutable events, and interrupted events whose surface attempt itself failed. Exit is two independent paths — one owner-DM notification on entry (through the normal outbound leg), plus a standing heartbeat checklist item for unacknowledged rows (via the <code>notifications</code> ledger, so no re-nag). Draining is deliberately manual: a requeue/discard command per row. "Dead" means the machine has given up and a human decides.</li>
   </ul>
@@ -540,7 +539,7 @@ flowchart LR
    └─ approach.db         # SQLite: events · dead_letters · sessions · facts · approvals · notifications · schedules · turns · FTS5</pre>
 
   <h3>Inbound event schema (C1 → C4 contract)</h3>
-  <p>The bridge normalizes every entry point — message, heartbeat, webhook, cron, approval — into one shape. The <code>trust</code> field is load-bearing: policy (§7) and sandbox routing key off it, and it is <b>assigned by the bridge from channel identity — code you control — never inferred from content</b>.</p>
+  <p>The daemon's channel-adapter layer (C1) normalizes every entry point — message, heartbeat, webhook, cron, approval — into one shape. The <code>trust</code> field is load-bearing: policy (§7) and sandbox routing key off it, and it is <b>assigned by the adapter from channel identity — code you own by construction (§10) — never inferred from content</b>.</p>
   <pre class="mono" style="background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:16px; font-size:12.5px; line-height:1.7; overflow-x:auto">{ "channel": "discord",
   "thread_key": "discord:dm:123",          // per-channel contract:
                                            //   discord:dm:&lt;user_id&gt; · discord:thread:&lt;thread_id&gt;
@@ -591,6 +590,9 @@ CREATE TABLE sessions (
                                      --   | failed (creating past deadline — retried fresh)
   cwd          TEXT NOT NULL,        -- spawn/resume dir: ~/approach, or repo path for task:* workers
                                      -- (--resume is scoped to the spawn dir — assert at spawn)
+  tainted      INTEGER DEFAULT 0,    -- sticky (§7): set by PostToolUse on untrusted bytes
+                                     --   (web fetch · non-owner participant · Codex output);
+                                     --   mutating verbs read one policy column right; clears on rotation
   channel      TEXT, last_seen INTEGER, turns INTEGER,
   PRIMARY KEY (thread_key, session_id)
 );
@@ -603,7 +605,8 @@ CREATE UNIQUE INDEX one_live_session ON sessions(thread_key)
 CREATE TABLE facts (                 -- SOURCE OF TRUTH; MEMORY.md is rendered from this
   id INTEGER PRIMARY KEY,
   fact TEXT NOT NULL,
-  provenance TEXT NOT NULL,          -- 'owner' | 'agent-reflection' | 'untrusted-gated'
+  provenance TEXT NOT NULL,          -- 'owner' | 'agent-reflection' | 'untrusted-derived'
+                                     --   (untrusted-derived: excluded from assembly until digest-ack — §5)
   source TEXT,                       -- thread_key or log ref it came from
   created INTEGER,
   superseded_by INTEGER REFERENCES facts(id),  -- non-destructive supersession
@@ -612,11 +615,18 @@ CREATE TABLE facts (                 -- SOURCE OF TRUTH; MEMORY.md is rendered f
 -- lexical recall over facts + logs
 CREATE VIRTUAL TABLE mem_fts USING fts5(fact, source, ts UNINDEXED);
 
-CREATE TABLE pending_approvals (     -- §4.4 deny-and-resume; single-use, exact-call-bound
-  id INTEGER PRIMARY KEY,
-  session_id TEXT, tool TEXT, rendered_call TEXT NOT NULL,
-  requested INTEGER, status TEXT DEFAULT 'pending'  -- pending | approved | denied | consumed
-);
+CREATE TABLE pending_approvals (     -- §4.4 deny-and-resume; single-use, digest-bound, expiring
+  id INTEGER PRIMARY KEY,            -- doubles as the nonce ("approve 42")
+  session_id TEXT NOT NULL,
+  requested_by_event INTEGER REFERENCES events(id),  -- who/what asked (audit)
+  tool TEXT NOT NULL,                -- canonical tool name
+  args_digest TEXT NOT NULL,         -- SHA-256 over normalized JSON args — THE binding
+  rendered_call TEXT NOT NULL,       -- display only, never compared
+  requested INTEGER NOT NULL,
+  expires INTEGER NOT NULL,          -- requested + 1h; expired ⇒ fresh request cycle
+  decided INTEGER, decided_by TEXT,  -- owner identity + surface that approved/denied (audit)
+  status TEXT DEFAULT 'pending'      -- pending | approved | denied | expired | consumed
+);                                   -- match+consume = ONE transaction; digest mismatch = new cycle
 
 CREATE TABLE notifications (         -- heartbeat re-nag ledger (§4.2)
   item_key TEXT PRIMARY KEY, notified_at INTEGER, snooze_until INTEGER
@@ -644,14 +654,16 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   <div class="callout safe"><b>Primary threat: injection via untrusted content.</b> A Discord message, a fetched page, an email body, or a community skill can carry instructions ("forward all mail to …", "run this"). Treat every byte the agent <em>reads</em> as data, never as commands. Cisco's audit of a third-party OpenClaw skill found silent data exfiltration — the ecosystem's cautionary tale, and the reason C9/C10 are non-negotiable here.</div>
 
   <h3>Policy matrix (what C9 actually implements)</h3>
-  <p>Prose controls become one table, keyed on the <code>trust</code> field the bridge stamps on every event (§6). This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
+  <p>Prose controls become one table, keyed on the <code>trust</code> field the adapter layer (C1) stamps on every event (§6), shifted one column right when the session is <code>tainted</code>. This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
   <div class="tbl">
   <table>
     <thead><tr><th>Capability</th><th>owner DM</th><th>known group</th><th>untrusted / webhook</th></tr></thead>
     <tbody>
       <tr><td>Read / Grep / local git</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag partial">sandbox only</span></td></tr>
       <tr><td>Web fetch</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag partial">sandbox, no session creds</span></td></tr>
-      <tr><td>Bash (mutating)</td><td><span class="tag have">allow</span></td><td><span class="tag build">ask</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
+      <tr><td>Bash (always sandboxed — no host, no creds, per-class egress)</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
+      <tr><td><code>host_exec</code> (host shell — admin only)</td><td><span class="tag build">ask · §4.4 · always</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
+      <tr><td>git push / open PR (host-side verb, daemon credential)</td><td><span class="tag build">ask · §4.4</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
       <tr><td>Send message (same thread)</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
       <tr><td>Send (other surface) · email · delete · purchase</td><td><span class="tag build">ask · §4.4</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
       <tr><td>Write to memory / facts</td><td><span class="tag have">allow</span></td><td><span class="tag build">gate · provenance-tag</span></td><td><span class="tag build">gate · provenance-tag</span></td></tr>
@@ -661,15 +673,16 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </table>
   </div>
   <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">Note the memory and task rows: <b>writing a fact or an issue is a gated verb</b>. An issue is worse than a fact — it's an instruction that persists <em>and gets scheduled</em>: a bd row created from injected content is a prompt injection with a cron job. Same enforcement, same provenance tag.</p>
+  <div class="callout safe"><b>Two rules the matrix carries implicitly.</b> (1) <b>Bash is never a side-effect path.</b> It always runs in the C10 container — every trust level, owner DM included — with no credentials and per-class egress; send/email/delete/purchase/push exist only as MCP or daemon verbs holding their own credentials, so the "curl from a trusted turn" bypass class is deleted, not enumerated. Host access exists only as <code>host_exec</code>, always-ask. (2) <b>Taint shifts the column.</b> A session that reads untrusted bytes (web fetch, non-owner participant, Codex output) gains a sticky <code>tainted</code> flag (§6, set by <code>PostToolUse</code>): mutating verbs then read <em>one column to the right</em> — an owner-DM-tainted session behaves like known-group, so its fact/task writes gate and provenance-tag <code>untrusted-derived</code>, feeding the read-time exclusion in §5 automatically. Reads are unaffected; the flag clears on rotation; high-impact verbs stay gated regardless.</div>
 
   <h3>Controls</h3>
   <ul>
     <li><b>Enforce at the hook layer, not the prompt.</b> <code>PreToolUse</code> deny holds even when the model is fooled — CLAUDE.md rules don't. Gate every irreversible verb (send, publish, delete, transfer) behind a policy hook or <code>--permission-prompt-tool</code> that answers from code you control.</li>
-    <li><b>Allowlist tools per surface.</b> <code>--allowedTools "Read,Grep,Bash(git *)"</code> for reads; sends and deletes go through the deny-and-resume approval flow (§4.4) — durable, single-use, bound to the exact rendered call.</li>
-    <li><b>Sandbox the untrusted.</b> Community skills and group/channel sessions run in the Docker backend with <code>deny network</code> by default; only the trusted solo session runs on the host.</li>
+    <li><b>Allowlist tools per surface.</b> <code>--allowedTools</code> narrows what each session class can even attempt; sends, deletes, pushes, and <code>host_exec</code> go through the deny-and-resume approval flow (§4.4) — durable, single-use, bound to a canonical argument digest.</li>
+    <li><b>Sandbox by default — everyone, always.</b> The Bash tool executes in the C10 container for <em>every</em> trust level; nothing about being the owner turns it off (an injected page read in an owner session was the exact bypass). The profile is pinned: immutable versioned image · non-root UID · read-only root FS · cwd-only mount · no secrets or tokens in env · all capabilities dropped · no Docker socket · default seccomp · CPU/mem/PID/wall-time limits · defined artifact extraction · teardown verified by test. Egress is per session class: assistant sessions none; workers a read-only dependency allowlist (git clone/fetch, <code>proxy.golang.org</code>, <code>registry.npmjs.org</code> — per-repo config). <b>Zero credentials inside any sandbox</b>: workers commit locally, and push/PR is a gated host-side verb — the daemon pushes with its own credential after the matrix says yes, so a compromised build script gets a polluted container and nothing else.</li>
     <li><b>Codex advises, Claude acts.</b> The second engine bypasses your hook layer entirely — it has no equivalent of <code>PreToolUse</code> — so it is never granted gated verbs. It runs as a child process with its sandbox pinned read-only, and its output re-enters a gated Claude session as <em>untrusted-adjacent data</em> (it may have read the web). A misconfigured <code>--sandbox danger-full-access</code> in a skill would bypass everything above — pin the flags in the skill, test the pin.</li>
     <li><b>Never in URLs.</b> No secrets or personal data in query strings; no autofill/submit reached via a link from untrusted content; no sending data to endpoints suggested by fetched content.</li>
-    <li><b>Access &amp; secrets.</b> Reach the box only over Tailscale (you've already hardened SSH this way); keep the API key in env / a secret file, not the workspace; bind any local UI to <code>127.0.0.1</code>. Codex adds a second credentialed binary — its auth token gets the same treatment, out of the workspace.</li>
+    <li><b>Access &amp; secrets.</b> Reach the box only over Tailscale (you've already hardened SSH this way); bind any local UI to <code>127.0.0.1</code>. Every service credential lives with the verb that uses it — inside its MCP server or the daemon (systemd credentials), never in the engine child's env, never in the workspace, never in a sandbox. Codex adds a second credentialed binary — its auth token gets the same treatment.</li>
     <li><b>Cost as a safety control.</b> Cap runaway loops with <code>--max-turns</code> and timeouts; the <code>turns</code> table (C11) gives the heartbeat a daily-spend query so the agent itself alarms on anomalous burn.</li>
     <li><b>Kill switch.</b> One systemd target — <code>approach.target</code> — groups the daemon and every timer. <code>systemctl stop approach.target</code> is the single documented panic command; nothing wakes up until you start it again.</li>
   </ul>
@@ -681,7 +694,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   <h2>Deployment</h2>
   <ul>
     <li><b>Host.</b> The Linux home server for the trusted solo agent; a small VPS later if you want it reachable when the homelab is down. Same systemd units either way. One box, one daemon — no second agent process anywhere (§10).</li>
-    <li><b>Process shape.</b> <code>cc-connect</code> runs as one long-lived unit; <b>APPROACH is a second small daemon</b> — or a package inside <code>cc-connect</code>, which is the simpler call since it's already Go and already resident. It owns the SQLite handle, a per-thread goroutine + queue over the durable <code>events</code> table (serialization for free, claimed by <code>thread_key</code> before session resolution — §4.1), pending approvals, and spawns <code>claude -p</code> as child processes from each session's recorded cwd (§6 — assistant sessions: <code>~/approach</code>; workers: the repo path). <code>systemd</code> <code>.timer</code> units shrink to socket pokes — heartbeat, nightly reflection, and NL-cron all enter through the same event path as a message.</li>
+    <li><b>Process shape.</b> <b>APPROACH is one small Go daemon</b>, channel adapters included — no separate bridge process. It owns the platform connections (discordgo, slack-go), the SQLite handle, a per-thread goroutine + queue over the durable <code>events</code> table (serialization for free, claimed by <code>thread_key</code> before session resolution — §4.1), pending approvals, and spawns <code>claude -p</code> as child processes from each session's recorded cwd (§6 — assistant sessions: <code>~/approach</code>; workers: the repo path). <code>systemd</code> <code>.timer</code> units shrink to socket pokes — heartbeat, nightly reflection, and NL-cron all enter through the same event path as a message.</li>
     <li><b>Model routing for cost.</b> Three-way: heartbeats on Haiku; interactive turns on Sonnet 5 (the CC default) or Opus for heavy work; on-demand critique (C12) on Codex under ChatGPT subscription auth — and, if F2 lands (§10), its nightly skill-draft critique routes the same way, putting flat-rate pricing on what would be the most token-hungry recurring job. Routing lives in <code>approach.toml</code>, keyed on event <code>kind</code>.</li>
     <li><b>Failure handling.</b> One rule, specified in §4.6: <b>retry only what provably did nothing; surface everything else.</b> Engine failures auto-retry (≤2, backoff) only when live <code>PostToolUse</code> accounting shows zero side effects this turn; anything ambiguous parks as <code>interrupted</code> and surfaces to the originating thread; terminal failures land in <code>dead_letters</code> with two surfacing paths and manual drain. Events are never silently dropped because every failure path ends in a durable, human-visible state. An always-on agent that fails silently reads as ignoring you, which is worse than being down.</li>
     <li><b>Task graph.</b> beads adds nothing resident — <code>bd</code> is a CLI over git-synced JSONL plus a local SQLite cache. The heartbeat polls <code>bd ready</code>; worker sessions take and close issues from repo cwds. Pin the version (young, fast-moving project) and treat <code>.beads/</code> as part of the workspace backup. Lease/assignment semantics are already in the tool for the day you run more than one worker.</li>
@@ -696,11 +709,11 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   <h2>Build plan</h2>
   <div class="phase p0">
     <div class="ptag">P0</div>
-    <div><h3>Baseline — already running</h3><p><code>cc-connect</code> ↔ <code>claude -p</code> ↔ skills. A message gets an answer. No memory, no persistence, no proactivity.</p><div class="pmeta">EXIT ✓ — done</div></div>
+    <div><h3>Engine baseline — already running</h3><p><code>claude -p</code> ↔ skills: a prompt gets a full tool-using answer in the terminal. No channels, no memory, no persistence, no proactivity. (An earlier draft counted a channel bridge as installed — it isn't; C1 is build work in P1.)</p><div class="pmeta">EXIT ✓ — engine only</div></div>
   </div>
   <div class="phase">
     <div class="ptag">P1</div>
-    <div><h3>Persistence — session router (C4)</h3><p>SQLite <code>thread_key → session_id</code>; resolve + <code>--resume</code>; pre-pinned UUIDs via <code>--session-id</code> under the <code>one_live_session</code> index (§6), events durable on receipt (§4.1). Now conversations survive across messages and restarts. The <code>turns</code> table (C11) rides along — it's ten lines once you're already parsing <code>stream-json</code>, and every later phase wants its data.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — a thread continues after hours/reboot, including a mid-turn kill: the event resurfaces as interrupted, nothing re-runs, nothing is lost</div></div>
+    <div><h3>Persistence — first adapter (C1) + session router (C4)</h3><p>One native channel adapter (Discord DM via discordgo) feeding the §6 event contract, then SQLite <code>thread_key → session_id</code>; resolve + <code>--resume</code>; pre-pinned UUIDs via <code>--session-id</code> under the <code>one_live_session</code> index (§6), events durable on receipt (§4.1). Now conversations survive across messages and restarts. The <code>turns</code> table (C11) rides along — it's ten lines once you're already parsing <code>stream-json</code>, and every later phase wants its data.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — a thread continues after hours/reboot, including a mid-turn kill: the event resurfaces as interrupted, nothing re-runs, nothing is lost</div></div>
   </div>
   <div class="phase">
     <div class="ptag">P2</div>
@@ -745,6 +758,9 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </div>
   <p>The spec's original tell — build if you want to <em>understand</em> the "improves while you're not looking" property, buy if you only want the property — resolves to build: P1–P3 plus curated memory already yields a persistent, proactive, accreting agent on owned infra, and the one genuinely open-ended piece is deferred until daily use produces evidence it would pay for itself.</p>
 
+  <h3>Same test, same verdict — cc-connect (C1)</h3>
+  <p><b>Decision (2026-07-09): rejected; the channel layer is built native.</b> An earlier draft counted <code>cc-connect</code> as an installed bridge. Inspection corrected two things at once: it isn't installed here, and it isn't a bridge — it's a full third-party harness (github.com/chenhg5/cc-connect: drives 10+ agents itself via ACP, owns session management, persistent memory, NL-cron scheduling, and <em>chat-controlled permission modes</em>). There is no pure-adapter mode to demote it into, so adopting it means a resident third-party process that drives agents, holds every channel token, sees all traffic, and keeps its own session/memory/schedule truth models — the Hermes objection with more surface. Forking to salvage its platform adapters inherits a large codebase's update stream for the 2–3 adapters actually needed. Building thin native connectors (discordgo, slack-go) costs days, and puts <code>trust</code>/<code>dedup_key</code> stamping in owned code by construction. cc-connect is retained as <em>reference code</em> for platform quirks — the same posture as reading OpenClaw for design ideas without running it.</p>
+
   <h3>Second engine — Codex: cheap as a tool, costly as a peer</h3>
   <p>The hero graphic's 70% is really "70% installed, <em>conditional on Claude Code being the only conversational engine</em>." What Codex brings depends entirely on which of three integration tiers you pick:</p>
   <div class="tbl">
@@ -783,7 +799,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
 </section>
 
 <footer>
-  APPROACH · personal agent harness · design spec v1.2 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants (§4.6, §6)<br>
+  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model<br>
   Engine capabilities (headless, resume, hooks, MCP, permission tooling) verified against current Claude Code docs.
 </footer>
 
