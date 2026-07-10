@@ -39,6 +39,19 @@ func Open(path string) (*sql.DB, error) {
 	if err := requireMode(path, 0o600); err != nil {
 		return nil, err
 	}
+	// WAL sidecars from an earlier run carry recent database pages and
+	// SQLite will keep appending to them, so they get the same posture
+	// check as the main file. Absent sidecars are fine — SQLite creates
+	// them inheriting the main file's 0600.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		sidecar := path + suffix
+		if _, err := os.Stat(sidecar); os.IsNotExist(err) {
+			continue
+		}
+		if err := requireMode(sidecar, 0o600); err != nil {
+			return nil, err
+		}
+	}
 
 	// Pragmas ride the DSN because database/sql pools connections:
 	// synchronous, busy_timeout, and foreign_keys are per-connection, so

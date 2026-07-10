@@ -147,6 +147,35 @@ func TestOpenRefusesLooseFilePermissions(t *testing.T) {
 	}
 }
 
+func TestOpenRefusesLooseSidecarPermissions(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-shm"} {
+		t.Run(suffix, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "state")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "approach.db")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sidecar := path + suffix
+			if err := os.WriteFile(sidecar, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := store.Open(path)
+			if err == nil {
+				t.Fatalf("Open succeeded with a 0644 %s sidecar, want refusal", suffix)
+			}
+			for _, want := range []string{sidecar, "0600"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
 func TestOpenExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "approach.db")
 
