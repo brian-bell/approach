@@ -47,7 +47,10 @@ func Open(path string) (*sql.DB, error) {
 	// file's 0600.
 	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
 		sidecar := path + suffix
-		if _, err := os.Stat(sidecar); os.IsNotExist(err) {
+		// Lstat, not Stat: a dangling symlink must be seen and refused,
+		// not skipped as absent — SQLite writing through it would
+		// create the target.
+		if _, err := os.Lstat(sidecar); os.IsNotExist(err) {
 			continue
 		}
 		if err := requireMode(sidecar, 0o600); err != nil {
@@ -98,13 +101,19 @@ func verifyPragmas(db *sql.DB) error {
 	return nil
 }
 
-// requireMode refuses a path whose permissions are wider than want. The
-// store holds identities and approvals; auto-tightening would hide that
-// the file sat exposed, so the caller is told to chmod instead.
+// requireMode refuses a symlink or a path whose permissions are wider
+// than want. The store holds identities and approvals; auto-tightening
+// would hide that the file sat exposed, so the caller is told to chmod
+// instead. Symlinks are refused outright: a stat-follow check would
+// approve the link's target while SQLite resolves the real database
+// path and uses sidecars beside it, out of sight of these checks.
 func requireMode(path string, want os.FileMode) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("store: %s is a symlink — the state store refuses symlinked paths", path)
 	}
 	if got := info.Mode().Perm(); got != want {
 		return fmt.Errorf("store: %s has mode %04o, want %04o — run: chmod %o %s", path, got, want, want, path)

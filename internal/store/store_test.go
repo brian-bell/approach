@@ -176,6 +176,62 @@ func TestOpenRefusesLooseSidecarPermissions(t *testing.T) {
 	}
 }
 
+// TestOpenRefusesSymlinkedPaths: os.Stat would follow a symlink and
+// accept its target, but SQLite resolves the real database path and
+// uses sidecars beside the target — which the path+suffix checks never
+// see. Symlinks are refused outright; the posture has no legitimate
+// symlink case.
+func TestOpenRefusesSymlinkedPaths(t *testing.T) {
+	newStateDir := func(t *testing.T) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	t.Run("db file", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "real.db")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(newStateDir(t), "approach.db")
+		if err := os.Symlink(target, path); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := store.Open(path)
+		if err == nil {
+			t.Fatalf("Open succeeded on a symlinked db file, want refusal")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error %q does not mention symlink", err)
+		}
+	})
+
+	t.Run("sidecar", func(t *testing.T) {
+		dir := newStateDir(t)
+		path := filepath.Join(dir, "approach.db")
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Dangling target: os.Stat would report not-exist and skip it,
+		// but SQLite writing through the link would create the target.
+		if err := os.Symlink(filepath.Join(dir, "elsewhere"), path+"-wal"); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := store.Open(path)
+		if err == nil {
+			t.Fatalf("Open succeeded on a symlinked sidecar, want refusal")
+		}
+		if !strings.Contains(err.Error(), "symlink") {
+			t.Errorf("error %q does not mention symlink", err)
+		}
+	})
+}
+
 func TestOpenExistingDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state", "approach.db")
 
