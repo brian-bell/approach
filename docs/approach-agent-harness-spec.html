@@ -153,7 +153,7 @@
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.4</span></div>
+  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.5</span></div>
   <h1 class="title">Wrapping Claude Code into a persistent agent — <span class="call">APPROACH</span></h1>
   <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — with its own thin channel adapters, running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the part that is real work.</p>
   <div class="meta">
@@ -449,12 +449,14 @@ sequenceDiagram
 
   <h3>4.5 &nbsp;Task orchestration (coding-agent work)</h3>
   <p>Multi-session work lives in beads (C13), not in prompts. A ready issue becomes a <b>worker session</b>: a row in the same <code>sessions</code> table, keyed <code>task:&lt;issue-id&gt;</code>, spawned from the repo's cwd (stored per session — §6; this is what forces the <code>sessions.cwd</code> column, since <code>--resume</code> is scoped to the spawn directory). Workers run under the same policy matrix and the same per-thread queue; a worker surviving a reboot is just C4 persistence applied to work instead of conversation. Done → <code>bd close</code> with a closing note the reflector (§5) can read; stuck → <code>bd update --blocked-on</code>, and the issue drops out of <code>ready</code> until its blocker clears — parked, not nagging, not leaking into facts.</p>
+  <p><b>The claim is atomic because the daemon is the lock.</b> One serialized claim section: check <code>max_workers</code> (start N=1) → insert the <code>task:&lt;id&gt;</code> session row (the <code>one_live_session</code> index makes a double-spawn a constraint violation) → <code>bd update --claim</code> as the durable record. Two heartbeat fires can both see an issue as ready; only one exits the claim section with it. bd's claim field is a <em>record, not a mutex</em> — foreign claims are respected (skip ready issues whose assignee isn't us), and cross-machine lease semantics stay out of scope until a second box exists. Each worker session records its <b>origin thread</b>, so progress reports and recovery notes have an address. <b>Restart reconciliation:</b> on boot, sweep active <code>task:*</code> sessions — if the transcript resumes (§4.6 assert), the worker re-enters its queue with a system-trust <em>"you were interrupted; reassess and continue"</em> nudge, half-done work visible via <code>git status</code> in its own repo; if the transcript is gone, mark <code>resume_failed</code>, <em>release the bd claim</em> (the issue returns to ready), and post a note to the origin thread. Mid-task events follow §4.6 — no side-effect replay, ever.</p>
   <figure>
     <pre class="mermaid">
 flowchart LR
   TRG["Heartbeat tick<br/>or your message"]:::appr --> RDY["bd ready"]:::mem
   RDY --> PICK["Pick issue<br/>priority + policy"]:::appr
-  PICK --> WK["Worker session<br/>claude -p · repo cwd<br/>thread_key task:id"]:::eng
+  PICK --> CLM["Daemon claim section<br/>max_workers · session row<br/>· bd --claim"]:::appr
+  CLM --> WK["Worker session<br/>claude -p · repo cwd<br/>thread_key task:id"]:::eng
   WK -->|done| CL["bd close<br/>+ closing note"]:::mem
   WK -->|stuck| BL["bd update<br/>blocked_on"]:::mem
   BL -.blocker clears.-> RDY
@@ -595,6 +597,8 @@ CREATE TABLE sessions (
                                      --   | failed (creating past deadline — retried fresh)
   cwd          TEXT NOT NULL,        -- spawn/resume dir: ~/approach, or repo path for task:* workers
                                      -- (--resume is scoped to the spawn dir — assert at spawn)
+  origin       TEXT,                 -- task:* workers: thread that spawned the work —
+                                     --   where progress reports and recovery notes go (§4.5)
   tainted      INTEGER DEFAULT 0,    -- sticky (§7): set by PostToolUse on untrusted bytes
                                      --   (web fetch · non-owner participant · Codex output);
                                      --   mutating verbs read one policy column right; clears on rotation
@@ -689,6 +693,15 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   tool_calls INTEGER, duration_ms INTEGER, outcome TEXT  -- ok | error | denied | timeout
 );</pre>
   <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">Note: portability of the memory layout into other harnesses is a non-goal — the Hermes split was rejected (§10). The rendered MEMORY.md + append-only logs are shaped for greppability and recoverability, not export. Task state lives in beads' own git-native format — portable by construction.</p>
+
+  <h3>Durability, backup, recovery</h3>
+  <ul>
+    <li><b>Two durability tiers, named honestly.</b> <b>Tier-1 (loss = broken):</b> <code>approach.db</code>, <code>.beads/</code>, and the rendered workspace — the facts/work/config truth. <b>Tier-2 (loss = degraded):</b> the Claude-side transcript store under <code>~/.claude/projects</code> — a store APPROACH indexes into but does not own (Claude Code controls its format and GC). It's included in backups because it's small and cheap, but restore is best-effort: §4.6's amnesia-with-notes is the contract when a transcript is gone. A heartbeat <b>orphan sweep</b> flags <code>sessions</code> rows whose transcript has vanished, so engine-side GC drift is seen before you hit it mid-conversation.</li>
+    <li><b>SQLite settings.</b> WAL mode, <code>synchronous=NORMAL</code>, <code>busy_timeout</code> set — single box, single writer; the snapshot below is the durability backstop. <code>state/</code> is <code>0700</code>, the db <code>0600</code>.</li>
+    <li><b>Migrations.</b> Numbered SQL migrations embedded in the daemon binary, applied in one transaction at startup; the daemon <em>refuses to start</em> on a schema version newer than it knows — downgrade protection beats mystery corruption.</li>
+    <li><b>Backup mechanism.</b> Nightly, after reflection: <code>VACUUM INTO</code> a dated snapshot (SQLite's own consistent-copy path — safe against a live WAL), then restic ships <code>~/approach</code> + snapshots + <code>~/.claude/projects</code> offsite (NAS/B2); retention 7 daily + 4 weekly. Git remotes already replicate beads and the rendered views continuously. <b>RPO: 24h for db state, ~continuous for git-synced truth.</b></li>
+    <li><b>Restore is a drill, not a document.</b> Order: workspace checkout → newest db snapshot → transcripts → <code>bd doctor</code>. A scripted <code>approach restore-drill</code> restores into a temp dir and asserts sessions/facts/events row counts — run quarterly. An untested backup is a hope, not a control.</li>
+  </ul>
 </section>
 
 <!-- 7. SECURITY -->
@@ -745,6 +758,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
     <li><b>Failure handling.</b> One rule, specified in §4.6: <b>retry only what provably did nothing; surface everything else.</b> Engine failures auto-retry (≤2, backoff) only when live <code>PostToolUse</code> accounting shows zero side effects this turn; anything ambiguous parks as <code>interrupted</code> and surfaces to the originating thread; terminal failures land in <code>dead_letters</code> with two surfacing paths and manual drain. Events are never silently dropped because every failure path ends in a durable, human-visible state. An always-on agent that fails silently reads as ignoring you, which is worse than being down.</li>
     <li><b>Task graph.</b> beads adds nothing resident — <code>bd</code> is a CLI over git-synced JSONL plus a local SQLite cache. The heartbeat polls <code>bd ready</code>; worker sessions take and close issues from repo cwds. Pin the version (young, fast-moving project) and treat <code>.beads/</code> as part of the workspace backup. Lease/assignment semantics are already in the tool for the day you run more than one worker.</li>
     <li><b>Config.</b> Model routing, the policy matrix, channel bindings, session TTLs, and retry policy live in one file — <code>approach.toml</code> (§6) — not smeared across hook scripts.</li>
+    <li><b>Backup.</b> Nightly snapshot + restic offsite, two durability tiers, quarterly restore drill — specified in §6 (Durability, backup, recovery). The panic command's quiet sibling: <code>approach restore-drill</code>.</li>
     <li><b>Interop.</b> Portability into other harnesses is explicitly a non-goal — the Hermes split was evaluated and rejected on structural grounds (§10), so the layout in §6 is optimized for this system, not for export. One asymmetry that still matters: SKILL.md does <em>not</em> travel to Codex, which lives in an AGENTS.md + prompts world — don't count the skill library as shared with the second engine.</li>
   </ul>
 </section>
@@ -775,7 +789,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </div>
   <div class="phase">
     <div class="ptag">P5</div>
-    <div><h3>Orchestration — task graph (C13)</h3><p>Adopt beads: heartbeat polls <code>bd ready</code>; worker sessions (keyed <code>task:&lt;issue-id&gt;</code>, repo cwd) take, advance, and close issues; blocked work parks with <code>blocked_on</code> instead of leaking into facts or HEARTBEAT.md. <b>Depends only on P2</b> — the number is ordinal, not sequential; most builds should run this before or alongside P4, and closed-issue trajectories make P4's reflector better.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent resumes a multi-session coding task after a reboot and closes it</div></div>
+    <div><h3>Orchestration — task graph (C13)</h3><p>Adopt beads: heartbeat polls <code>bd ready</code>; worker sessions (keyed <code>task:&lt;issue-id&gt;</code>, repo cwd) take, advance, and close issues; blocked work parks with <code>blocked_on</code> instead of leaking into facts or HEARTBEAT.md. <b>Depends on P1 + P2 and the C9/C10 baseline</b> (workers are unattended agents — the policy gate and sandbox are prerequisites, not parallel work); the number is ordinal, not sequential — run this before or alongside P4, and closed-issue trajectories make P4's reflector better.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent resumes a multi-session coding task after a reboot and closes it; a mid-task daemon kill releases or resumes cleanly per §4.5</div></div>
   </div>
   <p style="margin-top:18px"><b>Cross-cutting (do alongside P1–P4, not after):</b> C9 policy gate + C10 sandbox. Add the <code>PreToolUse</code> gate the moment the agent can send or delete anything. One sequencing honesty note: P2's exit criterion ("surfaces a deadline unprompted") already requires proactive <em>sends</em> — so the matrix's ask/allow path for sends, and at least the skeleton of §4.4, must exist by end of P2, not "alongside eventually." C12 (Codex critic) can land any time after P0 — it's an afternoon — and ships at launch as an on-demand critic; it becomes load-bearing only if F2 lands (§10).</p>
 </section>
@@ -845,7 +859,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
 </section>
 
 <footer>
-  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs<br>
+  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs · v1.5: durability tiers + restore drill, atomic worker claims, restart reconciliation<br>
   Engine capabilities (headless, resume, hooks, MCP, permission tooling) verified against current Claude Code docs.
 </footer>
 
