@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"io"
 	"runtime/debug"
+
+	"github.com/brian-bell/approach/internal/config"
 )
 
 const usage = `usage: approach <command>
 
 commands:
-  version    print the approach version
+  config check <path>    validate an approach.toml file
+  version                print the approach version
 `
 
 // Run executes the subcommand named in args and returns the process exit code.
@@ -24,10 +27,25 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "version":
 		fmt.Fprintf(stdout, "approach %s\n", version())
 		return 0
+	case "config":
+		return runConfig(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "approach: unknown command %q\n%s", args[0], usage)
 		return 2
 	}
+}
+
+func runConfig(args []string, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "check" {
+		fmt.Fprint(stderr, usage)
+		return 2
+	}
+	if _, err := config.Load(args[1]); err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+	fmt.Fprintln(stdout, "config OK")
+	return 0
 }
 
 func version() string {

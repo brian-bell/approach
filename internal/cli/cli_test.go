@@ -33,6 +33,24 @@ func TestRun(t *testing.T) {
 			wantCode:   2,
 			wantStderr: "unknown command",
 		},
+		{
+			name:       "config check on a valid file exits 0",
+			args:       []string{"config", "check", "../../docs/approach.toml.example"},
+			wantCode:   0,
+			wantStdout: "config OK",
+		},
+		{
+			name:       "config check on an invalid file exits 1 with the errors",
+			args:       []string{"config", "check", "testdata/invalid.toml"},
+			wantCode:   1,
+			wantStderr: "models.message",
+		},
+		{
+			name:       "config check without a path exits 2",
+			args:       []string{"config", "check"},
+			wantCode:   2,
+			wantStderr: "usage:",
+		},
 	}
 
 	for _, tt := range tests {
