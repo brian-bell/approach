@@ -61,11 +61,8 @@
   .instrument .ihead{display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap}
   .instrument .ilabel{font-family:var(--mono); font-size:11px; letter-spacing:.18em; color:#7E93A5; text-transform:uppercase}
   .gauge{display:flex; align-items:baseline; gap:10px}
-  .gauge .num{font-family:var(--mono); font-size:40px; font-weight:700; color:#F0F5F9; line-height:1}
   .gauge .unit{font-family:var(--mono); font-size:13px; color:#7E93A5}
-  .bar{height:8px; border-radius:6px; background:#243343; margin:16px 0 20px; overflow:hidden; display:flex}
-  .bar .have{background:var(--eng); width:70%}
-  .bar .todo{background:var(--sched); width:30%}
+  .subs{margin-top:16px}
   .subs{display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:1px; background:#1c2836; border-radius:9px; overflow:hidden}
   .sub{background:#131c26; padding:11px 13px; display:flex; align-items:flex-start; gap:10px}
   .sub .led{width:8px;height:8px;border-radius:50%;margin-top:6px;flex:none}
@@ -153,7 +150,7 @@
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.5</span></div>
+  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.6</span></div>
   <h1 class="title">Wrapping Claude Code into a persistent agent — <span class="call">APPROACH</span></h1>
   <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — with its own thin channel adapters, running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the part that is real work.</p>
   <div class="meta">
@@ -165,12 +162,11 @@
   </div>
 
   <!-- SIGNATURE: coverage instrument -->
-  <div class="instrument" role="img" aria-label="Coverage instrument: about 70 percent installed, 30 percent build required">
+  <div class="instrument" role="img" aria-label="Build-state board: engine installed, harness is the build">
     <div class="ihead">
-      <span class="ilabel">Harness coverage · by capability</span>
-      <div class="gauge"><span class="num">70</span><span class="unit">% installed&nbsp;/&nbsp;30% build req'd</span></div>
+      <span class="ilabel">Build-state board · mirrors the §3 register</span>
+      <div class="gauge"><span class="unit">engine installed&nbsp;·&nbsp;harness is the build</span></div>
     </div>
-    <div class="bar"><div class="have"></div><div class="todo"></div></div>
     <div class="subs">
       <div class="sub build"><span class="led"></span><div><div class="sname">Channel adapters</div><div class="sstat">build · thin — native (cc-connect rejected, §10)</div></div></div>
       <div class="sub on"><span class="led"></span><div><div class="sname">Reasoning engine</div><div class="sstat">installed · claude -p</div></div></div>
@@ -198,7 +194,7 @@
   <p class="lead">Reconstruct the useful properties of OpenClaw / Hermes on infrastructure you own and understand, so the "always-on, self-improving assistant" behavior isn't rented from a framework whose harness you can't see into.</p>
   <h3>Goals</h3>
   <ul>
-    <li><b>Persistence.</b> A message, a webhook, or a timer continues the <em>same</em> live session hours later — not a fresh stateless invocation.</li>
+    <li><b>Persistence.</b> Two deliberate shapes, not one. <em>Conversational threads:</em> a message (or a webhook targeting a thread) continues the <em>same</em> live session hours or days later — not a fresh stateless invocation. <em>Scheduled runs:</em> heartbeats and cron fires start deliberately fresh sessions over durable state (§4.2) — continuity lives in facts, schedules, and the task graph, not in an ever-growing timer session.</li>
     <li><b>Proactivity.</b> The agent wakes itself on a schedule, decides whether anything is worth surfacing, and stays quiet when it isn't.</li>
     <li><b>Accretion.</b> Facts and successful patterns persist across sessions and are pulled back in on relevance — the agent's competence compounds.</li>
     <li><b>Ownership.</b> Everything runs as plain files, SQLite, and systemd units on your box, behind Tailscale, with no vendor control plane.</li>
@@ -514,7 +510,7 @@ flowchart LR
     <li><b>Compaction is where memory rots silently.</b> Summarizing yesterday's logs discards detail you can't get back. <code>log_entries</code> rows are append-only; compaction writes <em>additional</em> rollup rows (rendered into <code>rollups/</code>), never destructively — the raw rows survive every summary pass.</li>
     <li><b>Reflection is a job, not a hook side effect.</b> Every run is a <code>reflection_jobs</code> row (§6) under a single-holder lease with a durable watermark over <code>log_entries</code> + closed sessions. <b>The nightly sweep is the correctness guarantee</b> — it reflects everything from the last watermark to now, so nothing is ever missed; <code>Stop</code>/<code>SessionEnd</code> triggers are opportunistic freshness enqueues of the same job kinds, deduped by the unique <code>(kind, range)</code> key — nice when they run, harmless when the daemon dies (tonight's sweep covers it). A fact merge is one transaction: insert the merged fact, set <code>superseded_by</code> on the olds, copy <code>fact_sources</code> rows, append the digest entry — no partially-merged state is ever visible.</li>
   </ul>
-  <div class="callout mem"><b>Decision hinge — resolved.</b> C4/C5/C6 are a weekend or two of plumbing over primitives you already have. Within C8, the open-ended part is F2 skill synthesis; F1 fact curation is bounded by the v1 posture above (auto-write + digest + append-only means curation errors are recoverable, not compounding). §10 records the decision: build F1/F3 now, defer F2 behind an evidence trigger, Hermes rejected.</div>
+  <div class="callout mem"><b>Decision hinge — resolved.</b> C4/C5/C6 are bounded plumbing (S–M) over primitives you already have. Within C8, the open-ended part is F2 skill synthesis; F1 fact curation is bounded by the v1 posture above (auto-write + digest + append-only means curation errors are recoverable, not compounding). §10 records the decision: build F1/F3 now, defer F2 behind an evidence trigger, Hermes rejected.</div>
 </section>
 
 <!-- 6. DATA MODEL -->
@@ -773,25 +769,25 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </div>
   <div class="phase">
     <div class="ptag">P1</div>
-    <div><h3>Persistence — first adapter (C1) + session router (C4)</h3><p>One native channel adapter (Discord DM via discordgo) feeding the §6 event contract, then SQLite <code>thread_key → session_id</code>; resolve + <code>--resume</code>; pre-pinned UUIDs via <code>--session-id</code> under the <code>one_live_session</code> index (§6), events durable on receipt (§4.1). Now conversations survive across messages and restarts. The <code>turns</code> table (C11) rides along — it's ten lines once you're already parsing <code>stream-json</code>, and every later phase wants its data.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — a thread continues after hours/reboot, including a mid-turn kill: the event resurfaces as interrupted, nothing re-runs, nothing is lost</div></div>
+    <div><h3>Persistence — first adapter (C1) + session router (C4)</h3><p>One native channel adapter (Discord DM via discordgo) feeding the §6 event contract, then SQLite <code>thread_key → session_id</code>; resolve + <code>--resume</code>; pre-pinned UUIDs via <code>--session-id</code> under the <code>one_live_session</code> index (§6), events durable on receipt (§4.1). Now conversations survive across messages and restarts. The <code>turns</code> table (C11) rides along — it's ten lines once you're already parsing <code>stream-json</code>, and every later phase wants its data.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — a thread continues after hours/reboot &nbsp;·&nbsp; DRILLS (test-first) — <code>kill -9</code> mid-turn → interrupted, no side-effect replay · duplicate channel delivery → one turn (dedup_key) · two first-messages race → one session (index holds) · rate-limit storm → absorbed by retry rules</div></div>
   </div>
   <div class="phase">
     <div class="ptag">P2</div>
-    <div><h3>Proactivity — heartbeat (C5)</h3><p><code>HEARTBEAT.md</code> + <code>systemd</code> timer + <code>HEARTBEAT_OK</code> drop. Add webhook and NL-cron entry points.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent surfaces a deadline unprompted, stays silent otherwise</div></div>
+    <div><h3>Proactivity — heartbeat (C5)</h3><p><code>HEARTBEAT.md</code> + <code>systemd</code> timer; silence is the <em>absence of a <code>notify</code> call</em> — no sentinel strings (§4.2). Add webhook and NL-cron entry points.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent surfaces a deadline unprompted, stays silent otherwise &nbsp;·&nbsp; DRILLS — 3h downtime → one coalesced catch-up with missed_count · slow fire + due occurrence → skip recorded · same deadline twice → ledger suppresses re-nag</div></div>
   </div>
   <div class="phase">
     <div class="ptag">P3</div>
-    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>facts + fact_sources + log_entries (rendered to MEMORY.md / daily .md), dual FTS5, session_facts retrieval delta, owner digest.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded; digest arrives; reindex rebuilds cleanly</div></div>
+    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>facts + fact_sources + log_entries (rendered to MEMORY.md / daily .md), dual FTS5, session_facts retrieval delta, owner digest.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded &nbsp;·&nbsp; DRILLS — <code>approach reindex</code> rebuilds both FTS tables to identical results · untrusted-derived fact stays out of context until digest-ack (poisoning drill) · restore-drill passes on a fresh checkout</div></div>
   </div>
   <div class="phase p4">
     <div class="ptag">P4</div>
-    <div><h3>Accretion — reflection loop (C8, F1/F3 only)</h3><p>Fact extraction with provenance/confidence/supersession, non-destructive compaction, owner digest, and tagged <code>repeated-pattern</code> rows. Skill synthesis (F2) is <b>deferred</b> behind the evidence trigger (§10) and is not part of this phase.</p><div class="pmeta">EFFORT M &nbsp;·&nbsp; EXIT — facts accrete and dedup across a week of use; digest arrives and prunes; untrusted-derived facts stay out of context until acked</div></div>
+    <div><h3>Accretion — reflection loop (C8, F1/F3 only)</h3><p>Fact extraction with provenance/confidence/supersession, non-destructive compaction, owner digest, and tagged <code>repeated-pattern</code> rows. Skill synthesis (F2) is <b>deferred</b> behind the evidence trigger (§10) and is not part of this phase.</p><div class="pmeta">EFFORT M &nbsp;·&nbsp; EXIT — facts accrete and dedup across a week of use; digest arrives and prunes &nbsp;·&nbsp; DRILLS — re-run reflection over the same watermark range → zero duplicate facts (idempotency) · daemon killed mid-reflection → tonight's sweep covers the gap · fact merge interrupted → no partially-merged state visible</div></div>
   </div>
   <div class="phase">
     <div class="ptag">P5</div>
-    <div><h3>Orchestration — task graph (C13)</h3><p>Adopt beads: heartbeat polls <code>bd ready</code>; worker sessions (keyed <code>task:&lt;issue-id&gt;</code>, repo cwd) take, advance, and close issues; blocked work parks with <code>blocked_on</code> instead of leaking into facts or HEARTBEAT.md. <b>Depends on P1 + P2 and the C9/C10 baseline</b> (workers are unattended agents — the policy gate and sandbox are prerequisites, not parallel work); the number is ordinal, not sequential — run this before or alongside P4, and closed-issue trajectories make P4's reflector better.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent resumes a multi-session coding task after a reboot and closes it; a mid-task daemon kill releases or resumes cleanly per §4.5</div></div>
+    <div><h3>Orchestration — task graph (C13)</h3><p>Adopt beads: heartbeat polls <code>bd ready</code>; worker sessions (keyed <code>task:&lt;issue-id&gt;</code>, repo cwd) take, advance, and close issues; blocked work parks with <code>blocked_on</code> instead of leaking into facts or HEARTBEAT.md. <b>Depends on P1 + P2 and the C9/C10 baseline</b> (workers are unattended agents — the policy gate and sandbox are prerequisites, not parallel work); the number is ordinal, not sequential — run this before or alongside P4, and closed-issue trajectories make P4's reflector better.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent resumes a multi-session coding task after a reboot and closes it &nbsp;·&nbsp; DRILLS — mid-task daemon kill → resume-or-release per §4.5 · two heartbeat fires, one ready issue → one claim · foreign-assigned issue → skipped · worker hits --max-turns → parked with note, claim released</div></div>
   </div>
-  <p style="margin-top:18px"><b>Cross-cutting (do alongside P1–P4, not after):</b> C9 policy gate + C10 sandbox. Add the <code>PreToolUse</code> gate the moment the agent can send or delete anything. One sequencing honesty note: P2's exit criterion ("surfaces a deadline unprompted") already requires proactive <em>sends</em> — so the matrix's ask/allow path for sends, and at least the skeleton of §4.4, must exist by end of P2, not "alongside eventually." C12 (Codex critic) can land any time after P0 — it's an afternoon — and ships at launch as an on-demand critic; it becomes load-bearing only if F2 lands (§10).</p>
+  <p style="margin-top:18px"><b>Security is a gate, not a stripe:</b> the <b>minimum secure execution profile — C9 skeleton (matrix + deny-and-resume for sends) and the C10 container profile — is a hard prerequisite for any proactive send (P2 exit) and any worker (P5 start)</b>, not parallel optional work. Both are M-sized components inside the plan's scope, with their own drills: C9 — replayed approval rejected · digest-swap between approval and execution rejected · expired approval starts a fresh cycle · tainted session observed shifting one matrix column; C10 — escape smoke (host mount probe, credential probe, egress probe from inside the sandbox all fail) · teardown leaves nothing running. Migrations carry their own: daemon refuses to start on a newer schema. Estimates throughout are effort classes (S/M/L/XL), deliberately not calendar promises. C12 (Codex critic) can land any time after P0 — effort S — and ships at launch as an on-demand critic; it becomes load-bearing only if F2 lands (§10).</p>
 </section>
 
 <!-- 10. BUILD VS BUY -->
@@ -859,7 +855,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
 </section>
 
 <footer>
-  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs · v1.5: durability tiers + restore drill, atomic worker claims, restart reconciliation<br>
+  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs · v1.5: durability tiers + restore drill, atomic worker claims, restart reconciliation · v1.6: gauge dropped for build-state board, fault drills per phase, security as hard gate, persistence goal split, sentinel removed<br>
   Engine capabilities (headless, resume, hooks, MCP, permission tooling) verified against current Claude Code docs.
 </footer>
 
