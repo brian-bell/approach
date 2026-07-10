@@ -150,7 +150,7 @@
 <div class="wrap">
 
 <header class="doc">
-  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.7</span></div>
+  <div class="kicker"><span class="dot"></span><span class="eyebrow">Personal Agent Harness · Design Spec · v1.8</span></div>
   <h1 class="title">Wrapping Claude Code into a persistent agent — <span class="call">APPROACH</span></h1>
   <p class="thesis">A self-hosted harness that turns Claude Code from a tool you invoke into a process that persists, acts on its own schedule, and curates its own memory — with its own thin channel adapters, running on the homelab box behind Tailscale. This spec sizes exactly how much of that you already have, and marks the part that is real work.</p>
   <div class="meta">
@@ -337,7 +337,7 @@ flowchart TB
   <h2>Control flows</h2>
 
   <h3>4.1 &nbsp;Inbound message</h3>
-  <p>The hot path. First act on receipt: <b>persist the event row</b> (§6) — gateway channels don't redeliver, so receipt is the last moment durability is free; everything after is recoverable from the table. The engine never invents a session — the router resolves it from the store — and the <code>Stop</code> hook records the turn asynchronously so the reply isn't blocked on memory writes. Queues are <b>keyed by <code>thread_key</code>, not <code>session_id</code>, and claimed <em>before</em> resolution</b>: two simultaneous first-messages to a new thread serialize in the queue, and the sessions schema's partial unique index (§6) backstops the one-active-session-per-thread invariant even against daemon bugs. In-memory queues are just an index over unprocessed event rows — per-thread FIFO by receipt order, rebuilt from the table on restart. The reply leg is <b>at-least-once</b>: the event advances to <code>replied</code> only after the channel adapter confirms the platform accepted the send, so a crash in that window re-sends on restart — a rare duplicated chat message is accepted; a silently eaten reply is not.</p>
+  <p>The hot path. First act on receipt: <b>persist the event row</b> (§6) — gateway channels don't redeliver, so receipt is the last moment durability is free; everything after is recoverable from the table. The engine never invents a session — the router resolves it from the store — and the <code>Stop</code> hook records the turn asynchronously so the reply isn't blocked on memory writes. Queues are <b>keyed by <code>thread_key</code>, not <code>session_id</code>, and claimed <em>before</em> resolution</b>: two simultaneous first-messages to a new thread serialize in the queue, and the sessions schema's partial unique index (§6) backstops the one-active-session-per-thread invariant even against daemon bugs. In-memory queues are just an index over unprocessed event rows — per-thread FIFO by receipt order, rebuilt from the table on restart. The reply leg is <b>at-least-once and durable</b>: the rendered reply is written to a <code>deliveries</code> outbox row (§6) <em>before</em> the first send attempt, the event advances to <code>replied</code> only after the adapter confirms the platform accepted it, and unacked delivery rows re-send on restart — a crash after compose-but-before-ack re-sends from the persisted payload, so a rare duplicated chat message is accepted; a silently eaten reply is not.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
@@ -354,7 +354,7 @@ sequenceDiagram
   R->>S: persist event row (received)
   Note over R: per-thread queue · claimed by thread_key before resolution
   R->>S: resolve thread_key
-  S-->>R: session_id (or create: pinned UUID, status creating)
+  S-->>R: session_id (existing) — or NEW: daemon pins UUID, spawns --session-id, status creating
   R->>A: request context
   A-->>R: base + facts + recent log
   R->>C: claude -p --resume id (stream-json)
@@ -374,7 +374,7 @@ sequenceDiagram
   </figure>
 
   <h3>4.2 &nbsp;Heartbeat (proactivity)</h3>
-  <p>A timer, not a message, drives this. The agent reads a checklist and exercises <em>judgment on a schedule</em>; a no-op result is swallowed so silence is the default. Run it on a cheap model (Haiku) to keep idle cost near zero. Three protocol decisions: heartbeats run in a <b>fresh session every fire</b> (a persistent heartbeat session accumulates cruft and cost); "something to say" is expressed as a <b><code>notify</code> tool call, never a sentinel string parsed out of free text</b> — no tool call means silence; and the prompt reads/writes a <code>notifications</code> ledger (<code>item_key, target, notified_at, snooze_until</code> — keyed per recipient, §6) so a 30-minute timer doesn't re-nag the same deadline 16 times a day. NL-cron ("brief me at 8am") is a <code>schedules</code> row the agent inserts via a skill — the scheduler fires rows, not just <code>HEARTBEAT.md</code>. Every fire has a manufactured identity — <code>(schedule_id, occurrence_time)</code> is the event's idempotency key — and misfires <b>coalesce with a staleness flag</b>: after downtime, at most one catch-up event fires per schedule, keyed to the newest missed occurrence and carrying <code>missed_count</code> + lateness so the <em>model</em> judges whether a 3-hour-late brief still ships; older occurrences are recorded as skipped, never enqueued. Three more contract points. <b>Trust:</b> system-generated events (heartbeat, cron, reflection triggers) carry <code>trust=system</code> — stampable only by the daemon itself, never by an adapter; it reads like owner for reads, notify, and task-graph operations, but can never satisfy an approval, and its sends are restricted to configured targets. <b>Time:</b> each schedule stores an IANA timezone; cron expressions are DST-aware local wall-clock (a nonexistent 2:30am fires at the next valid instant; a repeated one fires once), and occurrences are recorded UTC + zone. <b>Overlap:</b> <code>max_overlap = 1</code> by default — an occurrence due while the previous fire's session still runs is recorded as a skipped event row, never enqueued; fires and skips alike are event rows, so the per-fire audit trail is the <code>events</code> table itself, and a chronically-skipping schedule shows up in the digest as a tuning signal. One standing checklist item: <code>bd ready</code> — unblocked task-graph work is surfaced (or picked up, §4.5) through the same judgment-on-a-schedule loop. The heartbeat is the <em>only</em> component that asks beads what's ready; beads never initiates.</p>
+  <p>A timer, not a message, drives this. The agent reads a checklist and exercises <em>judgment on a schedule</em>; a no-op result is swallowed so silence is the default. Run it on a cheap model (Haiku) to keep idle cost near zero. Three protocol decisions: heartbeats run in a <b>fresh session every fire</b> (a persistent heartbeat session accumulates cruft and cost); "something to say" is expressed as a <b><code>notify</code> tool call, never a sentinel string parsed out of free text</b> — no tool call means silence; and the prompt reads/writes a <code>notifications</code> ledger (<code>item_key, target, notified_at, snooze_until</code> — keyed per recipient, §6) so a 30-minute timer doesn't re-nag the same deadline 16 times a day. NL-cron ("brief me at 8am") is a <code>schedules</code> row the agent inserts via a skill — the scheduler fires rows, not just <code>HEARTBEAT.md</code>. Every fire has a manufactured identity — <code>(schedule_id, occurrence_time)</code> is the event's idempotency key — and misfires <b>coalesce with a staleness flag</b>: after downtime, at most one catch-up event fires per schedule, keyed to the newest missed occurrence and carrying <code>missed_count</code> + lateness so the <em>model</em> judges whether a 3-hour-late brief still ships; older occurrences are recorded as skipped, never enqueued. Three more contract points. <b>Trust:</b> system-generated events (heartbeat, cron, reflection triggers) carry <code>trust=system</code> — stampable only by the daemon itself, never by an adapter; it reads like owner for reads, notify, and task-graph operations, but can never satisfy an approval, and its sends are restricted to configured targets. <b>No escalation via schedules:</b> a cron fire runs at <code>min(system, schedules.created_trust)</code> (§6, §7) — a schedule inserted from a known or gated request fires at <em>that</em> trust, never system, so lower-trust content can't launder itself into a privileged recurring job. Creating or editing a schedule is itself a gated matrix verb (§7). <b>Time:</b> each schedule stores an IANA timezone; cron expressions are DST-aware local wall-clock (a nonexistent 2:30am fires at the next valid instant; a repeated one fires once), and occurrences are recorded UTC + zone. <b>Overlap:</b> <code>max_overlap = 1</code> by default — an occurrence due while the previous fire's session still runs is recorded as a skipped event row, never enqueued; fires and skips alike are event rows, so the per-fire audit trail is the <code>events</code> table itself, and a chronically-skipping schedule shows up in the digest as a tuning signal. One standing checklist item: <code>bd ready</code> — unblocked task-graph work is surfaced (or picked up, §4.5) through the same judgment-on-a-schedule loop. The heartbeat is the <em>only</em> component that asks beads what's ready; beads never initiates.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
@@ -399,7 +399,7 @@ sequenceDiagram
   </figure>
 
   <h3>4.3 &nbsp;Context assembly</h3>
-  <p>What actually goes into each turn. Keep it lean: the model gets a <em>skills list</em> (names + descriptions, not bodies) and only the facts that retrieve against the current input — this is where a black-box harness quietly bloats your token bill. Mechanism is pinned: the <code>UserPromptSubmit</code> hook, not a prompt prefix. And because <code>--resume</code> already carries the session's history, the full fact package is injected <b>only on session start/rotation</b>; per-turn injection is the <em>retrieval delta</em> — facts matching this input that aren't already in-session. "Already in-session" is a ledger, not a guess: the assembler records every injected fact id in <code>session_facts</code> (§6), and each turn injects FTS hits minus that set — ranked by match score, confidence, and recency, capped by a top-k / token budget in <code>approach.toml</code> (start k=8). Re-paying the whole fact block every turn is exactly the bloat this figure warns about.</p>
+  <p>What actually goes into each turn. Keep it lean: the model gets a <em>skills list</em> (names + descriptions, not bodies) and only the facts that retrieve against the current input — this is where a black-box harness quietly bloats your token bill. Mechanism is pinned: the <code>UserPromptSubmit</code> hook, not a prompt prefix. And because <code>--resume</code> already carries the session's history, the full fact package is injected <b>only on session start/rotation</b>; per-turn injection is the <em>retrieval delta</em> — facts matching this input that aren't already in-session. "Already in-session" is a ledger, not a guess: the assembler records every injected fact id in <code>session_facts</code> (§6), and each turn injects FTS hits minus that set — ranked by match score, confidence, and recency, capped by a top-k / token budget in <code>approach.toml</code> (start k=8). <b>Retrieval is trust-filtered in both directions.</b> The query excludes (a) rows where <code>session.trust &lt; fact.min_trust</code> — so owner-private facts (default <code>min_trust=owner</code>) never surface into a known-group thread, closing the outbound leak that mirrors the inbound one; (b) unacked <code>untrusted-derived</code> rows (§5); and (c) superseded rows (<code>superseded_by IS NOT NULL</code>) — ranked-down is not enough, a stale contradictory fact must not re-enter at all. <code>system</code> reads as owner. Re-paying the whole fact block every turn is exactly the bloat this figure warns about.</p>
   <figure>
     <pre class="mermaid">
 flowchart LR
@@ -418,7 +418,7 @@ flowchart LR
   </figure>
 
   <h3>4.4 &nbsp;Approval round-trip (gated verbs)</h3>
-  <p>The hardest flow in the system, so it's pinned: <b>deny-and-resume</b>. Hooks are synchronous with timeouts — the gate never holds a turn open waiting for a human. It records the intended call, denies with a reason, and lets the turn end gracefully; your approval arrives later as just another inbound event that resumes the session. Approvals are durable rows, so they survive restarts, and a gated call can never fire without a matching approved row. The binding is cryptographic, not textual: the row stores the canonical tool name and a <b>digest of the normalized JSON arguments</b> (the rendered string is display-only), plus the requesting event id, session, and timestamps; the approval id doubles as the nonce. <b>Authorization:</b> an approval event is valid iff its sender resolves to the owner identity on a <code>trust=owner</code> surface — any owner surface, not just the requesting one (approve from Slack what Discord asked; it's the same authenticated human). <b>Expiry: 1 hour</b> — a stale "approve 42" can't fire tomorrow against forgotten context; expired means a fresh request cycle. Match-and-consume is one transaction; if the resumed model re-issues a call whose digest differs from what was approved, that is a <em>new approval cycle</em>, never a fuzzy match.</p>
+  <p>The hardest flow in the system, so it's pinned: <b>deny-and-resume</b>. Hooks are synchronous with timeouts — the gate never holds a turn open waiting for a human. It records the intended call, denies with a reason, and lets the turn end gracefully; your approval arrives later as just another inbound event that resumes the session. Approvals are durable rows, so they survive restarts, and a gated call can never fire without a matching approved row. The binding is cryptographic, not textual: the row stores the canonical tool name and a <b>digest of the normalized JSON arguments</b> (the rendered string is display-only), plus the requesting event id, session, and timestamps; the approval id doubles as the nonce. <b>Authorization:</b> an approval event is valid iff its sender's <code>owner_id</code> (from the <code>identities</code> table, §6) matches — any owner surface, not just the requesting one (approve from Slack what Discord asked; it's the same authenticated human). <b>Expiry: 1 hour</b> — a stale "approve 42" can't fire tomorrow against forgotten context; expired means a fresh request cycle. <b>Rotation voids approvals:</b> if the bound session rotates (idle TTL, turn cap, resume-failure) before the approval arrives, the outstanding approval is cancelled (<code>status=expired</code>) and the action re-requests on the successor session — a stale approval never fires into a fresh, unexpected session. Match-and-consume is one transaction that <em>re-evaluates the current matrix</em> — including the session's <code>tainted</code> flag — at execution time, not just the digest; turn serialization guarantees no <code>PostToolUse</code> (hence no taint change) can slip between the deny that ended the turn and the approve that resumes it, so the re-check is belt-and-suspenders, not a race. If the resumed model re-issues a call whose digest differs from what was approved, that is a <em>new approval cycle</em>, never a fuzzy match.</p>
   <figure>
     <pre class="mermaid">
 sequenceDiagram
@@ -445,7 +445,7 @@ sequenceDiagram
 
   <h3>4.5 &nbsp;Task orchestration (coding-agent work)</h3>
   <p>Multi-session work lives in beads (C13), not in prompts. A ready issue becomes a <b>worker session</b>: a row in the same <code>sessions</code> table, keyed <code>task:&lt;issue-id&gt;</code>, spawned from the repo's cwd (stored per session — §6; this is what forces the <code>sessions.cwd</code> column, since <code>--resume</code> is scoped to the spawn directory). Workers run under the same policy matrix and the same per-thread queue; a worker surviving a reboot is just C4 persistence applied to work instead of conversation. Done → <code>bd close -r</code> with a closing reason the reflector (§5) can read; stuck → <code>bd dep add &lt;issue&gt; &lt;blocker&gt;</code> (or <code>bd update --defer</code>), and the issue drops out of <code>ready</code> until its blocker clears — parked, not nagging, not leaking into facts.</p>
-  <p><b>The claim is atomic because the daemon is the lock.</b> One serialized claim section: check <code>max_workers</code> (start N=1) → insert the <code>task:&lt;id&gt;</code> session row (the <code>one_live_session</code> index makes a double-spawn a constraint violation) → <code>bd update --claim</code> as the durable record. Two heartbeat fires can both see an issue as ready; only one exits the claim section with it. bd's claim field is a <em>record, not a mutex</em> — foreign claims are respected (skip ready issues whose assignee isn't us), and cross-machine lease semantics stay out of scope until a second box exists. Each worker session records its <b>origin thread</b>, so progress reports and recovery notes have an address. <b>Restart reconciliation:</b> on boot, sweep active <code>task:*</code> sessions — if the transcript resumes (§4.6 assert), the worker re-enters its queue with a system-trust <em>"you were interrupted; reassess and continue"</em> nudge, half-done work visible via <code>git status</code> in its own repo; if the transcript is gone, mark <code>resume_failed</code>, <em>release the bd claim</em> (the issue returns to ready), and post a note to the origin thread. Mid-task events follow §4.6 — no side-effect replay, ever.</p>
+  <p><b>The claim is atomic because the daemon is the lock, and bd runs daemon-side.</b> Workers never invoke <code>bd</code> from inside their sandbox — the sandbox has zero credentials and can't reach the Dolt remote (§7). Instead, <code>bd</code> mutations against the single central store (<code>~/approach/.beads</code>, §6) are a <b>gated daemon-side verb</b> (the "Task graph writes" matrix row, §7), executed with the daemon's credential. One serialized claim section: check <code>max_workers</code> (start N=1) → insert the <code>task:&lt;id&gt;</code> session row (two schema indexes bite here — <code>one_live_session</code> stops a double-spawn, <code>one_worker_per_repo</code> stops two workers sharing a repo cwd) → <code>bd update --claim</code> as the durable record. Two heartbeat fires can both see an issue as ready; only one exits the claim section with it. bd's claim field is a <em>record, not a mutex</em> (verified: atomic field write, no lease/expiry — §8), so a crashed worker's claim is released by the restart sweep below, not by a timeout. Each worker session records its <b>origin thread</b>. A worker turn is a distinct event <code>kind=task</code> carrying <code>trust=system-worker</code> — it routes to the interactive model tier, <em>never Haiku</em> (a cheap model on unattended coding work is the §11 runaway risk made worse), reads as system for bd/repo operations, and can never satisfy an approval. <b>Restart reconciliation:</b> on boot, sweep active <code>task:*</code> sessions — if the transcript resumes (§4.6 assert), the worker re-enters its queue with a <em>"you were interrupted; reassess and continue"</em> nudge, half-done work visible via <code>git status</code> in its own repo; if the transcript is gone, mark <code>resume_failed</code>, <em>release the bd claim</em> (the issue returns to ready), and post a note to the origin thread. Mid-task events follow §4.6 — no side-effect replay, ever.</p>
   <figure>
     <pre class="mermaid">
 flowchart LR
@@ -453,7 +453,7 @@ flowchart LR
   RDY --> PICK["Pick issue<br/>priority + policy"]:::appr
   PICK --> CLM["Daemon claim section<br/>max_workers · session row<br/>· bd --claim"]:::appr
   CLM --> WK["Worker session<br/>claude -p · repo cwd<br/>thread_key task:id"]:::eng
-  WK -->|done| CL["bd close<br/>+ closing note"]:::mem
+  WK -->|done| CL["daemon: bd close -r<br/>+ closing reason"]:::mem
   WK -->|stuck| BL["bd dep add<br/>blocker"]:::mem
   BL -.blocker clears.-> RDY
   CL --> RF["Reflector reads<br/>trajectory · §5"]:::mem
@@ -504,7 +504,7 @@ flowchart LR
 
   <h3>Why it's the hard part</h3>
   <ul>
-    <li><b>Fact curation is lossy and adversarial to itself.</b> Naive "append what you learned" produces contradictory, duplicated, stale facts within days. You need dedup/merge, supersession ("X moved from A to B"), and decay — a small ontology problem, not a prompt. The <code>facts</code> table in §6 makes these row operations instead of markdown surgery, which is why SQLite (not <code>MEMORY.md</code>) holds the truth. <b>V1 posture:</b> the reflector auto-writes facts with provenance, confidence, and supersession links; decay is passive (stale facts rank down in retrieval, never auto-delete); a periodic owner-DM digest lists new/merged/superseded facts for one-tap pruning — human oversight without a blocking queue. Facts derived from trajectories containing untrusted content are stored immediately but <em>excluded from context assembly until acknowledged in a digest</em> — the trust split applied at read time (§7, §11).</li>
+    <li><b>Fact curation is lossy and adversarial to itself.</b> Naive "append what you learned" produces contradictory, duplicated, stale facts within days. You need dedup/merge, supersession ("X moved from A to B"), and decay — a small ontology problem, not a prompt. The <code>facts</code> table in §6 makes these row operations instead of markdown surgery, which is why SQLite (not <code>MEMORY.md</code>) holds the truth. <b>V1 posture:</b> the reflector auto-writes facts with provenance, confidence, and supersession links; decay is passive (stale facts rank down in retrieval, never auto-delete); a periodic owner-DM digest lists new/merged/superseded facts for one-tap pruning — human oversight without a blocking queue. Facts derived from trajectories containing untrusted content are stored immediately but <em>excluded from context assembly until acknowledged in a digest</em> (the <code>acked</code> column, §6) — the trust split applied at read time (§7, §11). Crucially, <b>provenance is computed by the daemon, not the model</b>: an extracted fact's provenance is the <em>max-untrust over the <code>log_entries</code> the reflection job spanned</em> — if any source row in the watermark range was untrusted, the fact is <code>untrusted-derived</code> regardless of what the reflector's output claims. The one place the defense could rest on model cooperation is closed mechanically.</li>
     <li><b>Skill synthesis needs a taste filter — which is why it's deferred.</b> Auto-generating a <code>SKILL.md</code> from one lucky run yields brittle, over-fit skills. The honest version watches for <em>repeated</em> success, drafts, and puts a review gate in front of anything that lands in the skill dir — an open-ended tuning project, deferred behind the evidence trigger in §10. The gate's cheap concrete mechanism, when it lands, is <b>cross-model critique</b>: Claude drafts the skill, <code>codex exec</code> (C12) attacks it with a different model lineage — de-correlated errors are exactly what a same-family self-review can't give you — and you approve. C12 ships at launch as an on-demand critic, so the mechanism is proven before F2 needs it.</li>
     <li><b>Retrieval quality caps everything.</b> Start with SQLite FTS5 — fast, transparent, no embedding infra. Add vectors only if lexical recall provably misses. Resist the urge to over-build here first.</li>
     <li><b>Compaction is where memory rots silently.</b> Summarizing yesterday's logs discards detail you can't get back. <code>log_entries</code> rows are append-only; compaction writes <em>additional</em> rollup rows (rendered into <code>rollups/</code>), never destructively — the raw rows survive every summary pass.</li>
@@ -533,14 +533,29 @@ flowchart LR
 │  ├─ MEMORY.md           # RENDERED view of facts table — regenerate, don't hand-edit
 │  ├─ 2026-07-08.md       # RENDERED view of log_entries rows (§6) — same rule as MEMORY.md
 │  └─ rollups/            # non-destructive compactions (rows in log_entries, rendered here)
-├─ .beads/                # task graph (C13): embedded Dolt db (truth) + issues.jsonl (passive export)
+├─ .beads/                # THE central task graph (C13): embedded Dolt db (truth) + issues.jsonl export.
+│                         #   Authoritative — the heartbeat's bd ready and all worker claims target THIS
+│                         #   store, mutated daemon-side (§4.5). A coding repo's own .beads is that
+│                         #   project's concern, outside APPROACH orchestration.
 └─ state/
-   └─ approach.db         # SQLite: events · dead_letters · sessions · facts · fact_sources ·
-                          #   log_entries · reflection_jobs · session_facts · approvals ·
-                          #   notifications · schedules · turns · mem_fts · log_fts</pre>
+   └─ approach.db         # SQLite: identities · events · deliveries · dead_letters · sessions · facts ·
+                          #   fact_sources · log_entries · reflection_jobs · checkpoints · session_facts ·
+                          #   approvals · notifications · schedules · turns · mem_fts · log_fts</pre>
+
+  <h3>Identity &amp; trust resolution (the root of §7)</h3>
+  <p>Every gate and the approval flow reduce to one question: <em>is this sender the owner, someone known, or untrusted?</em> That is not inferred — it is a table lookup. A hand-enrolled <code>identities</code> table maps each <code>(channel, native_id)</code> to a trust level and, for owner rows, to a single canonical <code>owner_id</code>. The adapter looks up every inbound sender; a <b>hit</b> stamps the row's trust, a <b>miss</b> stamps <code>untrusted</code> — deny-by-default, so an unknown Discord DM is untrusted, not owner. Because all of the owner's surfaces share one <code>owner_id</code>, "approve from Slack what Discord asked" (§4.4) is an <code>owner_id</code> match, not a channel match. You enroll your own handful of ids once; a homelab has one owner and a few known people.</p>
+  <pre class="mono" style="background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:16px; font-size:12.5px; line-height:1.7; overflow-x:auto">CREATE TABLE identities (            -- hand-enrolled; seeded from approach.toml
+  channel   TEXT NOT NULL,           -- discord | slack | sms | …
+  native_id TEXT NOT NULL,           -- discord user_id, slack user, e164 …
+  trust     TEXT NOT NULL,           -- owner | known  (no row ⇒ untrusted, deny-by-default)
+  owner_id  TEXT,                    -- same value across ALL of the owner's surfaces —
+                                     --   this is what unifies cross-surface approval (§4.4)
+  label     TEXT,
+  PRIMARY KEY (channel, native_id)
+);</pre>
 
   <h3>Inbound event schema (C1 → C4 contract)</h3>
-  <p>The daemon's channel-adapter layer (C1) normalizes every entry point — message, heartbeat, webhook, cron, approval — into one shape. The <code>trust</code> field is load-bearing: policy (§7) and sandbox routing key off it, and it is <b>assigned by the adapter from channel identity — code you own by construction (§10) — never inferred from content</b>.</p>
+  <p>The daemon's channel-adapter layer (C1) normalizes every entry point — message, heartbeat, webhook, cron, approval — into one shape. The <code>trust</code> field is load-bearing: policy (§7) and sandbox routing key off it, and it is <b>assigned by the adapter via the <code>identities</code> lookup above — code you own by construction (§10) — never inferred from content, and defaulting to <code>untrusted</code> on any unmapped sender</b>.</p>
   <pre class="mono" style="background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:16px; font-size:12.5px; line-height:1.7; overflow-x:auto">{ "channel": "discord",
   "thread_key": "discord:dm:123",          // per-channel contract:
                                            //   discord:dm:&lt;user_id&gt; · discord:thread:&lt;thread_id&gt;
@@ -549,12 +564,16 @@ flowchart LR
   "dedup_key": "discord:msg:9871…",        // REQUIRED — event identity, adapter must pass it through:
                                            //   message → (channel, native message id)
                                            //   webhook → provider delivery id, else content hash
+                                           //     + receipt counter (so two identical legit pings
+                                           //     don't collide into a silent drop — §4.6)
                                            //   heartbeat/cron → (schedule_id, occurrence_time)
   "sender": "brian",
-  "trust": "owner",                        // owner | known | untrusted | system — keys §7;
-                                           //   adapters may stamp the first three; system is
-                                           //   daemon-only (heartbeat/cron/reflection — §4.2)
-  "kind": "message",                       // message | heartbeat | webhook | cron | approval
+  "owner_id": "brian",                     // from identities lookup on owner rows; null otherwise —
+                                           //   cross-surface approval matches on this (§4.4)
+  "trust": "owner",                        // owner | known | untrusted | system | system-worker —
+                                           //   from the identities table (unmapped ⇒ untrusted);
+                                           //   system/system-worker are daemon-only (§4.2, §4.5)
+  "kind": "message",                       // message | heartbeat | webhook | cron | approval | task
   "occurrence": null,                      // cron/heartbeat only: ISO occurrence_time +
                                            //   missed_count when coalescing a misfire (§4.2)
   "text": "…", "attachments": [], "reply_to": null }</pre>
@@ -574,6 +593,15 @@ flowchart LR
   correlation TEXT                   -- links retries / approval round-trips to the origin event
 );
 CREATE INDEX ev_queue ON events(thread_key, id) WHERE status IN ('received','processing');
+
+CREATE TABLE deliveries (            -- outbound outbox (§4.1) — the reply leg is durable, not fire-and-forget
+  id INTEGER PRIMARY KEY,
+  event_id INTEGER NOT NULL REFERENCES events(id),  -- the turn this reply answers
+  target TEXT NOT NULL,              -- channel + thread to send to
+  payload TEXT NOT NULL,            -- the rendered reply text — persisted BEFORE the send attempt
+  attempts INTEGER DEFAULT 0, last_attempt INTEGER,
+  acked INTEGER                      -- set when the adapter confirms the platform accepted it;
+);                                   --   unacked rows re-send on restart (at-least-once — §4.1)
 
 CREATE TABLE dead_letters (          -- terminal failures, surfaced twice (§4.6): DM on entry
   event_id INTEGER PRIMARY KEY REFERENCES events(id),
@@ -596,7 +624,7 @@ CREATE TABLE sessions (
   origin       TEXT,                 -- task:* workers: thread that spawned the work —
                                      --   where progress reports and recovery notes go (§4.5)
   tainted      INTEGER DEFAULT 0,    -- sticky (§7): set by PostToolUse on untrusted bytes
-                                     --   (web fetch · non-owner participant · Codex output);
+                                     --   (inbound non-owner prompt/attachment · web fetch · Codex web read);
                                      --   mutating verbs read one policy column right; clears on rotation
   channel      TEXT, last_seen INTEGER, turns INTEGER,
   PRIMARY KEY (thread_key, session_id)
@@ -606,15 +634,24 @@ CREATE TABLE sessions (
 -- is a constraint violation, not a race.
 CREATE UNIQUE INDEX one_live_session ON sessions(thread_key)
   WHERE status IN ('creating','active');
+-- Worker exclusivity: at most one live worker per repo path (§4.5, §7 X8).
+CREATE UNIQUE INDEX one_worker_per_repo ON sessions(cwd)
+  WHERE status IN ('creating','active') AND thread_key LIKE 'task:%';
 
 CREATE TABLE facts (                 -- SOURCE OF TRUTH; MEMORY.md is rendered from this
   id INTEGER PRIMARY KEY,
   fact TEXT NOT NULL,
   provenance TEXT NOT NULL,          -- 'owner' | 'agent-reflection' | 'untrusted-derived'
-                                     --   (untrusted-derived: excluded from assembly until digest-ack — §5)
+                                     --   computed MECHANICALLY as max-untrust over the source range (§5),
+                                     --   never from model output
+  min_trust TEXT DEFAULT 'owner',    -- READ visibility (§4.3): lowest session trust allowed to retrieve.
+                                     --   owner by default — a fact leaks down only if deliberately widened
+  acked INTEGER DEFAULT 0,           -- untrusted-derived rows: 0 until owner acks in a digest;
+                                     --   assembler excludes acked=0 untrusted-derived rows (§5 read-time split)
   confidence REAL DEFAULT 0.7,       -- reflector-assigned; decays passively via ranking, never deletes
   created INTEGER,
-  superseded_by INTEGER REFERENCES facts(id),  -- non-destructive supersession
+  superseded_by INTEGER REFERENCES facts(id),  -- non-destructive supersession;
+                                     --   retrieval filters superseded_by IS NOT NULL (§4.3) — ranked-down ≠ excluded
   confirmed_count INTEGER DEFAULT 1, -- cache; derived from fact_sources
   last_used INTEGER
 );
@@ -639,6 +676,10 @@ CREATE TABLE reflection_jobs (       -- §5: durable, leased, watermarked
   status TEXT DEFAULT 'queued',      -- queued | running | done | failed
   attempts INTEGER DEFAULT 0, output TEXT,
   UNIQUE (kind, source_from, source_to)    -- opportunistic + nightly enqueues dedup here
+);
+CREATE TABLE checkpoints (           -- durable watermarks — "how far has each job kind reflected"
+  kind TEXT PRIMARY KEY,             -- extract-facts | compact
+  last_log_id INTEGER NOT NULL       -- highest log_entries id already covered; nightly sweep = last..now
 );
 
 CREATE TABLE session_facts (         -- retrieval-delta ledger (§4.3): what this session has seen
@@ -674,7 +715,9 @@ CREATE TABLE schedules (             -- NL-cron: "brief me at 8am" is a row, not
   id INTEGER PRIMARY KEY,
   cron_expr TEXT NOT NULL, tz TEXT NOT NULL,      -- IANA zone; DST-aware local wall-clock (§4.2)
   prompt TEXT NOT NULL, target TEXT,              -- thread/surface the result goes to
-  created_by TEXT, created_trust TEXT,            -- provenance: who asked, at what trust
+  created_by TEXT, created_trust TEXT NOT NULL,   -- provenance: who asked, at what trust — LOAD-BEARING:
+                                     --   a fire runs at min(system, created_trust), so a schedule made
+                                     --   from a known/gated request can NEVER escalate to system (§7)
   max_overlap INTEGER DEFAULT 1,                  -- overlap ⇒ skipped event row (§4.2)
   next_fire INTEGER, last_fire INTEGER,
   enabled INTEGER DEFAULT 1, last_error TEXT      -- disabled-with-reason beats silently broken
@@ -695,7 +738,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
     <li><b>Two durability tiers, named honestly.</b> <b>Tier-1 (loss = broken):</b> <code>approach.db</code>, <code>.beads/</code>, and the rendered workspace — the facts/work/config truth. <b>Tier-2 (loss = degraded):</b> the Claude-side transcript store under <code>~/.claude/projects</code> — a store APPROACH indexes into but does not own (Claude Code controls its format and GC). It's included in backups because it's small and cheap, but restore is best-effort: §4.6's amnesia-with-notes is the contract when a transcript is gone. This is not hypothetical — Claude Code <b>silently garbage-collects transcripts after <code>cleanupPeriodDays</code> (default 30)</b> with no warning or recovery (verified 2026-07-09); raise it in <code>settings.json</code> and let the heartbeat <b>orphan sweep</b> flag <code>sessions</code> rows whose transcript has vanished, so GC drift is seen before you hit it mid-conversation.</li>
     <li><b>SQLite settings.</b> WAL mode, <code>synchronous=NORMAL</code>, <code>busy_timeout</code> set — single box, single writer; the snapshot below is the durability backstop. <code>state/</code> is <code>0700</code>, the db <code>0600</code>.</li>
     <li><b>Migrations.</b> Numbered SQL migrations embedded in the daemon binary, applied in one transaction at startup; the daemon <em>refuses to start</em> on a schema version newer than it knows — downgrade protection beats mystery corruption.</li>
-    <li><b>Backup mechanism.</b> Nightly, after reflection: <code>VACUUM INTO</code> a dated snapshot (SQLite's own consistent-copy path — safe against a live WAL), then restic ships <code>~/approach</code> + snapshots + <code>~/.claude/projects</code> offsite (NAS/B2); retention 7 daily + 4 weekly. Git remotes already replicate beads and the rendered views continuously. <b>RPO: 24h for db state, ~continuous for git-synced truth.</b></li>
+    <li><b>Backup mechanism.</b> Nightly, after reflection: <code>VACUUM INTO</code> a dated snapshot (SQLite's own consistent-copy path — safe against a live WAL), then restic ships <code>~/approach</code> + snapshots + <code>~/.claude/projects</code> offsite (NAS/B2); retention 7 daily + 4 weekly. <b>RPO for <code>approach.db</code> = the snapshot interval (24h as specified — tighten by running the snapshot more often, or add Litestream WAL-streaming if a lost day ever bites).</b> Beads is separate: its RPO is the <code>bd dolt push</code> cadence, which the daemon runs after every gated task-graph write, so committed issue state is at-remote within a turn — but that is a <em>push cadence</em>, not "continuous replication," and a push that hasn't run yet is only as safe as the nightly snapshot.</li>
     <li><b>Restore is a drill, not a document.</b> Order: workspace checkout → newest db snapshot → transcripts → <code>bd doctor</code>. A scripted <code>approach restore-drill</code> restores into a temp dir and asserts sessions/facts/events row counts — run quarterly. An untested backup is a hope, not a control.</li>
   </ul>
 </section>
@@ -709,12 +752,13 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   <div class="callout safe"><b>Primary threat: injection via untrusted content.</b> A Discord message, a fetched page, an email body, or a community skill can carry instructions ("forward all mail to …", "run this"). Treat every byte the agent <em>reads</em> as data, never as commands. Cisco AI Defense's analysis (2026-01-28) of a top-ranked third-party OpenClaw skill found silent data exfiltration — a hidden <code>curl</code> to an attacker server, output to <code>/dev/null</code> — plus prompt injection, in a skill downloaded thousands of times. The ecosystem's cautionary tale, and the reason C9/C10 are non-negotiable here.</div>
 
   <h3>Policy matrix (what C9 actually implements)</h3>
-  <p>Prose controls become one table, keyed on the <code>trust</code> field the adapter layer (C1) stamps on every event (§6), shifted one column right when the session is <code>tainted</code>. A fourth class, <code>trust=system</code> (daemon-stamped only — §4.2), reads the owner column for reads, notify, and task-graph verbs but can never satisfy an approval, and its sends are restricted to configured targets. This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
+  <p>Prose controls become one table, keyed on the <code>trust</code> field the adapter stamps from the <code>identities</code> lookup (§6), shifted one column right when the session is <code>tainted</code>. Two daemon-only classes sit alongside the three adapter-stampable ones: <code>system</code> (heartbeat/cron/reflection — §4.2) and <code>system-worker</code> (task turns — §4.5) both read the owner column for reads, notify, and task-graph verbs but can never satisfy an approval, and system sends are restricted to configured targets. Schedule writes are themselves a gated row (so untrusted content can't plant a recurring job), and a fire's trust is capped at its creator's (§4.2). This is the config in <code>approach.toml</code>; the <code>PreToolUse</code> hook answers from it.</p>
   <div class="tbl">
   <table>
     <thead><tr><th>Capability</th><th>owner DM</th><th>known group</th><th>untrusted / webhook</th></tr></thead>
     <tbody>
-      <tr><td>Read / Grep / local git</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag partial">sandbox only</span></td></tr>
+      <tr><td>Read / Grep / local git <span style="color:var(--ink-soft)">(cwd-scoped; secret paths denied)</span></td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag partial">sandbox only</span></td></tr>
+      <tr><td>Schedule create / update / delete</td><td><span class="tag have">allow</span></td><td><span class="tag build">gate · provenance-tag</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
       <tr><td>Web fetch</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag partial">sandbox, no session creds</span></td></tr>
       <tr><td>Bash (always sandboxed — no host, no creds, per-class egress)</td><td><span class="tag have">allow</span></td><td><span class="tag have">allow</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
       <tr><td><code>host_exec</code> (host shell — admin only)</td><td><span class="tag build">ask · §4.4 · always</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td><td><span class="tag" style="background:var(--safe-bg);color:var(--safe)">deny</span></td></tr>
@@ -728,7 +772,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </table>
   </div>
   <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">Note the memory and task rows: <b>writing a fact or an issue is a gated verb</b>. An issue is worse than a fact — it's an instruction that persists <em>and gets scheduled</em>: a bd row created from injected content is a prompt injection with a cron job. Same enforcement, same provenance tag.</p>
-  <div class="callout safe"><b>Two rules the matrix carries implicitly.</b> (1) <b>Bash is never a side-effect path.</b> It always runs in the C10 container — every trust level, owner DM included — with no credentials and per-class egress; send/email/delete/purchase/push exist only as MCP or daemon verbs holding their own credentials, so the "curl from a trusted turn" bypass class is deleted, not enumerated. Host access exists only as <code>host_exec</code>, always-ask. (2) <b>Taint shifts the column.</b> A session that reads untrusted bytes (web fetch, non-owner participant, Codex output) gains a sticky <code>tainted</code> flag (§6, set by <code>PostToolUse</code>): mutating verbs then read <em>one column to the right</em> — an owner-DM-tainted session behaves like known-group, so its fact/task writes gate and provenance-tag <code>untrusted-derived</code>, feeding the read-time exclusion in §5 automatically. Reads are unaffected; the flag clears on rotation; high-impact verbs stay gated regardless.</div>
+  <div class="callout safe"><b>Three rules the matrix carries implicitly.</b> (1) <b>Bash is never a side-effect path.</b> The Bash tool is wired — via <code>.claude/settings.json</code> permission config, the same hook layer that gates everything else — to execute only in the C10 container, every trust level including owner DM, with no credentials and per-class egress; send/email/delete/purchase/push exist only as MCP or daemon verbs holding their own credentials, so the "curl from a trusted turn" bypass class is deleted, not enumerated. Host access exists only as <code>host_exec</code>, always-ask. (2) <b>Reads are scoped, not free.</b> Even allowed host-side <code>Read</code>/<code>Grep</code> is confined to the session's cwd subtree with a hard path denylist — <code>~/.ssh</code>, <code>~/.claude</code> auth, <code>~/.codex</code> auth, secret files, and anything outside the workspace are refused — so "read" can't become credential exfiltration through the front door. (3) <b>Taint shifts the column.</b> A session that ingests untrusted bytes — an inbound non-owner prompt or attachment, a web fetch, a Codex web read — gains a sticky <code>tainted</code> flag (§6, set by <code>PostToolUse</code>): mutating verbs then read <em>one column to the right</em>, so its fact/task writes gate and provenance-tag <code>untrusted-derived</code>, feeding the read-time exclusion in §5 automatically. A <em>read-only</em> Codex critic call does not by itself taint (it's the web read, if any, that does), so the draft→critique→approve→act flow survives. Reads are unaffected by the shift; the flag clears on rotation; high-impact verbs stay gated regardless.</div>
 
   <h3>Controls</h3>
   <ul>
@@ -777,7 +821,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </div>
   <div class="phase">
     <div class="ptag">P3</div>
-    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>facts + fact_sources + log_entries (rendered to MEMORY.md / daily .md), dual FTS5, session_facts retrieval delta, owner digest.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded &nbsp;·&nbsp; DRILLS — <code>approach reindex</code> rebuilds both FTS tables to identical results · untrusted-derived fact stays out of context until digest-ack (poisoning drill) · restore-drill passes on a fresh checkout</div></div>
+    <div><h3>Memory — curated store + recall (C6, C7)</h3><p>facts + fact_sources + log_entries (rendered to MEMORY.md / daily .md), dual FTS5, session_facts retrieval delta, owner digest.</p><div class="pmeta">EFFORT M–L &nbsp;·&nbsp; EXIT — agent recalls a fact from last week without being reminded &nbsp;·&nbsp; DRILLS — <code>approach reindex</code> rebuilds both FTS tables to identical results · untrusted-derived fact stays out of context until digest-ack (poisoning drill) · owner-private fact never retrieves into a known-group session (visibility drill) · superseded fact never re-enters context · restore-drill passes on a fresh checkout</div></div>
   </div>
   <div class="phase p4">
     <div class="ptag">P4</div>
@@ -787,7 +831,11 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
     <div class="ptag">P5</div>
     <div><h3>Orchestration — task graph (C13)</h3><p>Adopt beads: heartbeat polls <code>bd ready</code>; worker sessions (keyed <code>task:&lt;issue-id&gt;</code>, repo cwd) take, advance, and close issues; blocked work parks behind a <code>bd dep</code> blocker instead of leaking into facts or HEARTBEAT.md. <b>Depends on P1 + P2 and the C9/C10 baseline</b> (workers are unattended agents — the policy gate and sandbox are prerequisites, not parallel work); the number is ordinal, not sequential — run this before or alongside P4, and closed-issue trajectories make P4's reflector better.</p><div class="pmeta">EFFORT S–M &nbsp;·&nbsp; EXIT — agent resumes a multi-session coding task after a reboot and closes it &nbsp;·&nbsp; DRILLS — mid-task daemon kill → resume-or-release per §4.5 · two heartbeat fires, one ready issue → one claim · foreign-assigned issue → skipped · worker hits --max-turns → parked with note, claim released</div></div>
   </div>
-  <p style="margin-top:18px"><b>Security is a gate, not a stripe:</b> the <b>minimum secure execution profile — C9 skeleton (matrix + deny-and-resume for sends) and the C10 container profile — is a hard prerequisite for any proactive send (P2 exit) and any worker (P5 start)</b>, not parallel optional work. Both are M-sized components inside the plan's scope, with their own drills: C9 — replayed approval rejected · digest-swap between approval and execution rejected · expired approval starts a fresh cycle · tainted session observed shifting one matrix column; C10 — escape smoke (host mount probe, credential probe, egress probe from inside the sandbox all fail) · teardown leaves nothing running. Migrations carry their own: daemon refuses to start on a newer schema. Estimates throughout are effort classes (S/M/L/XL), deliberately not calendar promises. C12 (Codex critic) can land any time after P0 — effort S — and ships at launch as an on-demand critic; it becomes load-bearing only if F2 lands (§10).</p>
+  <div class="phase">
+    <div class="ptag">PS</div>
+    <div><h3>Security baseline — policy gate (C9) + sandbox (C10)</h3><p>Not a phase you schedule "after": a <b>hard prerequisite gate</b>. The identities/trust resolution (§6), the deny-and-resume approval flow with digest binding, the taint column-shift, and the full C10 container profile must all pass their drills <em>before</em> P2 can send proactively or P5 can spawn a worker. Sequenced first in wall-clock even though it's numbered last.</p><div class="pmeta">EFFORT M (C9) + M (C10) &nbsp;·&nbsp; GATES — <b>blocks P2 sends and P5 workers</b> &nbsp;·&nbsp; DRILLS (test-first, automated) — replayed approval rejected · digest-swap rejected · expired/rotated approval → fresh cycle · tainted session shifts one column · schedule-from-known-request fires at known trust not system · unmapped sender resolves untrusted · host Read of <code>~/.ssh</code> denied · sandbox escape smoke (mount/credential/egress probes fail) · teardown leaves nothing running · daemon refuses to start on a newer schema</div></div>
+  </div>
+  <p style="margin-top:18px"><b>Security is a gate, not a stripe:</b> phase <b>PS</b> above is a hard prerequisite for any proactive send (P2 exit) and any worker (P5 start), not parallel optional work — that is why it carries its own slot, effort, and automated test-first drills rather than living in a "cross-cutting" footnote. Estimates throughout are effort classes (S/M/L/XL), deliberately not calendar promises. C12 (Codex critic) can land any time after P0 — effort S — and ships at launch as an on-demand critic; it becomes load-bearing only if F2 lands (§10).</p>
 </section>
 
 <!-- 10. BUILD VS BUY -->
@@ -843,7 +891,7 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
     <li><b>Concurrency.</b> <span class="tag have" style="vertical-align:1px">handled by design</span> — the daemon's per-thread goroutine + queue over the durable <code>events</code> table (§3, §4.1, §8) serializes turns, and the <code>one_live_session</code> partial unique index (§6) backstops the router invariant in schema. Becomes a risk only if the implementation drifts back to per-event dispatch.</li>
     <li><b>Session scope trap.</b> <span class="tag have" style="vertical-align:1px">handled by design</span> — <code>--resume</code> lookups are scoped to the project dir + worktrees, so a session resumed from the wrong cwd silently fails. Every session records its spawn dir in <code>sessions.cwd</code> (§6) and the daemon asserts it on every resume (assistant sessions: <code>~/approach</code>; workers: the repo path). The failure mode returns if a worker's repo moves or a worktree is pruned — assert, don't assume; when the assert (or the resume itself) fails, §4.6 degrades it to auto-rotate + fact-seeded fresh session + a transparency note, never a hard error.</li>
     <li><b>Bare mode drift.</b> <code>--bare</code> (faster, slated to become the <code>-p</code> default) skips hooks/skills/MCP/CLAUDE.md discovery — the opposite of what this harness needs. Pin the non-bare path explicitly.</li>
-    <li><b>Memory as attack surface.</b> A curated fact written from injected content persists and re-enters future context. Mitigation is structural: fact writes are a gated verb in the policy matrix (§7), and the assembler <em>excludes</em> <code>untrusted-derived</code> rows from context assembly until they're acknowledged in an owner digest — the trust split applied at read time (§5). Residual risk: the reflector itself reads logs containing untrusted text — its extraction prompt must provenance-tag by source, not by content claims.</li>
+    <li><b>Memory as attack surface.</b> A curated fact written from injected content persists and re-enters future context. Mitigation is structural: fact writes are a gated verb in the policy matrix (§7), and the assembler <em>excludes</em> <code>untrusted-derived</code> rows from context assembly until they're acknowledged in an owner digest — the trust split applied at read time (§5). Residual risk is closed mechanically, not by prompt: the daemon stamps each extracted fact's provenance as the max-untrust over the source <code>log_entries</code> range (§5), so untrusted text in a log cannot talk the reflector into labelling its fact owner-trusted — the model's claimed provenance is never trusted.</li>
     <li><b>Skill-synthesis over-fitting.</b> <span class="tag partial" style="vertical-align:1px">deferred with F2</span> — without the review gate, the agent teaches itself bad habits from lucky runs. When F2 lands (§10), the gate is not optional — and it must be cross-model (§5): a same-family self-review shares the blind spots it's supposed to catch.</li>
     <li><b>Codex sandbox pin.</b> The second engine's hooks are not <em>this harness's</em> hooks — none of the daemon's policy machinery governs it, so its safety here rests entirely on the read-only sandbox flags pinned in the critic skill (§7). One edited flag reopens everything — treat the skill file as security-sensitive config and test the pin, don't assume it.</li>
     <li><b>Approval fatigue.</b> If §4.4 fires too often, you'll start rubber-stamping "approve 42" — at which point the gate is theater. Watch the <code>pending_approvals</code> rate in the <code>turns</code> data; if a verb is approved &gt;90% of the time from the owner surface, promote it to <em>allow</em> deliberately rather than letting habituation do it.</li>
@@ -854,11 +902,35 @@ CREATE TABLE turns (                 -- C11 observability; from stream-json resu
   </ul>
 
   <h3>Verification record</h3>
-  <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">External claims swept 2026-07-09 against primary sources: Claude Code docs (code.claude.com — headless, cli-reference, hooks; 31 hook events; <code>--bare</code> "will become the default for -p" confirmed; transcript GC <code>cleanupPeriodDays</code>=30 default), beads v1.1.0 local CLI + gastownhall/beads docs (Dolt truth model; atomic non-lease claims), Codex CLI 0.144.0 local + developers.openai.com (JSONL output, sandbox flags, hook lifecycle, SKILL.md support), Anthropic model docs (Sonnet 5 / Haiku 4.5 current), Cisco AI Defense blog 2026-01-28, discordgo v0.29.0 / slack-go v0.27.0 (pre-1.0 — pin it). <b>Open assumptions, marked in place:</b> recurring unattended Codex critique under subscription auth (§8 — metered, ToS silent; API billing is the fallback) and Claude Code memory auto-splitting (§2 — community-documented, not official docs).</p>
+  <p style="font-size:12px; color:var(--ink-soft)">External claims swept 2026-07-09 against primary sources, claim by claim:</p>
+  <div class="tbl">
+  <table style="font-size:11.5px">
+    <thead><tr><th>Claim (spec ref)</th><th>Verdict</th><th>Primary source</th></tr></thead>
+    <tbody>
+      <tr><td><code>claude -p</code> headless + <code>stream-json</code> (§2)</td><td>confirmed</td><td>code.claude.com/docs/en/headless</td></tr>
+      <tr><td><code>--session-id</code> pre-pin + cwd-scoped <code>--resume</code> (§2, §4.1)</td><td>confirmed</td><td>code.claude.com/docs/en/cli-reference, /headless</td></tr>
+      <tr><td>Hook lifecycle = 31 events (§2)</td><td>confirmed (was "~30")</td><td>code.claude.com/docs/en/hooks</td></tr>
+      <tr><td><code>--permission-prompt-tool</code> exists (§7)</td><td>partial — ships, undocumented</td><td>cli-reference; GH issue #24595</td></tr>
+      <tr><td><code>--bare</code> to become <code>-p</code> default (§11)</td><td>confirmed</td><td>code.claude.com/docs/en/headless</td></tr>
+      <tr><td>Transcript GC <code>cleanupPeriodDays</code>=30, silent (§6)</td><td>confirmed</td><td>GH issues #59248, #47038, #62959</td></tr>
+      <tr><td>Memory auto-split under <code>~/.claude/.../memory/</code> (§2)</td><td><b>assumption</b> — community-documented, not official</td><td>—</td></tr>
+      <tr><td>beads = embedded Dolt truth; <code>refs/dolt/data</code> sync (§6)</td><td>confirmed (was "JSONL+SQLite")</td><td>bd v1.1.0 <code>info</code>/<code>where</code>; SYNC_CONCEPTS.md</td></tr>
+      <tr><td><code>bd --claim</code> atomic but <em>not</em> lease-based (§8)</td><td>confirmed</td><td>bd v1.1.0 <code>help update</code></td></tr>
+      <tr><td>Codex <code>exec --json</code> JSONL + sandbox flags (§10)</td><td>confirmed</td><td>Codex 0.144.0 <code>--help</code></td></tr>
+      <tr><td>Codex has hook lifecycle + SKILL.md support (§7, §8)</td><td>confirmed (reversed prior "no hooks")</td><td>developers.openai.com/codex/hooks, /skills</td></tr>
+      <tr><td>Recurring unattended Codex under subscription auth (§8)</td><td><b>assumption</b> — metered, ToS silent; API fallback</td><td>help.openai.com/en/articles/11369540</td></tr>
+      <tr><td>Sonnet 5 / Haiku 4.5 current model ids (§8)</td><td>confirmed</td><td>platform.claude.com/docs/…/models/overview</td></tr>
+      <tr><td>Cisco skill-exfiltration audit (§7)</td><td>confirmed (Cisco AI Defense, not Talos)</td><td>blogs.cisco.com/ai/… 2026-01-28</td></tr>
+      <tr><td>discordgo v0.29.0 / slack-go v0.27.0 mature (§3, C1)</td><td>confirmed — slack-go pre-1.0, pin it</td><td>github releases</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="font-family:var(--mono); font-size:11.5px; color:var(--ink-soft)">Two claims remain <b>assumptions</b>, marked in place at their use sites (§8 subscription Codex, §2 memory auto-split); everything else is confirmed against a dated primary source above.</p>
 </section>
 
 <footer>
-  APPROACH · personal agent harness · design spec v1.3 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected · v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs · v1.5: durability tiers + restore drill, atomic worker claims, restart reconciliation · v1.6: gauge dropped for build-state board, fault drills per phase, security as hard gate, persistence goal split, sentinel removed · v1.7: external claims verified with dated sources (§11 verification record)<br>
+  APPROACH · personal agent harness · design spec v1.8 · for Brian · build-vs-buy decided 2026-07-09: build, F2 deferred, Hermes rejected<br>
+  Changelog — v1.2: durable events + session invariants · v1.3: cc-connect rejected (native C1), sandbox-default Bash, digest-bound approvals, taint model · v1.4: system trust, schedule contract, log rows as truth, leased reflection jobs · v1.5: durability tiers + restore drill, atomic worker claims, restart reconciliation · v1.6: gauge dropped for build-state board, fault drills per phase, security as hard gate, persistence goal split, sentinel removed · v1.7: external claims verified with dated sources · v1.8: identity/trust registry, fact read-visibility, mechanical reflector provenance, delivery outbox, schedule-escalation gate, daemon-side bd, security phase slot (round-2 review fixes)<br>
   All version-sensitive external claims verified 2026-07-09 or explicitly marked as assumptions — see the §11 verification record.
 </footer>
 
