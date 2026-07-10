@@ -4,6 +4,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -78,6 +79,11 @@ func Open(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	if err := verifyPragmas(db); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	// Open is the daemon's startup path, so migrations apply here (§6):
+	// a handle you can hold is a handle to a migrated store.
+	if err := Migrate(context.Background(), db); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
 	return db, nil
