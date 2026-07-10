@@ -62,11 +62,16 @@ func Open(path string) (*sql.DB, error) {
 	// synchronous, busy_timeout, and foreign_keys are per-connection, so
 	// a post-open Exec would configure one connection while the pool
 	// hands out unconfigured ones. journal_mode=WAL persists in the file
-	// but is harmless to re-assert per connection.
+	// but is harmless to re-assert per connection. Order matters:
+	// busy_timeout must be set FIRST — the pragmas run in DSN order at
+	// connection open, and re-asserting journal_mode needs a lock, so a
+	// connection opened while another holds the write lock (e.g. during
+	// a migration batch) would otherwise fail SQLITE_BUSY with no retry
+	// budget.
 	dsn := "file:" + url.PathEscape(path) +
-		"?_pragma=journal_mode(WAL)" +
+		"?_pragma=busy_timeout(5000)" +
+		"&_pragma=journal_mode(WAL)" +
 		"&_pragma=synchronous(NORMAL)" +
-		"&_pragma=busy_timeout(5000)" +
 		"&_pragma=foreign_keys(ON)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
