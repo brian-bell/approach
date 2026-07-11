@@ -94,7 +94,11 @@ func TestDaemonSeedsIdentitiesFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store after daemon exit: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 	var trust, ownerID string
 	err = db.QueryRow(
 		`SELECT trust, owner_id FROM identities WHERE channel = 'discord' AND native_id = '42'`,
@@ -127,7 +131,11 @@ func TestDaemonSeedsFromDefaultedConfigPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store after daemon exit: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM identities`).Scan(&count); err != nil {
 		t.Fatalf("count identities: %v", err)
@@ -206,7 +214,11 @@ func TestDaemonWithoutConfigWarnsAndServes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open store after daemon exit: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
 	var count int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM identities`).Scan(&count); err != nil {
 		t.Fatalf("count identities: %v", err)

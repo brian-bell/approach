@@ -75,7 +75,11 @@ func readIdentities(t *testing.T, db *sql.DB) map[string]string {
 	if err != nil {
 		t.Fatalf("query identities: %v", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Errorf("close identities rows: %v", err)
+		}
+	}()
 	got := make(map[string]string)
 	for rows.Next() {
 		var channel, nativeID, trust, ownerID, label string
