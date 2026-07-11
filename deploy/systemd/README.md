@@ -36,6 +36,21 @@ point of a panic button — work interrupted by the hard stop is
 recovered from durable state on the next start (§4.1, §9), never
 silently replayed.
 
+## Kill-switch smoke test
+
+After installing, prove the panic button on the host itself:
+
+```sh
+deploy/systemd/smoke-kill-switch.sh
+```
+
+It starts `approach.target`, fires the panic command, asserts the
+target, the daemon, and every shipped unit are down and the admin
+socket is unreachable, then resumes and asserts the daemon answers
+again. It needs a real systemd user manager (it exits 2 with a SKIP
+note elsewhere, e.g. on macOS) and briefly stops the daemon — don't
+run it while you depend on the agent being up.
+
 ## Adding a timer later
 
 Every `.service`/`.timer` here must carry `PartOf=approach.target`
