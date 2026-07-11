@@ -1,27 +1,106 @@
 # Agent Instructions
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+APPROACH is a personal agent harness: one small Go daemon that will own
+channel adapters, an event router, and an agent-engine lifecycle, with a
+SQLite state store and a trust/policy model designed in
+`docs/approach-agent-harness-spec.html`. Section references in code
+comments (§4.1, §6, §7, …) point at that spec.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [SYNC_CONCEPTS.md](https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+**Current state**: the daemon skeleton and trust foundation are built
+(admin socket, state store + migrations, config loading, identity
+seeding, trust levels, path denylist). The event router, channel
+adapters, and engine spawning are later milestones (M1+) — a `poke`
+today only increments a counter visible in `status`.
 
-## Quick Reference
+## Build & Test
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
+make build    # go build -o bin/approach ./cmd/approach
+make test     # go test -race ./...
+make lint     # golangci-lint run (config: .golangci.yml)
+make check    # build + test + lint
+make clean    # remove bin/
 ```
+
+Go 1.26; the only direct dependency is BurntSushi/toml (SQLite is the
+pure-Go modernc.org/sqlite driver — no cgo). CI (`.github/workflows/ci.yml`)
+runs build, test, and golangci-lint on pushes to main and PRs.
+
+## Layout
+
+- `cmd/approach/` — main; all logic lives in `internal/`.
+- `internal/cli/` — subcommand dispatch (`daemon`, `poke`, `status`,
+  `drain`, `config check`, `version`) and the daemon startup sequence:
+  claim daemon lock → load config → open/migrate store → seed
+  identities → serve admin socket.
+- `internal/admin/` — the Unix admin socket (`approach.sock`): one
+  line-based verb per connection (poke | status | drain). Daemon
+  ownership is a flock'd `approach.sock.lock` sidecar, taken in
+  `New` before the store is touched.
+- `internal/config/` — loads and validates `approach.toml` (models,
+  channels, identities, sessions, policy matrix). Fails loud: unknown
+  keys are errors, enums are closed, missing policy cells mean deny.
+- `internal/store/` — SQLite state store (`approach.db`): posture-checked
+  open (WAL, 0700 dir / 0600 file, verified pragmas), embedded
+  migrations under `migrations/`, identity seeding, session taint flag.
+- `internal/trust/` — trust levels (untrusted < known < owner), session
+  trust-floor computation, and the content-taint rules.
+- `internal/policy/` — the §7 read/write path denylist (`DeniedPath`,
+  `DeniedDir`, `DeniedDescendant`), including symlink-alias handling.
+  Enforcement (the PreToolUse hook, C9) is M1 work.
+- `deploy/systemd/` — user-level units plus `units_test.go`, which
+  enforces that every unit is `PartOf=`/`WantedBy=approach.target`
+  (the kill switch), and a kill-switch smoke test script.
+- `docs/` — the design spec (HTML) and `approach.toml.example`.
+
+## Conventions
+
+- **Fail closed, fail loud.** Ambiguity resolves to deny/untrusted/error,
+  never to a silent default: an unknown trust level reads as untrusted,
+  an empty policy cell reads as deny, a store error never reads as
+  "clean" or "not the owner", and a walk error in the denylist is an
+  error, not an allow.
+- **Comments carry the "why" and the spec section.** Code that encodes
+  a security decision cites the spec (§6, §7 …) and explains the failure
+  mode it forecloses. Match this density when editing these files.
+- **TDD.** Every package has table-driven tests beside it; write the
+  failing test first. `make test` runs with `-race`.
+- **Migrations** (`internal/store/migrations/`): named
+  `NNNN_description.sql`, numbered contiguously from 0001, applied as
+  one transaction. Never `BEGIN`/`COMMIT`/`ROLLBACK` inside one, never
+  mention `user_version` (rejected lexically — the runner owns it),
+  and don't toggle pragmas. The runner detects transaction escapes at
+  test time.
+- **Exit codes**: the daemon exits 3 (`exitUnrecoverable` in
+  `internal/cli`) on startup refusals a restart cannot fix — kept in
+  sync with `RestartPreventExitStatus=3` in
+  `deploy/systemd/approach.service`. CLI usage errors exit 2, other
+  failures 1.
+- **Logging**: the daemon logs structured JSON (slog) to stderr — the
+  systemd journal. stdout carries only the single readiness line
+  launchers may wait on.
+
+## Gotchas
+
+- The daemon lock must be taken **before** the store opens: a second
+  (possibly newer) binary must be refused before it can migrate the
+  schema out from under the running daemon.
+- The defaulted config path is `approach.toml` **beside** the state
+  directory (the `$APPROACH_HOME` layout: `~/approach/approach.toml`
+  next to `~/approach/state/`). A missing file at the defaulted path
+  boots with zero identities (deny-by-default, loudly warned); an
+  explicit `--config` path must load cleanly or the daemon refuses to
+  start.
+- `store.SeedIdentities` is a full sync, not an upsert: removing an
+  identity from `approach.toml` revokes it at the next startup.
+- Weak-auth channels (sms, email) are clamped to at most `known` trust,
+  are read-only, and can never satisfy an approval. Config validation
+  rejects `owner` trust on a weak channel.
+- `internal/policy` matching is lexical and case-insensitive; symlink
+  resolution belongs to the enforcement point. `DeniedDir` is the
+  os-filesystem entry point that resolves and walks symlinks within the
+  session cwd boundary — its alias/spelling logic is subtle and heavily
+  tested; read the comments before touching it.
 
 ## Non-Interactive Shell Commands
 
