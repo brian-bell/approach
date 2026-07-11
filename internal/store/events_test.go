@@ -55,8 +55,12 @@ func TestInsertEventPersistsOnReceipt(t *testing.T) {
 	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
 
 	ev := testEvent()
-	if err := store.InsertEvent(context.Background(), db, ev); err != nil {
+	inserted, err := store.InsertEvent(context.Background(), db, ev)
+	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
+	}
+	if !inserted {
+		t.Error("InsertEvent reported inserted=false on a fresh event, want true")
 	}
 
 	var (
@@ -92,12 +96,12 @@ func TestInsertEventClosedEnums(t *testing.T) {
 
 	bad := testEvent()
 	bad.Kind = "carrier-pigeon"
-	if err := store.InsertEvent(context.Background(), db, bad); err == nil {
+	if _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
 		t.Error("kind 'carrier-pigeon' accepted, want CHECK violation")
 	}
 	bad = testEvent()
 	bad.Trust = "root" // not even 'system' spelling drift may pass
-	if err := store.InsertEvent(context.Background(), db, bad); err == nil {
+	if _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
 		t.Error("trust 'root' accepted, want CHECK violation")
 	}
 	var n int
@@ -144,8 +148,12 @@ func TestInsertEventFailsLoudOnInvalidFields(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := testEvent()
 			tc.mutate(&ev)
-			if err := store.InsertEvent(context.Background(), db, ev); err == nil {
+			inserted, err := store.InsertEvent(context.Background(), db, ev)
+			if err == nil {
 				t.Errorf("InsertEvent accepted event with %s, want error", tc.name)
+			}
+			if inserted {
+				t.Errorf("InsertEvent reported inserted=true alongside the %s error", tc.name)
 			}
 		})
 	}
@@ -158,21 +166,43 @@ func TestInsertEventFailsLoudOnInvalidFields(t *testing.T) {
 	}
 }
 
-// TestInsertEventDuplicateDedupKey: dedup_key is the event's identity
-// (§6) — a second insert with the same key must leave exactly one row.
-// Until approach-x6n.2.2 lands the dup-insert=no-op contract, the
-// duplicate surfaces as a loud UNIQUE violation.
-func TestInsertEventDuplicateDedupKey(t *testing.T) {
+// TestInsertEventDuplicateIsNoOp: THE §6 dedup contract — dedup_key is
+// the event's identity, and a duplicate insert is a reported no-op, not
+// an error: gateway redelivery must collapse to one turn (§4.1 drill),
+// and inserted=false is how the caller knows not to enqueue a second.
+func TestInsertEventDuplicateIsNoOp(t *testing.T) {
 	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
 
 	ev := testEvent()
-	if err := store.InsertEvent(context.Background(), db, ev); err != nil {
+	inserted, err := store.InsertEvent(context.Background(), db, ev)
+	if err != nil {
 		t.Fatalf("first InsertEvent: %v", err)
+	}
+	if !inserted {
+		t.Error("first InsertEvent reported inserted=false, want true")
 	}
 	dup := ev
 	dup.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"message","trust":"owner","text":"redelivered"}`
-	if err := store.InsertEvent(context.Background(), db, dup); err == nil {
-		t.Error("duplicate dedup_key accepted, want UNIQUE violation (no-op semantics land in x6n.2.2)")
+	inserted, err = store.InsertEvent(context.Background(), db, dup)
+	if err != nil {
+		t.Errorf("duplicate InsertEvent errored: %v, want no-op", err)
+	}
+	if inserted {
+		t.Error("duplicate InsertEvent reported inserted=true, want false")
+	}
+	// Identity is the dedup_key ALONE, not (kind, dedup_key): each kind
+	// embeds its namespace in the key by construction (§6 contract —
+	// message ids, delivery ids, schedule occurrences can't collide), so
+	// even a different-kind insert on the same key is the same event.
+	crossKind := ev
+	crossKind.Kind = "webhook"
+	crossKind.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"webhook","trust":"owner"}`
+	inserted, err = store.InsertEvent(context.Background(), db, crossKind)
+	if err != nil {
+		t.Errorf("cross-kind duplicate InsertEvent errored: %v, want no-op", err)
+	}
+	if inserted {
+		t.Error("cross-kind duplicate reported inserted=true, want false")
 	}
 	var n int
 	if err := db.QueryRow(`SELECT count(*) FROM events WHERE dedup_key = ?`, ev.DedupKey).Scan(&n); err != nil {
@@ -180,5 +210,46 @@ func TestInsertEventDuplicateDedupKey(t *testing.T) {
 	}
 	if n != 1 {
 		t.Errorf("%d rows for dedup_key %q, want exactly 1", n, ev.DedupKey)
+	}
+}
+
+// TestInsertEventDuplicateFirstWriteWins: a redelivery must never touch
+// the original row — not its payload, and not lifecycle state the queue
+// has already advanced (§4.1: everything after receipt is recoverable
+// from the FIRST row; a redelivery that reset status would replay a
+// turn already in flight).
+func TestInsertEventDuplicateFirstWriteWins(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	ev := testEvent()
+	if _, err := store.InsertEvent(context.Background(), db, ev); err != nil {
+		t.Fatalf("first InsertEvent: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE events SET status = 'processing' WHERE dedup_key = ?`, ev.DedupKey); err != nil {
+		t.Fatalf("advance status: %v", err)
+	}
+
+	dup := ev
+	dup.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"message","trust":"owner","text":"redelivered"}`
+	dup.Received = ev.Received + 60
+	if _, err := store.InsertEvent(context.Background(), db, dup); err != nil {
+		t.Fatalf("duplicate InsertEvent: %v", err)
+	}
+
+	var payload, status string
+	var received int64
+	if err := db.QueryRow(
+		`SELECT payload, status, received FROM events WHERE dedup_key = ?`, ev.DedupKey,
+	).Scan(&payload, &status, &received); err != nil {
+		t.Fatalf("read back event: %v", err)
+	}
+	if payload != ev.Payload {
+		t.Errorf("payload = %q after redelivery, want the original", payload)
+	}
+	if status != "processing" {
+		t.Errorf("status = %q after redelivery, want 'processing' preserved", status)
+	}
+	if received != ev.Received {
+		t.Errorf("received = %d after redelivery, want original %d", received, ev.Received)
 	}
 }

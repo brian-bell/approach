@@ -27,18 +27,33 @@ type Event struct {
 // Validation happens before the db is touched and fails loud: a blank
 // identity or key would either violate schema anyway or, worse, insert a
 // row the queue can never claim correctly.
-func InsertEvent(ctx context.Context, db *sql.DB, ev Event) error {
+//
+// A duplicate dedup_key is a reported no-op, never an error (§6: dup
+// insert = no-op): redelivery must collapse to one turn (§4.1), and the
+// first write wins — the original row, including lifecycle state the
+// queue has already advanced, is untouched. inserted=false is the
+// caller's signal not to enqueue; a caller that drops it still cannot
+// double-process, because only one row exists to claim. The conflict
+// target is exactly dedup_key, so every OTHER constraint (CHECK, NOT
+// NULL) still fails loud.
+func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (inserted bool, err error) {
 	if err := ev.validate(); err != nil {
-		return fmt.Errorf("store: insert event: %w", err)
+		return false, fmt.Errorf("store: insert event: %w", err)
 	}
-	if _, err := db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		`INSERT INTO events (dedup_key, thread_key, kind, trust, payload, received)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(dedup_key) DO NOTHING`,
 		ev.DedupKey, ev.ThreadKey, ev.Kind, ev.Trust, ev.Payload, ev.Received,
-	); err != nil {
-		return fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
 	}
-	return nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
+	}
+	return n > 0, nil
 }
 
 // validate refuses an event the queue could not honestly carry. Enum
