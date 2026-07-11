@@ -1,0 +1,16 @@
+# approach.target — the §7 kill switch. Every APPROACH unit (the
+# daemon and, later, every timer) is PartOf= this target and
+# WantedBy= it, so one command stops everything:
+#
+#   systemctl --user disable --now approach.target   # panic: stays off across reboots
+#   systemctl --user enable --now approach.target    # resume
+#
+# (`stop` alone halts things now but the target re-activates with the
+# next login/boot via default.target — disable is what makes "nothing
+# wakes up until you start it again" true.) See deploy/systemd/README.md.
+
+[Unit]
+Description=APPROACH personal agent harness (daemon + timers)
+
+[Install]
+WantedBy=default.target

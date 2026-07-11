@@ -1,0 +1,25 @@
+# approach.service — the APPROACH daemon (§8: one small Go daemon).
+# PartOf=approach.target makes `systemctl --user stop approach.target`
+# stop the daemon too — the §7 kill switch. SIGTERM (systemd's default
+# stop signal) is the daemon's drain path, so no ExecStop is needed.
+
+[Unit]
+Description=APPROACH daemon (channel adapters, router, state store)
+PartOf=approach.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/bin/approach daemon
+Restart=on-failure
+RestartSec=2
+# 30s of graceful drain, then SIGKILL — deliberate panic-button
+# semantics, not an oversight: the kill switch must actually stop
+# things, and the state design tolerates force-kill (§4.1/§9 — durable
+# events, interrupted turns recovered on restart, no side-effect
+# replay).
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=approach.target
