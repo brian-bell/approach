@@ -1,0 +1,690 @@
+package policy_test
+
+import (
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"testing/fstest"
+
+	"github.com/brian-bell/approach/internal/policy"
+)
+
+// TestDeniedPath: the §7 hard path denylist — ~/.ssh, credentials, and
+// the harness's own control surface (.claude hooks·settings·skills,
+// .codex, approach.toml) are refused for BOTH read and write, so
+// neither credential exfiltration nor the worst escalation — the agent
+// editing its own PreToolUse hook to disable the gate — is expressible
+// in-band.
+func TestDeniedPath(t *testing.T) {
+	denied := []string{
+		// .ssh, wherever it sits — home, bare, nested in a repo.
+		"/Users/brian/.ssh/id_rsa",
+		"/Users/brian/.ssh",
+		"repo/.ssh/key",
+		// Lexical dodges: traversal and case games must not work.
+		"work/../.ssh/key",
+		"/Users/brian/.SSH/id_rsa",
+		// Credential stores — named exactly, named partially, netrc.
+		"/Users/brian/.aws/credentials",
+		"secrets/credentials/token.json",
+		"/opt/app/Credentials",
+		"/Users/brian/.git-credentials",
+		"project/oauth/credentials.json",
+		"/Users/brian/.netrc",
+		"C:/Users/brian/_netrc",
+		// Fail-safe: even a doc naming itself after credentials.
+		"docs/credentials.md",
+		// Well-known token stores whose names lack the word.
+		"/Users/brian/.npmrc",
+		"/Users/brian/.pypirc",
+		"/Users/brian/.aws/config",
+		"/Users/brian/.docker/config.json",
+		"/Users/brian/.kube/config",
+		"/Users/brian/.gnupg/private-keys-v1.d/ABCDEF.key",
+		"/Users/brian/.config/gh/hosts.yml",
+		"/Users/brian/.config/gcloud/access_tokens.db",
+		"repo/.env",
+		"repo/.env.production",
+		// The harness control surface.
+		"/Users/brian/.claude/hooks/pretooluse.sh",
+		"repo/.claude/settings.json",
+		"repo/.claude/settings.local.json",
+		"/Users/brian/.claude/skills/x/SKILL.md",
+		"/Users/brian/.claude",
+		"/Users/brian/.codex/config.toml",
+		"repo/.codex",
+		// THE config file, wherever it lives.
+		"/Users/brian/approach/approach.toml",
+		"approach.toml",
+	}
+	for _, path := range denied {
+		isDenied, reason := policy.DeniedPath(path)
+		if !isDenied {
+			t.Errorf("DeniedPath(%q) = allowed, want denied", path)
+			continue
+		}
+		if reason == "" {
+			t.Errorf("DeniedPath(%q) denied with empty reason — refusals must name the rule", path)
+		}
+	}
+
+	allowed := []string{
+		"/Users/brian/dev/approach/internal/store/store.go",
+		"README.md",
+		// Only the enumerated .claude control surface is refused.
+		"repo/.claude/commands/deploy.md",
+		// Name near-misses stay reachable.
+		"notes/ssh-setup.md",
+		"docs/approach.toml.example",
+		"src/environment.ts",
+		"/Users/brian/.config/nvim/init.lua",
+	}
+	for _, path := range allowed {
+		if isDenied, reason := policy.DeniedPath(path); isDenied {
+			t.Errorf("DeniedPath(%q) = denied (%s), want allowed", path, reason)
+		}
+	}
+}
+
+// TestDeniedDescendant: a recursive read rooted at an allowed ancestor
+// traverses everything beneath it, so an allowed root with a denied
+// descendant must yield a deny verdict — otherwise Grep from the repo
+// root walks straight into .env or .claude/settings.json.
+func TestDeniedDescendant(t *testing.T) {
+	dirty := fstest.MapFS{
+		"README.md":              &fstest.MapFile{Data: []byte("ok")},
+		"src/main.go":            &fstest.MapFile{Data: []byte("ok")},
+		".claude/settings.json":  &fstest.MapFile{Data: []byte("secret")},
+		".claude/commands/ok.md": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err := policy.DeniedDescendant(dirty, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant: %v", err)
+	}
+	if path == "" {
+		t.Error("repo containing .claude/settings.json read as clean, want a denied descendant")
+	}
+	if reason == "" && path != "" {
+		t.Error("denied descendant reported with empty reason")
+	}
+
+	// A .claude subtree holding only allowed content stays readable —
+	// the walk judges its children, not the directory's bare name.
+	claudeOK := fstest.MapFS{
+		"README.md":               &fstest.MapFile{Data: []byte("ok")},
+		".claude/commands/ok.md":  &fstest.MapFile{Data: []byte("ok")},
+		".claude/commands/two.md": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(claudeOK, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on allowed .claude content: %v", err)
+	}
+	if path != "" {
+		t.Errorf(".claude with only commands refused (%s at %s) — only hooks/skills/settings are control surface", reason, path)
+	}
+
+	clean := fstest.MapFS{
+		"README.md":   &fstest.MapFile{Data: []byte("ok")},
+		"src/main.go": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, _, err = policy.DeniedDescendant(clean, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on clean tree: %v", err)
+	}
+	if path != "" {
+		t.Errorf("clean tree reported denied descendant %q", path)
+	}
+
+	// Symlinks are resolved and revalidated, not blanket-refused:
+	// denied or root-escaping targets fail closed, while an in-tree
+	// link (node_modules/.bin style) stays legal — the walk visits its
+	// real target anyway.
+	for name, badTarget := range map[string]string{
+		"absolute denied target":  "/Users/alice/.ssh",
+		"relative denied target":  "../../.ssh",
+		"escapes the read root":   "../../elsewhere/data",
+		"absolute allowed target": "/opt/data/files",
+	} {
+		linked := fstest.MapFS{
+			"README.md": &fstest.MapFile{Data: []byte("ok")},
+			"src/cache": &fstest.MapFile{Data: []byte(badTarget), Mode: fs.ModeSymlink},
+		}
+		path, reason, err = policy.DeniedDescendant(linked, "/repo")
+		if err != nil {
+			t.Fatalf("DeniedDescendant (%s): %v", name, err)
+		}
+		if path == "" {
+			t.Errorf("%s: symlink src/cache -> %s read as clean, want refused", name, badTarget)
+		} else if reason == "" {
+			t.Errorf("%s: refused with empty reason", name)
+		}
+	}
+	// A symlink NAMED like a denied path is judged by its own name
+	// first — a benign target must not launder it.
+	deniedName := fstest.MapFS{
+		"README.md": &fstest.MapFile{Data: []byte("ok")},
+		".codex":    &fstest.MapFile{Data: []byte("harmless"), Mode: fs.ModeSymlink},
+		"harmless":  &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, _, err = policy.DeniedDescendant(deniedName, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on denied-name symlink: %v", err)
+	}
+	if path == "" {
+		t.Error("symlink named .codex read as clean — the entry's own name is denied")
+	}
+
+	benign := fstest.MapFS{
+		"node_modules/.bin/tsc":           &fstest.MapFile{Data: []byte("../typescript/bin/tsc"), Mode: fs.ModeSymlink},
+		"node_modules/typescript/bin/tsc": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(benign, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on benign symlink: %v", err)
+	}
+	if path != "" {
+		t.Errorf("in-tree symlink refused (%s at %s) — routine workspace links must stay legal", reason, path)
+	}
+
+	// A denied root is its own verdict — no walk needed.
+	path, _, err = policy.DeniedDescendant(clean, "/Users/brian/.ssh")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on denied root: %v", err)
+	}
+	if path == "" {
+		t.Error("denied root read as clean")
+	}
+}
+
+// TestDeniedDir: the os entry point resolves the read root's own
+// symlink chain before walking — os.DirFS follows a symlinked root
+// silently, so a benignly named link out of the cwd subtree must be
+// refused here, not walked under its innocent name.
+// TestDeniedDescendantAppliesRootContext: WalkDir hands out paths
+// RELATIVE to the walk root, so a read rooted at ~/.config sees
+// "gh/hosts.yml" with no .config segment — judged bare, the
+// .config/{gh,gcloud} rule never fires and the walk traverses GitHub
+// and gcloud token files. Entries must be judged with their root
+// context joined back on.
+func TestDeniedDescendantAppliesRootContext(t *testing.T) {
+	config := fstest.MapFS{
+		"themes/starship.toml": &fstest.MapFile{Data: []byte("ok")},
+		"gh/hosts.yml":         &fstest.MapFile{Data: []byte("oauth_token: secret")},
+	}
+	path, reason, err := policy.DeniedDescendant(config, "/Users/alice/.config")
+	if err != nil {
+		t.Fatalf("DeniedDescendant: %v", err)
+	}
+	if path == "" {
+		t.Error("walk rooted at .config traversed gh/hosts.yml as clean, want .config/gh denied")
+	}
+	if path != "" && !strings.Contains(reason, ".config/gh") {
+		t.Errorf("reason = %q, want it to name the .config/gh rule", reason)
+	}
+
+	// The rest of the config tree stays reachable: a .config root with
+	// no token-bearing tools underneath walks clean.
+	tokenless := fstest.MapFS{
+		"themes/starship.toml": &fstest.MapFile{Data: []byte("ok")},
+		"git/config":           &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(tokenless, "/Users/alice/.config")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on tokenless .config: %v", err)
+	}
+	if path != "" {
+		t.Errorf("tokenless .config refused (%s at %s), want readable — only gh/gcloud are denied", reason, path)
+	}
+}
+
+// TestDeniedDescendantSymlinkAliasContext: an in-root symlink can spell
+// a denied path onto content whose real location is benign — .config ->
+// config-target makes config-target/gh/hosts.yml reachable as
+// .config/gh/hosts.yml. The alias spelling carries the .config/gh
+// context the target's real path lacks, so the aliased subtree must be
+// judged under the source name, not only visited under the target's.
+func TestDeniedDescendantSymlinkAliasContext(t *testing.T) {
+	aliased := fstest.MapFS{
+		"README.md":                  &fstest.MapFile{Data: []byte("ok")},
+		".config":                    &fstest.MapFile{Data: []byte("config-target"), Mode: fs.ModeSymlink},
+		"config-target/gh/hosts.yml": &fstest.MapFile{Data: []byte("oauth_token: secret")},
+	}
+	path, reason, err := policy.DeniedDescendant(aliased, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant: %v", err)
+	}
+	if path == "" {
+		t.Error(".config -> config-target aliased gh/hosts.yml read as clean, want .config/gh denied")
+	}
+	if path != "" && !strings.Contains(reason, ".config/gh") {
+		t.Errorf("reason = %q, want it to name the .config/gh rule", reason)
+	}
+
+	// A benign in-root alias (no context rule on the source name) stays
+	// legal — the target subtree is still walked, just not refused.
+	benignAlias := fstest.MapFS{
+		"README.md":           &fstest.MapFile{Data: []byte("ok")},
+		"latest":              &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/main.go": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(benignAlias, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on benign alias: %v", err)
+	}
+	if path != "" {
+		t.Errorf("benign in-root alias refused (%s at %s)", reason, path)
+	}
+
+	// A benign alias whose target holds only allowed .claude content
+	// stays legal — the alias check must mirror the .claude carve-out,
+	// not refuse the whole read on a terminal .claude child.
+	claudeAlias := fstest.MapFS{
+		"latest":                             &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/main.go":                &fstest.MapFile{Data: []byte("ok")},
+		"releases/v2/.claude/commands/ok.md": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(claudeAlias, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on alias to allowed .claude content: %v", err)
+	}
+	if path != "" {
+		t.Errorf("benign alias to .claude/commands refused (%s at %s) — carve-out must apply", reason, path)
+	}
+
+	// But an alias whose target holds real .claude control surface is
+	// still refused — the carve-out descends to judge children, and
+	// settings.json is denied wherever it sits.
+	claudeAliasBad := fstest.MapFS{
+		"latest":                            &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/.claude/settings.json": &fstest.MapFile{Data: []byte("secret")},
+	}
+	path, _, err = policy.DeniedDescendant(claudeAliasBad, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on alias to .claude control surface: %v", err)
+	}
+	if path == "" {
+		t.Error("alias target with .claude/settings.json read as clean, want denied")
+	}
+
+	// An alias to the walk root itself still needs its context judged:
+	// sub/.config -> the root makes .config/gh/hosts.yml reachable, and
+	// the alias's direct-child check must not be skipped as a cycle.
+	rootAlias := fstest.MapFS{
+		"gh/hosts.yml": &fstest.MapFile{Data: []byte("oauth_token: secret")},
+		"sub/.config":  &fstest.MapFile{Data: []byte(".."), Mode: fs.ModeSymlink},
+	}
+	path, _, err = policy.DeniedDescendant(rootAlias, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on root-targeting alias: %v", err)
+	}
+	if path == "" {
+		t.Error("sub/.config -> root aliased gh/hosts.yml as clean, want .config/gh denied")
+	}
+
+	// A chain of in-root aliases whose deepest link points to a sibling
+	// elsewhere under the SAME root stays legal — the confinement
+	// boundary is the original root, not each alias's own target subtree.
+	nested := fstest.MapFS{
+		"latest":              &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/main.go": &fstest.MapFile{Data: []byte("ok")},
+		"releases/v2/assets":  &fstest.MapFile{Data: []byte("../../shared"), Mode: fs.ModeSymlink},
+		"shared/logo.png":     &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(nested, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on nested in-root aliases: %v", err)
+	}
+	if path != "" {
+		t.Errorf("in-root sibling alias refused (%s at %s) — the boundary is the original root", reason, path)
+	}
+}
+
+// TestDeniedDirRelativeCwd: DeniedDir accepts a relative session cwd
+// (resolved against the process directory), so the component-by-component
+// root resolver must anchor it to an absolute path first — a regression
+// guard for the symlink-spelling walk.
+func TestDeniedDirRelativeCwd(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "repo", "src"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "repo", "src", ".env"), []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(base); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(prev); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+
+	// Relative cwd "repo", relative root "src" (joined to repo/src): the
+	// denied descendant .env still surfaces, proving resolution anchored
+	// correctly instead of erroring against the filesystem root.
+	path, _, err := policy.DeniedDir("repo", "src")
+	if err != nil {
+		t.Fatalf("DeniedDir with relative cwd: %v", err)
+	}
+	if path == "" {
+		t.Error("relative-cwd read of repo/src containing .env read as clean, want denied")
+	}
+}
+
+func TestDeniedDir(t *testing.T) {
+	base := t.TempDir()
+	cwd := filepath.Join(base, "cwd")
+	outside := filepath.Join(base, "outside")
+	for _, dir := range []string{
+		filepath.Join(cwd, "src"),
+		filepath.Join(outside, "data"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "src", "main.go"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cwd, "cache")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	// An in-cwd, clean root is allowed — absolute or relative (a
+	// relative root anchors to the session cwd, not the daemon's).
+	path, reason, err := policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir on clean root: %v", err)
+	}
+	if path != "" {
+		t.Errorf("clean in-cwd root refused (%s at %s)", reason, path)
+	}
+	path, reason, err = policy.DeniedDir(cwd, "src")
+	if err != nil {
+		t.Fatalf("DeniedDir on relative root: %v", err)
+	}
+	if path != "" {
+		t.Errorf("relative in-cwd root refused (%s at %s)", reason, path)
+	}
+
+	// A link that leaves the read root but stays inside the session cwd
+	// is legal — the §7 boundary is the cwd subtree — and its target
+	// tree is walked too, so a secret behind it still surfaces.
+	if err := os.MkdirAll(filepath.Join(cwd, "build", "generated"), 0o755); err != nil {
+		t.Fatalf("mkdir build: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cwd, "build", "generated"), filepath.Join(cwd, "src", "generated")); err != nil {
+		t.Fatalf("symlink generated: %v", err)
+	}
+	path, reason, err = policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with in-cwd link: %v", err)
+	}
+	if path != "" {
+		t.Errorf("in-cwd out-of-root link refused (%s at %s) — the boundary is the cwd, not the read root", reason, path)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "build", "generated", ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatalf("write linked .env: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with dirty linked tree: %v", err)
+	}
+	if path == "" {
+		t.Error("secret behind an in-cwd link read as clean — external targets must be walked too")
+	}
+	if err := os.Remove(filepath.Join(cwd, "build", "generated", ".env")); err != nil {
+		t.Fatalf("remove linked .env: %v", err)
+	}
+
+	// A symlinked root escaping the cwd subtree is refused even though
+	// its own name is benign.
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "cache"))
+	if err != nil {
+		t.Fatalf("DeniedDir on escaping root: %v", err)
+	}
+	if path == "" {
+		t.Error("symlinked root escaping the cwd read as clean, want refused")
+	}
+
+	// A denylisted root NAME is refused before resolution — a benign
+	// in-cwd target must not launder it.
+	if err := os.Symlink(filepath.Join(cwd, "src"), filepath.Join(cwd, ".codex")); err != nil {
+		t.Fatalf("symlink .codex: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, ".codex"))
+	if err != nil {
+		t.Fatalf("DeniedDir on denied-name root: %v", err)
+	}
+	if path == "" {
+		t.Error("root named .codex read as clean via its benign target, want refused by name")
+	}
+
+	// A root that does not resolve fails CLOSED — as an error, never a
+	// silent allow.
+	if _, _, err := policy.DeniedDir(cwd, filepath.Join(cwd, "missing")); err == nil {
+		t.Error("unresolvable root returned no error, want fail-closed resolution error")
+	}
+
+	// A denied descendant inside the cwd still surfaces through DeniedDir.
+	if err := os.WriteFile(filepath.Join(cwd, "src", ".env"), []byte("SECRET=1"), 0o644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with denied descendant: %v", err)
+	}
+	if path == "" {
+		t.Error("root containing .env read as clean, want denied descendant")
+	}
+	if err := os.Remove(filepath.Join(cwd, "src", ".env")); err != nil {
+		t.Fatalf("remove .env: %v", err)
+	}
+
+	// An in-cwd symlink aliases a denied spelling onto benign-real
+	// content: cwd/.config -> cwd/config-target, and
+	// config-target/gh/hosts.yml is reachable as .config/gh/hosts.yml.
+	// The alias name carries the .config/gh context the target's real
+	// path lacks, so a recursive read of cwd must refuse it.
+	if err := os.MkdirAll(filepath.Join(cwd, "config-target", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir config-target: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "config-target", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write hosts.yml: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cwd, "config-target"), filepath.Join(cwd, ".config")); err != nil {
+		t.Fatalf("symlink .config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, cwd)
+	if err != nil {
+		t.Fatalf("DeniedDir with aliased .config: %v", err)
+	}
+	if path == "" {
+		t.Error(".config -> config-target aliased a gh token file as clean, want .config/gh denied")
+	}
+
+	// A symlink cycle within the cwd must terminate, not spin: two
+	// directories linking into each other are walked to a verdict, not
+	// followed forever.
+	cycle := filepath.Join(base, "cycle")
+	if err := os.MkdirAll(filepath.Join(cycle, "a"), 0o755); err != nil {
+		t.Fatalf("mkdir cycle/a: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cycle, "b"), 0o755); err != nil {
+		t.Fatalf("mkdir cycle/b: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cycle, "b"), filepath.Join(cycle, "a", "to-b")); err != nil {
+		t.Fatalf("symlink a/to-b: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cycle, "a"), filepath.Join(cycle, "b", "to-a")); err != nil {
+		t.Fatalf("symlink b/to-a: %v", err)
+	}
+	if _, _, err := policy.DeniedDir(cycle, cycle); err != nil {
+		t.Fatalf("DeniedDir on a symlink cycle: %v", err)
+	}
+
+	// The read ROOT itself can be a denylist-aliasing symlink: the
+	// cwd/.config -> cwd/config-target link above makes
+	// config-target/gh/hosts.yml reachable as .config/gh/hosts.yml. Read
+	// with that symlink AS the root — the walk must judge descendants
+	// under the requested spelling (.config), not the resolved target
+	// name (config-target).
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, ".config"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a symlinked .config root: %v", err)
+	}
+	if path == "" {
+		t.Error("read root .config -> config-target exposed gh/hosts.yml as clean, want .config/gh denied")
+	}
+
+	// The inverse: a BENIGN-named root symlink pointing at a real
+	// denylisted directory. cwd/safe -> cwd/real/.config must not launder
+	// the real .config/gh path — the resolved spelling has to be judged
+	// too, not only the requested one.
+	if err := os.MkdirAll(filepath.Join(cwd, "real", ".config", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir real/.config/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real", ".config", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write real hosts.yml: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cwd, "real", ".config"), filepath.Join(cwd, "safe")); err != nil {
+		t.Fatalf("symlink safe -> real/.config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "safe"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a benign root symlink to a denied dir: %v", err)
+	}
+	if path == "" {
+		t.Error("root safe -> real/.config exposed the real gh token file as clean, want .config/gh denied")
+	}
+
+	// A denylisted segment can hide at an INTERMEDIATE hop of the root's
+	// own symlink chain: chain -> .config -> config-target collapses to
+	// config-target under EvalSymlinks, losing the .config spelling, but
+	// config-target/gh/hosts.yml is still reachable as
+	// chain/gh -> .config/gh. Each hop must be judged.
+	if err := os.Symlink(filepath.Join(cwd, ".config"), filepath.Join(cwd, "chain")); err != nil {
+		t.Fatalf("symlink chain -> .config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "chain"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a chained root symlink: %v", err)
+	}
+	if path == "" {
+		t.Error("root chain -> .config -> config-target exposed gh/hosts.yml as clean, want .config/gh denied")
+	}
+
+	// A symlink in a PARENT component of the root, not just the final
+	// component: root safe/gh where safe -> real/.config resolves to
+	// real/.config/gh, reachable as .config/gh, and must be denied.
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "safe", "gh"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a root beneath a symlinked ancestor: %v", err)
+	}
+	if path == "" {
+		t.Error("root safe/gh (safe -> real/.config) exposed hosts.yml as clean, want .config/gh denied")
+	}
+
+	// A multi-alias graph must not lose context on a revisit: read root
+	// graph/src links out to shared, shared/.config links back to src, so
+	// src/gh/hosts.yml is reachable as src/link/.config/gh/hosts.yml. The
+	// second time the walk reaches src it carries the .config spelling and
+	// must still deny, even though src was already visited under its own
+	// name.
+	graph := filepath.Join(base, "graph")
+	if err := os.MkdirAll(filepath.Join(graph, "src", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir graph/src/gh: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(graph, "shared"), 0o755); err != nil {
+		t.Fatalf("mkdir graph/shared: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(graph, "src", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write graph hosts.yml: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(graph, "shared"), filepath.Join(graph, "src", "link")); err != nil {
+		t.Fatalf("symlink src/link: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(graph, "src"), filepath.Join(graph, "shared", ".config")); err != nil {
+		t.Fatalf("symlink shared/.config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(graph, filepath.Join(graph, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir on multi-alias graph: %v", err)
+	}
+	if path == "" {
+		t.Error("src/link/.config/gh reachable but read as clean — a revisited dir must keep its alias context")
+	}
+}
+
+// TestDeniedDirExternalTargetResolvedContext: an external in-cwd link
+// whose RESOLVED target carries a context rule the alias spelling
+// lacks. src/link -> ../real/.config makes real/.config/gh/hosts.yml
+// reachable from a read of src, but under the alias spelling the
+// children are judged as src/link/gh/… — the .config/gh rule only
+// fires under the target's own resolved spelling, which must be
+// applied too.
+func TestDeniedDirExternalTargetResolvedContext(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "real", ".config", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir real/.config/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real", ".config", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write hosts.yml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "real", ".config"), filepath.Join(cwd, "src", "link")); err != nil {
+		t.Fatalf("symlink src/link: %v", err)
+	}
+	path, _, err := policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with external .config target: %v", err)
+	}
+	if path == "" {
+		t.Error("src/link -> ../real/.config exposed gh/hosts.yml as clean — the target's resolved spelling must be judged too")
+	}
+}
+
+// TestDeniedDirExternalChainSpellings: a denylisted spelling hiding at
+// an INTERMEDIATE hop of an external link's own chain. src/link ->
+// ../safe -> .config -> config-target: EvalSymlinks collapses the
+// chain to config-target and the source alias is src/link, so neither
+// retained spelling carries .config — but config-target/gh/hosts.yml
+// is still reachable as .config/gh. Every hop of an external target's
+// chain must be judged, exactly as rootSpellings does for the root.
+func TestDeniedDirExternalChainSpellings(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "config-target", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir config-target/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "config-target", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write hosts.yml: %v", err)
+	}
+	if err := os.Symlink("config-target", filepath.Join(cwd, ".config")); err != nil {
+		t.Fatalf("symlink .config: %v", err)
+	}
+	if err := os.Symlink(".config", filepath.Join(cwd, "safe")); err != nil {
+		t.Fatalf("symlink safe: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "safe"), filepath.Join(cwd, "src", "link")); err != nil {
+		t.Fatalf("symlink src/link: %v", err)
+	}
+	path, _, err := policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with chained external target: %v", err)
+	}
+	if path == "" {
+		t.Error("src/link -> ../safe -> .config -> config-target exposed gh/hosts.yml as clean — intermediate hop spellings must be judged too")
+	}
+}

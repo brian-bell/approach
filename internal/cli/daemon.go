@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 
 	"github.com/brian-bell/approach/internal/admin"
+	"github.com/brian-bell/approach/internal/config"
 	"github.com/brian-bell/approach/internal/store"
 )
 
@@ -47,6 +49,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	flags := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	state := flags.String("state", defaultStateDir(), "state directory (holds approach.db and approach.sock)")
+	configPath := flags.String("config", "", "path to approach.toml (default: approach.toml beside the state directory)")
 	if err := flags.Parse(args); err != nil {
 		return 2
 	}
@@ -105,6 +108,18 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		}
 	}()
 
+	// Config loads under the daemon lock but BEFORE the store opens: a
+	// bad approach.toml must be refused before this process migrates the
+	// schema. The file is security-load-bearing, so an explicit --config
+	// fails loud on any problem; only the DEFAULTED path may be absent —
+	// zero enrolled identities is a bootable, deny-by-default posture
+	// (§6), but it must be loudly logged, never silent.
+	cfg, err := loadDaemonConfig(*configPath, *state, logger)
+	if err != nil {
+		logger.Error("load config", "error", err.Error())
+		return 1
+	}
+
 	db, err = store.Open(filepath.Join(*state, "approach.db"))
 	if err != nil {
 		logger.Error("open state store", "error", err.Error())
@@ -120,6 +135,11 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		}
 	}()
 
+	if err := seedIdentities(db, cfg, logger); err != nil {
+		logger.Error("seed identities", "error", err.Error())
+		return 1
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := srv.Serve(ctx); err != nil {
@@ -128,6 +148,55 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	}
 	logger.Info("drained, shutting down")
 	return 0
+}
+
+// loadDaemonConfig loads approach.toml for the daemon. An explicit path
+// must load cleanly; the defaulted path (approach.toml beside the state
+// directory — the APPROACH_HOME layout, §6) may be absent, which reads
+// as zero enrolled identities and is warned about, not hidden.
+func loadDaemonConfig(path, state string, logger *slog.Logger) (*config.Config, error) {
+	explicit := path != ""
+	if !explicit {
+		// Clean first: Dir on a trailing-slash spelling ("…/state/")
+		// returns the state dir itself, and since absence at the
+		// defaulted path is tolerated, that misderivation would silently
+		// boot with zero identities instead of the enrolled set.
+		path = filepath.Join(filepath.Dir(filepath.Clean(state)), "approach.toml")
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		if !explicit && errors.Is(err, fs.ErrNotExist) {
+			logger.Warn("no approach.toml — zero identities enrolled; every sender is untrusted (§6)", "path", path)
+			return nil, nil
+		}
+		return nil, err
+	}
+	logger.Info("config loaded", "path", path)
+	return cfg, nil
+}
+
+// seedIdentities syncs the identities table to the config (§6). A nil
+// config (defaulted, absent approach.toml) syncs to empty: untrusted is
+// the absence of a row, so an unconfigured daemon trusts nobody.
+func seedIdentities(db *sql.DB, cfg *config.Config, logger *slog.Logger) error {
+	var ids []store.Identity
+	if cfg != nil {
+		ids = make([]store.Identity, len(cfg.Identities))
+		for i, id := range cfg.Identities {
+			ids[i] = store.Identity{
+				Channel:  id.Channel,
+				NativeID: id.NativeID,
+				Trust:    id.Trust,
+				OwnerID:  id.OwnerID,
+				Label:    id.Label,
+			}
+		}
+	}
+	if err := store.SeedIdentities(context.Background(), db, ids); err != nil {
+		return err
+	}
+	logger.Info("identities seeded", "count", len(ids))
+	return nil
 }
 
 // rejectLeftovers refuses positional arguments: flag parsing stops at
