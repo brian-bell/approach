@@ -26,7 +26,9 @@ var embeddedMigrations embed.FS
 // Migrate applies the schema migrations embedded in the binary to db:
 // numbered NNNN_description.sql files, every pending one applied in a
 // single transaction, with PRAGMA user_version tracking the schema
-// version (§6). Open calls this, so an opened store is always migrated.
+// version (§6). A version beyond the embedded set fails with
+// ErrSchemaTooNew. Open calls this, so an opened store is always
+// migrated.
 func Migrate(ctx context.Context, db *sql.DB) error {
 	fsys, err := fs.Sub(embeddedMigrations, "migrations")
 	if err != nil {
@@ -136,6 +138,12 @@ func rollback(conn *sql.Conn) error {
 	return nil
 }
 
+// ErrSchemaTooNew is returned when the database schema version is
+// beyond the embedded migration set: the db was written by a newer
+// binary, and running against a schema this code has never seen risks
+// mystery corruption. Downgrade protection, §6 — match with errors.Is.
+var ErrSchemaTooNew = errors.New("database schema is newer than this binary")
+
 // versionSentinel marks the batch transaction in flight: user_version
 // holds it from BEGIN until the final bump, so both escape directions
 // are observable (see requireBatchTransaction). Real versions are
@@ -151,9 +159,16 @@ func applyPending(ctx context.Context, observer, conn *sql.Conn, migrations []mi
 	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("store: read schema version: %w", err)
 	}
-	// A version beyond the embedded set means the db was written by a
-	// newer binary; today that is a silent no-op — approach-1zr.1.5 turns
-	// it into a hard refusal (downgrade protection, §6).
+	// Checked before the pending computation: a too-new version leaves
+	// pending empty, and the early return below would turn the refusal
+	// into a silent no-op.
+	newest := 0
+	if len(migrations) > 0 {
+		newest = migrations[len(migrations)-1].number
+	}
+	if version > newest {
+		return fmt.Errorf("store: schema version %d, this binary knows up to %d: %w — upgrade approach or restore a matching database (§6)", version, newest, ErrSchemaTooNew)
+	}
 	var pending []migration
 	for _, m := range migrations {
 		if m.number > version {
