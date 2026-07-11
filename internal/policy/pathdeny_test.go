@@ -622,3 +622,33 @@ func TestDeniedDir(t *testing.T) {
 		t.Error("src/link/.config/gh reachable but read as clean — a revisited dir must keep its alias context")
 	}
 }
+
+// TestDeniedDirExternalTargetResolvedContext: an external in-cwd link
+// whose RESOLVED target carries a context rule the alias spelling
+// lacks. src/link -> ../real/.config makes real/.config/gh/hosts.yml
+// reachable from a read of src, but under the alias spelling the
+// children are judged as src/link/gh/… — the .config/gh rule only
+// fires under the target's own resolved spelling, which must be
+// applied too.
+func TestDeniedDirExternalTargetResolvedContext(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "real", ".config", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir real/.config/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real", ".config", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write hosts.yml: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "real", ".config"), filepath.Join(cwd, "src", "link")); err != nil {
+		t.Fatalf("symlink src/link: %v", err)
+	}
+	path, _, err := policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with external .config target: %v", err)
+	}
+	if path == "" {
+		t.Error("src/link -> ../real/.config exposed gh/hosts.yml as clean — the target's resolved spelling must be judged too")
+	}
+}

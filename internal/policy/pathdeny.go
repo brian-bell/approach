@@ -201,7 +201,15 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 				return "", "", fmt.Errorf("policy: inspect symlink target %s: %w", target, err)
 			}
 			if info.IsDir() {
+				// Both spellings of the target enter the queue: the alias
+				// spelling because the link name may carry context its real
+				// path lacks, and the RESOLVED spelling because the inverse
+				// holds too — src/link -> ../real/.config reaches gh/… as
+				// src/link/gh under the alias, and only real/.config/gh
+				// fires the context rule. Whichever runs second hits the
+				// visited branch and gets the depth-1 alias check.
 				queue = append(queue, walkItem{physical: target, logical: e.sourceLogical})
+				queue = append(queue, walkItem{physical: target, logical: target})
 			}
 		}
 	}
