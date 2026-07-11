@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -201,6 +202,43 @@ func TestDeniedDescendant(t *testing.T) {
 // symlink chain before walking — os.DirFS follows a symlinked root
 // silently, so a benignly named link out of the cwd subtree must be
 // refused here, not walked under its innocent name.
+// TestDeniedDescendantAppliesRootContext: WalkDir hands out paths
+// RELATIVE to the walk root, so a read rooted at ~/.config sees
+// "gh/hosts.yml" with no .config segment — judged bare, the
+// .config/{gh,gcloud} rule never fires and the walk traverses GitHub
+// and gcloud token files. Entries must be judged with their root
+// context joined back on.
+func TestDeniedDescendantAppliesRootContext(t *testing.T) {
+	config := fstest.MapFS{
+		"themes/starship.toml": &fstest.MapFile{Data: []byte("ok")},
+		"gh/hosts.yml":         &fstest.MapFile{Data: []byte("oauth_token: secret")},
+	}
+	path, reason, err := policy.DeniedDescendant(config, "/Users/alice/.config")
+	if err != nil {
+		t.Fatalf("DeniedDescendant: %v", err)
+	}
+	if path == "" {
+		t.Error("walk rooted at .config traversed gh/hosts.yml as clean, want .config/gh denied")
+	}
+	if path != "" && !strings.Contains(reason, ".config/gh") {
+		t.Errorf("reason = %q, want it to name the .config/gh rule", reason)
+	}
+
+	// The rest of the config tree stays reachable: a .config root with
+	// no token-bearing tools underneath walks clean.
+	tokenless := fstest.MapFS{
+		"themes/starship.toml": &fstest.MapFile{Data: []byte("ok")},
+		"git/config":           &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(tokenless, "/Users/alice/.config")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on tokenless .config: %v", err)
+	}
+	if path != "" {
+		t.Errorf("tokenless .config refused (%s at %s), want readable — only gh/gcloud are denied", reason, path)
+	}
+}
+
 func TestDeniedDir(t *testing.T) {
 	base := t.TempDir()
 	cwd := filepath.Join(base, "cwd")

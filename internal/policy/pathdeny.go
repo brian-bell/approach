@@ -202,7 +202,11 @@ func walkTree(fsys fs.FS, root string) (path, reason string, externals []externa
 		if p == "." {
 			return nil
 		}
-		if denied, why := DeniedPath(p); denied {
+		// Judged with the root joined on, NOT the bare walk-relative
+		// entry: rules that span the root boundary (.config/gh under a
+		// walk rooted at ~/.config) need the ancestor segments, which
+		// WalkDir's relative paths drop.
+		if denied, why := DeniedPath(filepath.Join(root, p)); denied {
 			// One carve-out: a real .claude DIRECTORY met mid-walk is
 			// judged by its children — only the enumerated hooks/
 			// skills/settings surface inside it is denied, and commands
