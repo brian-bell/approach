@@ -136,6 +136,60 @@ func TestMigrateRefusesUnexpectedFiles(t *testing.T) {
 	}
 }
 
+// TestMigrateRefusesNewerSchemaVersion: a version beyond the embedded
+// set means the db was written by a newer binary — refuse loudly
+// (downgrade protection, §6) instead of silently running with a schema
+// this code has never seen.
+func TestMigrateRefusesNewerSchemaVersion(t *testing.T) {
+	db := openBare(t)
+	fsys := migrationFS(map[string]string{
+		"0001_a.sql": `CREATE TABLE a (id INTEGER PRIMARY KEY);`,
+	})
+	if _, err := db.Exec("PRAGMA user_version = 2"); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+
+	err := migrate(context.Background(), db, fsys)
+	if err == nil {
+		t.Fatal("migrate succeeded at version 2 with only 0001 embedded, want refusal")
+	}
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Errorf("error %q is not ErrSchemaTooNew", err)
+	}
+	// Both numbers, so the operator can see the mismatch at a glance.
+	for _, want := range []string{"2", "1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention version %q", err, want)
+		}
+	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 2 {
+		t.Errorf("user_version = %d after refusal, want 2 (untouched)", version)
+	}
+	// The refusal must release the write lock, not leak the transaction.
+	if _, err := db.Exec(`CREATE TABLE after_refusal (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Errorf("store not writable after refusal: %v", err)
+	}
+}
+
+// TestMigrateRefusesNewerVersionEmptySet: any positive version is too
+// new for an empty embedded set — refuse, don't panic on the missing
+// last element.
+func TestMigrateRefusesNewerVersionEmptySet(t *testing.T) {
+	db := openBare(t)
+	if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("set user_version: %v", err)
+	}
+
+	err := migrate(context.Background(), db, migrationFS(nil))
+	if !errors.Is(err, ErrSchemaTooNew) {
+		t.Errorf("migrate on empty set at version 1 = %v, want ErrSchemaTooNew", err)
+	}
+}
+
 func TestMigrateIsIdempotent(t *testing.T) {
 	db := openBare(t)
 	// Plain CREATE TABLE: if a second run re-executed anything, SQLite
