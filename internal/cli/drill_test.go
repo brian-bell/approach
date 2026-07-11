@@ -55,8 +55,12 @@ func TestDrillDaemonRefusesNewerSchema(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("daemon still running against a newer schema, want refusal")
 	}
-	if code != 1 {
-		t.Errorf("daemon exit = %d, want 1", code)
+	// Exit 3, not 1: the refusal is unrecoverable without operator
+	// action (upgrade the binary or restore a matching db), and the
+	// unit's RestartPreventExitStatus=3 keys off it — a plain failure
+	// exit would have systemd restart-loop the refusal every 2s.
+	if code != 3 {
+		t.Errorf("daemon exit = %d, want 3 (unrecoverable refusal, excluded from restart)", code)
 	}
 
 	// The refusal must be total: no readiness line, no socket file,

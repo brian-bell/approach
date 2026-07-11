@@ -71,6 +71,13 @@ func TestDaemonService(t *testing.T) {
 	if got := u.get(t, "approach.service", "Install", "WantedBy"); got != "approach.target" {
 		t.Errorf("WantedBy = %q, want approach.target (starting the target starts the daemon)", got)
 	}
+	// Exit 3 is the daemon's unrecoverable-refusal status (internal/cli
+	// exitUnrecoverable): without this exclusion, a schema-too-new
+	// refusal would restart-loop every RestartSec instead of staying
+	// down with one actionable journal record.
+	if got := u.get(t, "approach.service", "Service", "RestartPreventExitStatus"); got != "3" {
+		t.Errorf("RestartPreventExitStatus = %q, want 3 (unrecoverable startup refusal)", got)
+	}
 }
 
 // TestEveryUnitIsGroupedUnderTheTarget is the §7 kill-switch

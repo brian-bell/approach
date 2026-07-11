@@ -53,6 +53,26 @@ func TestSmokeScriptInvariants(t *testing.T) {
 	}
 }
 
+// TestSpecDocumentsKillSwitch: the architecture spec is part of the
+// kill-switch doc set — if it still tells the operator to `stop` the
+// target, a panic performed by the spec's book silently un-panics on
+// the next login/reboot (the target is WantedBy=default.target). The
+// spec must name the persistent command and must not present a plain
+// stop as the panic command.
+func TestSpecDocumentsKillSwitch(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/approach-agent-harness-spec.html")
+	if err != nil {
+		t.Fatalf("read spec: %v", err)
+	}
+	spec := string(raw)
+	if !strings.Contains(spec, "disable --now approach.target") {
+		t.Error("spec does not name the persistent panic command `disable --now approach.target`")
+	}
+	if strings.Contains(spec, "stop approach.target</code> is the single documented panic command") {
+		t.Error("spec still presents plain `stop approach.target` as the panic command — it does not survive a reboot")
+	}
+}
+
 // TestReadmeDocumentsKillSwitch: the doc and the mechanism must not
 // drift apart — the README names the panic command and the smoke test.
 func TestReadmeDocumentsKillSwitch(t *testing.T) {

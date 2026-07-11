@@ -12,6 +12,11 @@ After=network-online.target
 ExecStart=%h/bin/approach daemon
 Restart=on-failure
 RestartSec=2
+# Exit 3 is the daemon's "unrecoverable startup refusal" status (e.g.
+# schema newer than the binary, §6): restarting cannot fix it, so it
+# stays down with one actionable journal record instead of
+# restart-looping. Keep in sync with exitUnrecoverable in internal/cli.
+RestartPreventExitStatus=3
 # 30s of graceful drain, then SIGKILL — deliberate panic-button
 # semantics, not an oversight: the kill switch must actually stop
 # things, and the state design tolerates force-kill (§4.1/§9 — durable
