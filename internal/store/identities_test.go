@@ -60,6 +60,19 @@ func TestIdentitiesSchemaConstraints(t *testing.T) {
 			"known row with owner_id",
 			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '3', 'known', 'brian')`,
 		},
+		{
+			// Empty is not a principal: '' is non-NULL, so a naive CHECK
+			// admits it, and every such row would match every other empty
+			// owner_id in cross-surface approval (§4.4).
+			"owner row with empty owner_id",
+			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '4', 'owner', '')`,
+		},
+		{
+			// The two valid states are exactly (owner, non-empty) and
+			// (known, NULL) — an empty string on a known row is neither.
+			"known row with empty owner_id",
+			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '5', 'known', '')`,
+		},
 	} {
 		if _, err := db.Exec(tc.sql); err == nil {
 			t.Errorf("%s: insert succeeded, want CHECK violation", tc.name)

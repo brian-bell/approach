@@ -11,8 +11,14 @@ CREATE TABLE identities (
         CHECK (trust IN ('owner', 'known')),
     owner_id  TEXT                     -- canonical principal, identical across ALL of the
                                        --   owner's surfaces — cross-surface approval (§4.4)
-                                       --   matches on it, so exactly owner rows carry it
-        CHECK ((owner_id IS NOT NULL) = (trust = 'owner')),
+                                       --   matches on it, so exactly owner rows carry it.
+                                       --   The two valid states are spelled out: owner rows
+                                       --   need a real (non-empty) principal — '' is
+                                       --   non-NULL, and empty principals would all match
+                                       --   each other in approval — and known rows carry
+                                       --   nothing at all.
+        CHECK ((trust = 'owner' AND owner_id IS NOT NULL AND owner_id <> '')
+            OR (trust = 'known' AND owner_id IS NULL)),
     label     TEXT,
     PRIMARY KEY (channel, native_id)
 );
