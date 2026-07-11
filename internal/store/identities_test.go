@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/brian-bell/approach/internal/store"
+	"github.com/brian-bell/approach/internal/trust"
 )
 
 // TestOpenCreatesIdentitiesTable: the §6 identities table — the root of
@@ -222,5 +223,141 @@ func TestResolveOwnerID(t *testing.T) {
 	}
 	if ownerID, ok := resolve("discord", "unmapped"); ok {
 		t.Errorf("unmapped sender resolved principal %q, want none", ownerID)
+	}
+}
+
+// TestResolveTrust: the §6 lookup every gate reduces to — (channel,
+// native_id) -> trust level, and a miss IS untrusted, deny-by-default:
+// an unknown Discord DM is untrusted, never inferred toward anything
+// else.
+func TestResolveTrust(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	level, err := store.ResolveTrust(ctx, db, "discord", "999")
+	if err != nil {
+		t.Fatalf("ResolveTrust on unmapped sender: %v", err)
+	}
+	if level != trust.Untrusted {
+		t.Errorf("unmapped sender resolved %q, want untrusted deny-by-default", level)
+	}
+}
+
+// TestResolveTrustEnrolled: hits stamp the row's enrolled level, and
+// the lookup is exact-match — platform native IDs are case-sensitive,
+// so a case-mismatched id is a different (unmapped) sender.
+func TestResolveTrustEnrolled(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '42', 'owner', 'brian');
+		 INSERT INTO identities (channel, native_id, trust) VALUES ('slack', 'U7', 'known')`,
+	); err != nil {
+		t.Fatalf("enroll identities: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, channel, nativeID string
+		want                    trust.Level
+	}{
+		{"owner row", "discord", "42", trust.Owner},
+		{"known row", "slack", "U7", trust.Known},
+		{"case-mismatched native_id is a different sender", "slack", "u7", trust.Untrusted},
+		{"same native_id on an unenrolled channel", "sms", "42", trust.Untrusted},
+	} {
+		level, err := store.ResolveTrust(ctx, db, tc.channel, tc.nativeID)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if level != tc.want {
+			t.Errorf("%s: resolved %q, want %q", tc.name, level, tc.want)
+		}
+	}
+}
+
+// TestResolveTrustFailsClosed: a broken store and a drifted row are
+// errors carrying Untrusted — never a silent allow, and never a level a
+// caller that drops the error could act on.
+func TestResolveTrustFailsClosed(t *testing.T) {
+	ctx := context.Background()
+
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	level, err := store.ResolveTrust(ctx, db, "discord", "42")
+	if err == nil {
+		t.Error("ResolveTrust on a closed store returned no error, want fail-closed error")
+	}
+	if level != trust.Untrusted {
+		t.Errorf("failed lookup resolved %q, want untrusted", level)
+	}
+
+	// Drift the table past the 0002 CHECK — exactly what the Parse
+	// defense exists for: the identities table is the root of §7, and a
+	// manually edited row must not coerce into some level.
+	db = mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	if _, err := db.Exec(`PRAGMA ignore_check_constraints = ON`); err != nil {
+		t.Fatalf("disable check constraints: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust) VALUES ('discord', '13', 'admin')`,
+	); err != nil {
+		t.Fatalf("insert drifted row: %v", err)
+	}
+	level, err = store.ResolveTrust(ctx, db, "discord", "13")
+	if err == nil {
+		t.Error("drifted trust value resolved without error, want fail-closed error")
+	}
+	if level != trust.Untrusted {
+		t.Errorf("drifted row resolved %q, want untrusted", level)
+	}
+}
+
+// TestResolveTrustRowInvariants: the Parse defense alone is not enough —
+// the 0002 CHECK also binds trust to the owner_id shape, and a drifted
+// row violating THOSE invariants must fail closed too: a malformed
+// owner row must never stamp elevated trust, and a stored 'untrusted'
+// row is drift by definition (absence of a row is what untrusted means).
+func TestResolveTrustRowInvariants(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, insert, nativeID string
+	}{
+		{
+			"owner row without owner_id",
+			`INSERT INTO identities (channel, native_id, trust) VALUES ('discord', '13', 'owner')`,
+			"13",
+		},
+		{
+			"owner row with empty owner_id",
+			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '14', 'owner', '')`,
+			"14",
+		},
+		{
+			"known row carrying owner_id",
+			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '15', 'known', 'brian')`,
+			"15",
+		},
+		{
+			"stored untrusted row",
+			`INSERT INTO identities (channel, native_id, trust) VALUES ('discord', '16', 'untrusted')`,
+			"16",
+		},
+	} {
+		db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+		if _, err := db.Exec(`PRAGMA ignore_check_constraints = ON`); err != nil {
+			t.Fatalf("%s: disable check constraints: %v", tc.name, err)
+		}
+		if _, err := db.Exec(tc.insert); err != nil {
+			t.Fatalf("%s: insert drifted row: %v", tc.name, err)
+		}
+		level, err := store.ResolveTrust(ctx, db, "discord", tc.nativeID)
+		if err == nil {
+			t.Errorf("%s: resolved without error, want fail-closed error", tc.name)
+		}
+		if level != trust.Untrusted {
+			t.Errorf("%s: resolved %q, want untrusted", tc.name, level)
+		}
 	}
 }
