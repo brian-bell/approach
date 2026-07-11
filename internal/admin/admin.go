@@ -11,9 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +37,9 @@ type Options struct {
 	// OnReady is invoked once the socket is bound and accepting — the
 	// only point a launcher may treat the daemon as reachable.
 	OnReady func()
+	// Logger receives one structured record per request and per
+	// recovered handler panic. Nil means silent.
+	Logger *slog.Logger
 }
 
 // Server is the admin socket listener. Create with New, run with
@@ -69,6 +74,9 @@ func New(path string, opts Options) (*Server, error) {
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("admin: %w", err)
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
 	}
 	lock, err := acquireLock(path)
 	if err != nil {
@@ -216,9 +224,22 @@ func (s *Server) claim() error {
 	return nil
 }
 
-// handle answers one request on conn and closes it.
+// handle answers one request on conn and closes it. A panic anywhere
+// in the request path — including the daemon hooks handlers call into
+// (OnPoke, Status; later the event router) — is recovered here: one
+// poisoned request must not take the daemon down. The client gets a
+// diagnostic, the journal gets the stack.
 func (s *Server) handle(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
+	defer func() {
+		if p := recover(); p != nil {
+			s.opts.Logger.Error("panic in admin handler",
+				"panic", fmt.Sprint(p),
+				"stack", string(debug.Stack()))
+			// Best effort — the connection may already be unusable.
+			fmt.Fprintln(conn, "err internal error")
+		}
+	}()
 	// A silent or wedged client must not pin its handler goroutine
 	// (and the drain WaitGroup) forever: the deadline covers the WRITE
 	// side too — a client that sends a verb and never reads the reply
@@ -237,6 +258,7 @@ func (s *Server) handle(conn net.Conn) {
 		return
 	}
 	verb := strings.TrimSuffix(line, "\n")
+	s.opts.Logger.Info("admin request", "verb", verb)
 	switch verb {
 	case "poke":
 		if s.opts.OnPoke != nil {

@@ -6,9 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -32,7 +34,7 @@ func defaultStateDir() string {
 
 // runDaemon starts the state store and serves the admin socket until
 // a drain request or SIGINT/SIGTERM.
-func runDaemon(args []string, stdout, stderr io.Writer) int {
+func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	flags := flag.NewFlagSet("daemon", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	state := flags.String("state", defaultStateDir(), "state directory (holds approach.db and approach.sock)")
@@ -42,6 +44,19 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	if err := rejectLeftovers("daemon", flags, stderr); err != nil {
 		return 2
 	}
+	// stderr is the systemd journal (§8): every daemon lifecycle event
+	// and error is a structured record there. stdout keeps the one
+	// plain readiness line launchers wait for.
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	// The daemon must never die silently: a panic escaping the main
+	// loop is logged with its stack before the nonzero exit hands
+	// restarting over to systemd (Restart=on-failure).
+	defer func() {
+		if p := recover(); p != nil {
+			logger.Error("daemon panic", "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			code = 1
+		}
+	}()
 
 	// Daemon ownership (admin.New's lifetime lock) comes FIRST: opening
 	// the store also migrates it, and a second — possibly newer —
@@ -54,6 +69,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 	// status is how a timer's wake path is verified end to end.
 	var pokes atomic.Int64
 	srv, err := admin.New(socket, admin.Options{
+		Logger: logger,
 		OnPoke: func() { pokes.Add(1) },
 		Status: func() map[string]any {
 			fields := map[string]any{"version": version(), "pid": os.Getpid(), "pokes": pokes.Load()}
@@ -67,35 +83,38 @@ func runDaemon(args []string, stdout, stderr io.Writer) int {
 		// line is what launchers may wait on.
 		OnReady: func() {
 			fmt.Fprintf(stdout, "approach daemon listening on %s\n", socket)
+			logger.Info("ready", "socket", socket)
 		},
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
+		logger.Error("startup failed", "error", err.Error())
 		return 1
 	}
 	defer func() {
 		if err := srv.Close(); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
+			logger.Error("release daemon lock", "error", err.Error())
 		}
 	}()
 
 	db, err = store.Open(filepath.Join(*state, "approach.db"))
 	if err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
+		logger.Error("open state store", "error", err.Error())
 		return 1
 	}
+	logger.Info("state store open", "state", *state)
 	defer func() {
 		if err := db.Close(); err != nil {
-			fmt.Fprintf(stderr, "%v\n", err)
+			logger.Error("close state store", "error", err.Error())
 		}
 	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := srv.Serve(ctx); err != nil {
-		fmt.Fprintf(stderr, "%v\n", err)
+		logger.Error("admin socket", "error", err.Error())
 		return 1
 	}
+	logger.Info("drained, shutting down")
 	return 0
 }
 

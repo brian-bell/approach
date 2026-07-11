@@ -1,6 +1,7 @@
 package cli_test
 
 import (
+	"encoding/json"
 	"net"
 	"os"
 	"path/filepath"
@@ -78,6 +79,26 @@ func TestDaemonAdminRoundTrip(t *testing.T) {
 	// is a migrated daemon).
 	if _, err := os.Stat(filepath.Join(state, "approach.db")); err != nil {
 		t.Errorf("daemon did not create the state store: %v", err)
+	}
+
+	// stderr is the systemd journal: the daemon's lifecycle must land
+	// there as structured JSON records, not prose.
+	var readyLogged bool
+	for _, line := range strings.Split(strings.TrimSpace(daemonErr.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Errorf("daemon stderr line %q is not a JSON log record: %v", line, err)
+			continue
+		}
+		if rec["msg"] == "ready" && rec["socket"] == socket {
+			readyLogged = true
+		}
+	}
+	if !readyLogged {
+		t.Errorf("daemon stderr %q has no ready record naming the socket", daemonErr.String())
 	}
 }
 
