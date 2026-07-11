@@ -133,6 +133,77 @@ func TestDrillUnmappedSenderResolvesUntrusted(t *testing.T) {
 	}
 }
 
+// TestDrillSpoofedWeakChannelSenderClamps is the §9 PS drill for the
+// §6 channel-auth clamp. The threat: sms From is spoofable, so an
+// attacker who spells an enrolled weak-channel sender's id inherits
+// that row's trust — accepted, and exactly why weak channels are a
+// grade. What the drill pins is the CEILING that inheritance hits, in
+// three layers: enrollment can't even express owner-on-weak, the
+// stamping path clamps what the registry legitimately holds, and a
+// table row drifted past both still can't stamp above known.
+func TestDrillSpoofedWeakChannelSenderClamps(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	cfg := seedFromTOML(t, db, drillConfig)
+
+	// Layer 1 — config validation, the first line of defense: the
+	// dangerous row is unrepresentable in approach.toml, so no boot can
+	// seed an owner onto a spoofable channel.
+	ownerOnWeak := drillConfig + `
+[[identity]]
+channel = "sms"
+native_id = "+15550199"
+trust = "owner"
+owner_id = "brian"
+label = "Brian (spoofable!)"
+`
+	if _, err := config.Parse(strings.NewReader(ownerOnWeak)); err == nil {
+		t.Error("config accepted owner trust on a weak channel, want load-time rejection (§6)")
+	}
+
+	// Layer 2 — the stamping ceiling over the legitimately seeded
+	// registry: a spoof of Dana's enrolled sms id gains her known
+	// trust, but read-only and never able to satisfy an approval —
+	// MayApprove=false is what forecloses the spoofed-SMS approval
+	// (§4.4 composes it with the owner_id match).
+	stamped, err := store.ResolveStamped(ctx, db, "sms", "+15550100", cfg.Channels["sms"].Auth)
+	if err != nil {
+		t.Fatalf("ResolveStamped spoofed known sender: %v", err)
+	}
+	want := trust.Stamped{Trust: trust.Known, ReadOnly: true, MayApprove: false}
+	if stamped != want {
+		t.Errorf("spoofed enrolled sms sender stamped %+v, want %+v", stamped, want)
+	}
+
+	// Spelling the owner's discord id over sms reaches nothing at all:
+	// (channel, native_id) is the key, so the spoof isn't even known.
+	stamped, err = store.ResolveStamped(ctx, db, "sms", "42", cfg.Channels["sms"].Auth)
+	if err != nil {
+		t.Fatalf("ResolveStamped cross-channel owner spoof: %v", err)
+	}
+	if stamped.Trust != trust.Untrusted || !stamped.ReadOnly || stamped.MayApprove {
+		t.Errorf("owner id spoofed over sms stamped %+v, want the untrusted read-only bottom", stamped)
+	}
+
+	// Layer 3 — table drift, the clamp the bead is named for: the
+	// schema is channel-auth-agnostic, so an owner row CAN land on sms
+	// behind config validation's back (manual DB surgery, a stale
+	// seed). The stamping path is where the §6 invariant must hold:
+	// a weak channel never stamps owner, no matter what the row says.
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('sms', '+15550142', 'owner', 'brian')`,
+	); err != nil {
+		t.Fatalf("drift owner row onto sms: %v", err)
+	}
+	stamped, err = store.ResolveStamped(ctx, db, "sms", "+15550142", cfg.Channels["sms"].Auth)
+	if err != nil {
+		t.Fatalf("ResolveStamped drifted owner row: %v", err)
+	}
+	if stamped != want {
+		t.Errorf("drifted owner row on sms stamped %+v, want the clamp to %+v", stamped, want)
+	}
+}
+
 // TestDrillZeroConfigTrustsNobody: the daemon's no-approach.toml boot
 // syncs the table to empty (internal/cli seedIdentities with a nil
 // config) — and an unconfigured daemon must trust nobody, even a
