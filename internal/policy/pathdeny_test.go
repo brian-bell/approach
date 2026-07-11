@@ -310,6 +310,43 @@ func TestDeniedDescendantSymlinkAliasContext(t *testing.T) {
 	}
 }
 
+// TestDeniedDirRelativeCwd: DeniedDir accepts a relative session cwd
+// (resolved against the process directory), so the component-by-component
+// root resolver must anchor it to an absolute path first — a regression
+// guard for the symlink-spelling walk.
+func TestDeniedDirRelativeCwd(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "repo", "src"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(base, "repo", "src", ".env"), []byte("SECRET=1"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	prev, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(base); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(prev); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+
+	// Relative cwd "repo", relative root "src" (joined to repo/src): the
+	// denied descendant .env still surfaces, proving resolution anchored
+	// correctly instead of erroring against the filesystem root.
+	path, _, err := policy.DeniedDir("repo", "src")
+	if err != nil {
+		t.Fatalf("DeniedDir with relative cwd: %v", err)
+	}
+	if path == "" {
+		t.Error("relative-cwd read of repo/src containing .env read as clean, want denied")
+	}
+}
+
 func TestDeniedDir(t *testing.T) {
 	base := t.TempDir()
 	cwd := filepath.Join(base, "cwd")
@@ -460,6 +497,68 @@ func TestDeniedDir(t *testing.T) {
 	}
 	if _, _, err := policy.DeniedDir(cycle, cycle); err != nil {
 		t.Fatalf("DeniedDir on a symlink cycle: %v", err)
+	}
+
+	// The read ROOT itself can be a denylist-aliasing symlink: the
+	// cwd/.config -> cwd/config-target link above makes
+	// config-target/gh/hosts.yml reachable as .config/gh/hosts.yml. Read
+	// with that symlink AS the root — the walk must judge descendants
+	// under the requested spelling (.config), not the resolved target
+	// name (config-target).
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, ".config"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a symlinked .config root: %v", err)
+	}
+	if path == "" {
+		t.Error("read root .config -> config-target exposed gh/hosts.yml as clean, want .config/gh denied")
+	}
+
+	// The inverse: a BENIGN-named root symlink pointing at a real
+	// denylisted directory. cwd/safe -> cwd/real/.config must not launder
+	// the real .config/gh path — the resolved spelling has to be judged
+	// too, not only the requested one.
+	if err := os.MkdirAll(filepath.Join(cwd, "real", ".config", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir real/.config/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "real", ".config", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write real hosts.yml: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(cwd, "real", ".config"), filepath.Join(cwd, "safe")); err != nil {
+		t.Fatalf("symlink safe -> real/.config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "safe"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a benign root symlink to a denied dir: %v", err)
+	}
+	if path == "" {
+		t.Error("root safe -> real/.config exposed the real gh token file as clean, want .config/gh denied")
+	}
+
+	// A denylisted segment can hide at an INTERMEDIATE hop of the root's
+	// own symlink chain: chain -> .config -> config-target collapses to
+	// config-target under EvalSymlinks, losing the .config spelling, but
+	// config-target/gh/hosts.yml is still reachable as
+	// chain/gh -> .config/gh. Each hop must be judged.
+	if err := os.Symlink(filepath.Join(cwd, ".config"), filepath.Join(cwd, "chain")); err != nil {
+		t.Fatalf("symlink chain -> .config: %v", err)
+	}
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "chain"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a chained root symlink: %v", err)
+	}
+	if path == "" {
+		t.Error("root chain -> .config -> config-target exposed gh/hosts.yml as clean, want .config/gh denied")
+	}
+
+	// A symlink in a PARENT component of the root, not just the final
+	// component: root safe/gh where safe -> real/.config resolves to
+	// real/.config/gh, reachable as .config/gh, and must be denied.
+	path, _, err = policy.DeniedDir(cwd, filepath.Join(cwd, "safe", "gh"))
+	if err != nil {
+		t.Fatalf("DeniedDir on a root beneath a symlinked ancestor: %v", err)
+	}
+	if path == "" {
+		t.Error("root safe/gh (safe -> real/.config) exposed hosts.yml as clean, want .config/gh denied")
 	}
 
 	// A multi-alias graph must not lose context on a revisit: read root

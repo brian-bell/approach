@@ -92,7 +92,16 @@ func DeniedPath(path string) (denied bool, reason string) {
 // denylisted name must not be laundered by a benign target — and every
 // resolution failure is an error, never a silent allow.
 func DeniedDir(cwd, root string) (path, reason string, err error) {
-	if !filepath.IsAbs(root) {
+	// Anchor everything to an absolute cwd — component-by-component root
+	// resolution (rootSpellings) needs an absolute path, and this matches
+	// the base EvalSymlinks uses for a relative cwd (the process dir).
+	cwd, err = filepath.Abs(cwd)
+	if err != nil {
+		return "", "", fmt.Errorf("policy: resolve session cwd: %w", err)
+	}
+	if filepath.IsAbs(root) {
+		root = filepath.Clean(root)
+	} else {
 		root = filepath.Join(cwd, root)
 	}
 	if denied, why := DeniedPath(root); denied {
@@ -108,6 +117,36 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 	}
 	if !within(resolvedCwd, resolvedRoot) {
 		return root, "read root resolves outside the session cwd subtree (§7 cwd confinement)", nil
+	}
+
+	// The read root reaches the physical tree under several spellings,
+	// and a denied path under ANY of them must fire. The resolved real
+	// path (resolvedRoot) catches a denied segment at any depth in the
+	// real tree — the full walk below. But every hop in the root's own
+	// symlink chain (safe -> .config -> config-target) is another
+	// spelling of the same final directory, and a denylisted segment
+	// (.config) can appear at an intermediate hop that resolution
+	// collapses away. Judge the final directory's direct children under
+	// each hop's spelling — depth-1 is all the context rules need — so
+	// neither a benign link to a denied dir nor a denied-named link
+	// (direct or intermediate) to a benign dir can launder the path.
+	spellings, err := rootSpellings(root)
+	if err != nil {
+		return "", "", err
+	}
+	for _, spelling := range spellings {
+		if spelling == resolvedRoot {
+			continue
+		}
+		// The root itself denied under this spelling (reading .config/gh
+		// directly), or a direct child that a context rule needs
+		// (reading .config, whose gh child is denied).
+		if denied, why := DeniedPath(spelling); denied {
+			return spelling, why, nil
+		}
+		if p, r, aerr := aliasDenies(os.DirFS(resolvedRoot), ".", resolvedRoot, spelling); aerr != nil || p != "" {
+			return p, r, aerr
+		}
 	}
 
 	// Link targets inside the cwd but outside the walked tree become
@@ -334,6 +373,63 @@ func walkTreeLogical(fsys fs.FS, physicalRoot, logicalRoot string) (path, reason
 		}
 	}
 	return path, reason, externals, nil
+}
+
+// rootSpellings resolves the absolute read root component by component,
+// following symlinks anywhere in the path — not just the final
+// component — and returns every lexical spelling of the final target
+// seen along the way. A denylisted segment introduced by a symlink at
+// ANY position (safe/gh where safe -> .config; or safe -> .config ->
+// config-target) appears in one of these spellings even though
+// EvalSymlinks collapses it away. Resolution is bounded by a hop cap;
+// EvalSymlinks has already rejected a cyclic root before this runs.
+func rootSpellings(root string) ([]string, error) {
+	vol := filepath.VolumeName(root)
+	rest := strings.Split(root[len(vol):], string(filepath.Separator))
+	resolved := vol + string(filepath.Separator)
+	spellings := []string{filepath.Clean(root)}
+	hops := 0
+	for len(rest) > 0 {
+		comp := rest[0]
+		rest = rest[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+		next := filepath.Join(resolved, comp)
+		info, err := os.Lstat(next)
+		if err != nil {
+			return nil, fmt.Errorf("policy: inspect read root component %s: %w", next, err)
+		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+		hops++
+		if hops > 255 {
+			return nil, fmt.Errorf("policy: read root %s exceeds the symlink-resolution limit", root)
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return nil, fmt.Errorf("policy: read root symlink %s: %w", next, err)
+		}
+		if filepath.IsAbs(target) {
+			tvol := filepath.VolumeName(target)
+			resolved = tvol + string(filepath.Separator)
+			rest = append(strings.Split(target[len(tvol):], string(filepath.Separator)), rest...)
+		} else {
+			rest = append(strings.Split(target, string(filepath.Separator)), rest...)
+		}
+		// The still-unresolved remainder, joined onto the prefix, is
+		// another spelling of the final path (…/.config/gh before .config
+		// is expanded away).
+		spellings = append(spellings, filepath.Join(append([]string{resolved}, rest...)...))
+	}
+	spellings = append(spellings, resolved)
+	return spellings, nil
 }
 
 // aliasDenies judges the direct children of an aliased directory (at
