@@ -342,6 +342,17 @@ func walkTreeLogical(fsys fs.FS, physicalRoot, logicalRoot string) (path, reason
 // through the link even though the target's real path is benign. A
 // target that is not a directory re-spells only its own path, already
 // judged at the symlink entry, so it contributes nothing here.
+//
+// INVARIANT: this checks children ONE level deep, which is correct only
+// because every context-spanning rule in DeniedPath fires on a parent
+// segment plus exactly ONE child (.config/{gh,gcloud},
+// .claude/{hooks,skills,settings}). A deeper child alone is never denied
+// (.config/x/gh is not a gh-config path), and any real denied segment
+// deeper in the target is already caught by the ordinary walk under the
+// target's real name — the alias only adds the parent segment its real
+// path lacks. If a future rule ever needs parent-plus-two-or-more
+// context, this one-level check silently under-blocks: extend the depth
+// here (a bounded descent, still cycle-free) to match the deepest rule.
 func aliasDenies(fsys fs.FS, targetRel, targetAbs, aliasLogical string) (path, reason string, err error) {
 	info, err := fs.Stat(fsys, targetRel)
 	if err != nil {
