@@ -12,8 +12,12 @@ import (
 const usage = `usage: approach <command>
 
 commands:
-  config check <path>    validate an approach.toml file
-  version                print the approach version
+  daemon [--state <dir>]     run the daemon (admin socket + state store)
+  poke [--socket <path>]     wake a running daemon
+  status [--socket <path>]   report a running daemon's status
+  drain [--socket <path>]    gracefully stop a running daemon
+  config check <path>        validate an approach.toml file
+  version                    print the approach version
 `
 
 // Run executes the subcommand named in args and returns the process exit code.
@@ -29,6 +33,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	case "config":
 		return runConfig(args[1:], stdout, stderr)
+	case "daemon":
+		return runDaemon(args[1:], stdout, stderr)
+	case "poke", "status", "drain":
+		return runAdminVerb(args[0], args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "approach: unknown command %q\n%s", args[0], usage)
 		return 2
