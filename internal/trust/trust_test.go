@@ -73,3 +73,33 @@ func TestMin(t *testing.T) {
 		t.Errorf("Min(junk, owner) = %q, want untrusted — unknown levels read as the bottom", got)
 	}
 }
+
+// TestTaints: taint follows content, not the tool (§7 rule 3). A
+// session gains the sticky flag the moment it ingests externally-
+// authored content; the read-only Codex critic must not taint, or
+// draft→critique→approve→act dies.
+func TestTaints(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   trust.IngestKind
+		author trust.Level
+		want   bool
+	}{
+		{"owner prompt is the owner's own words", trust.IngestInboundMessage, trust.Owner, false},
+		{"known person's prompt", trust.IngestInboundMessage, trust.Known, true},
+		{"stranger's prompt", trust.IngestInboundMessage, trust.Untrusted, true},
+		{"junk author fails safe", trust.IngestInboundMessage, trust.Level("admin"), true},
+		{"untrusted MCP result (the poisoned email)", trust.IngestMCPResult, trust.Untrusted, true},
+		{"owner-graded MCP result", trust.IngestMCPResult, trust.Owner, false},
+		{"web fetch always", trust.IngestWebFetch, trust.Owner, true},
+		{"codex web read always", trust.IngestCodexWebRead, trust.Owner, true},
+		{"read-only codex critique never", trust.IngestCodexCritique, trust.Untrusted, false},
+		// The zero value is not a kind: a path that forgot to classify
+		// itself must taint, even claiming owner authorship.
+		{"uninitialized kind fails safe", trust.IngestKind(0), trust.Owner, true},
+	} {
+		if got := trust.Taints(tc.kind, tc.author); got != tc.want {
+			t.Errorf("%s: Taints(%v, %q) = %v, want %v", tc.name, tc.kind, tc.author, got, tc.want)
+		}
+	}
+}

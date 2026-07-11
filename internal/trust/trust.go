@@ -57,6 +57,49 @@ func Min(a, b Level) Level {
 	return b
 }
 
+// IngestKind classifies content arriving in a session for the taint
+// rule (§7 rule 3). The set is closed: new ingestion paths must decide
+// their taint behavior here, explicitly.
+type IngestKind int
+
+const (
+	// The zero value is deliberately NOT a valid kind: an ingestion
+	// path that forgets to set its kind must fall into Taints' tainting
+	// default, never masquerade as an inbound message from the owner.
+	// IngestInboundMessage is an inbound prompt or attachment, stamped
+	// at receipt, pre-execution.
+	IngestInboundMessage IngestKind = iota + 1
+	// IngestMCPResult is a tool result from an MCP server; the author
+	// level is the server's configured grade (default untrusted — the
+	// poisoned-email vector arrives here).
+	IngestMCPResult
+	// IngestWebFetch is fetched web content.
+	IngestWebFetch
+	// IngestCodexWebRead is web content read by the Codex critic.
+	IngestCodexWebRead
+	// IngestCodexCritique is the read-only critic's own analysis of
+	// local content — it must not taint, or draft→critique→approve→act
+	// dies (§7).
+	IngestCodexCritique
+)
+
+// Taints reports whether ingesting this content gains the session the
+// sticky tainted flag (§6, §7): taint follows CONTENT, not the tool —
+// keying on the tool alone would miss the email vector the threat model
+// names. author is who authored the content (for MCP results, the
+// server's configured grade); anything but Owner is externally authored.
+// Unknown kinds taint — fail safe, mirroring normalize.
+func Taints(kind IngestKind, author Level) bool {
+	switch kind {
+	case IngestInboundMessage, IngestMCPResult:
+		return normalize(author) != Owner
+	case IngestCodexCritique:
+		return false
+	default: // IngestWebFetch, IngestCodexWebRead, anything unknown
+		return true
+	}
+}
+
 // Floor computes a session's trust_floor (§6): the least-trusted
 // participant the thread can admit. A DM's floor is that identity's
 // trust — the single-participant case; a group's floor is the minimum
