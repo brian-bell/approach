@@ -155,3 +155,55 @@ func TestSeedIdentitiesSyncsToConfig(t *testing.T) {
 		t.Errorf("after empty re-seed identities = %v, want no rows", got)
 	}
 }
+
+// TestResolveOwnerID: the canonical principal behind a sender (§6).
+// Cross-surface approval (§4.4) matches on the resolved owner_id, so all
+// of the owner's surfaces resolve to the SAME principal, and neither an
+// unmapped sender nor an enrolled known person resolves to any — only
+// owner rows carry a principal, and a miss must read as "no principal",
+// never as an error.
+func TestResolveOwnerID(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	if err := store.SeedIdentities(ctx, db, []store.Identity{
+		{Channel: "discord", NativeID: "42", Trust: "owner", OwnerID: "brian"},
+		{Channel: "slack", NativeID: "U9", Trust: "owner", OwnerID: "brian"},
+		{Channel: "discord", NativeID: "77", Trust: "owner", OwnerID: "alice"},
+		{Channel: "discord", NativeID: "99", Trust: "known", Label: "Guest"},
+	}); err != nil {
+		t.Fatalf("SeedIdentities: %v", err)
+	}
+
+	resolve := func(channel, nativeID string) (string, bool) {
+		t.Helper()
+		ownerID, ok, err := store.ResolveOwnerID(ctx, db, channel, nativeID)
+		if err != nil {
+			t.Fatalf("ResolveOwnerID(%s, %s): %v", channel, nativeID, err)
+		}
+		return ownerID, ok
+	}
+
+	// The owner's surfaces unify on one principal.
+	discordOwner, ok := resolve("discord", "42")
+	if !ok || discordOwner != "brian" {
+		t.Errorf("discord/42 = (%q, %v), want (brian, true)", discordOwner, ok)
+	}
+	slackOwner, ok := resolve("slack", "U9")
+	if !ok || slackOwner != discordOwner {
+		t.Errorf("slack/U9 = (%q, %v), want the same principal as discord/42 (%q)", slackOwner, ok, discordOwner)
+	}
+
+	// A different owner row is a different principal.
+	if ownerID, ok := resolve("discord", "77"); !ok || ownerID == discordOwner {
+		t.Errorf("discord/77 = (%q, %v), want a distinct principal", ownerID, ok)
+	}
+
+	// Known people and unmapped senders have no principal — and neither
+	// is an error: a miss reads as "cannot approve", not a failure.
+	if ownerID, ok := resolve("discord", "99"); ok {
+		t.Errorf("known row resolved principal %q, want none", ownerID)
+	}
+	if ownerID, ok := resolve("discord", "unmapped"); ok {
+		t.Errorf("unmapped sender resolved principal %q, want none", ownerID)
+	}
+}

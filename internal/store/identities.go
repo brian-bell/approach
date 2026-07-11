@@ -18,6 +18,30 @@ type Identity struct {
 	Label    string
 }
 
+// ResolveOwnerID resolves a sender to the canonical principal behind it
+// (§6): the owner_id shared by ALL of the owner's surfaces, which
+// cross-surface approval matches on — an owner_id match, never a channel
+// match (§4.4). ok is false when the sender has no principal: unmapped
+// (untrusted, deny-by-default) or enrolled below owner — known people
+// cannot satisfy an approval. A query failure returns err with ok false,
+// so a broken store fails closed instead of reading as "not the owner".
+func ResolveOwnerID(ctx context.Context, db *sql.DB, channel, nativeID string) (ownerID string, ok bool, err error) {
+	// The 0002 CHECK makes owner rows with a NULL owner_id (and non-owner
+	// rows with one) unrepresentable, so scanning owner_id alone decides.
+	err = db.QueryRowContext(ctx,
+		`SELECT owner_id FROM identities
+		 WHERE channel = ? AND native_id = ? AND trust = 'owner'`,
+		channel, nativeID,
+	).Scan(&ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: resolve owner_id for %s/%s: %w", channel, nativeID, err)
+	}
+	return ownerID, true, nil
+}
+
 // SeedIdentities syncs the identities table to ids, in one transaction.
 // A full sync, not an upsert: approach.toml is the source of truth, so a
 // row dropped from the config is revoked here at the next startup —
