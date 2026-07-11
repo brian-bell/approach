@@ -12,7 +12,8 @@ import (
 const usage = `usage: approach <command>
 
 commands:
-  daemon [--state <dir>]     run the daemon (admin socket + state store)
+  daemon [--state <dir>] [--config <path>]
+                             run the daemon (admin socket + state store)
   poke [--socket <path>]     wake a running daemon
   status [--socket <path>]   report a running daemon's status
   drain [--socket <path>]    gracefully stop a running daemon

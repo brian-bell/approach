@@ -1,0 +1,157 @@
+package store_test
+
+import (
+	"context"
+	"database/sql"
+	"path/filepath"
+	"testing"
+
+	"github.com/brian-bell/approach/internal/store"
+)
+
+// TestOpenCreatesIdentitiesTable: the §6 identities table — the root of
+// every §7 trust decision — arrives with the embedded migrations, keyed
+// by (channel, native_id).
+func TestOpenCreatesIdentitiesTable(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id, label)
+		 VALUES ('discord', '42', 'owner', 'brian', 'Brian')`,
+	); err != nil {
+		t.Fatalf("insert into identities: %v", err)
+	}
+
+	// The primary key is (channel, native_id): the same native id on
+	// another channel is a different identity, but re-enrolling the same
+	// pair must conflict.
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust) VALUES ('slack', '42', 'known')`,
+	); err != nil {
+		t.Errorf("same native_id on another channel should be a distinct row: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '42', 'owner', 'brian')`,
+	); err == nil {
+		t.Error("duplicate (channel, native_id) insert succeeded, want primary-key conflict")
+	}
+}
+
+// TestIdentitiesSchemaConstraints: config validation (§6) is mirrored in
+// the schema — the table is the root of §7, so its invariants are CHECK
+// constraints, not conventions. Untrusted is the absence of a row and
+// exactly owner rows carry the canonical owner_id (§4.4).
+func TestIdentitiesSchemaConstraints(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{
+			"untrusted is never enrolled",
+			`INSERT INTO identities (channel, native_id, trust) VALUES ('discord', '1', 'untrusted')`,
+		},
+		{
+			"owner row without owner_id",
+			`INSERT INTO identities (channel, native_id, trust) VALUES ('discord', '2', 'owner')`,
+		},
+		{
+			"known row with owner_id",
+			`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '3', 'known', 'brian')`,
+		},
+	} {
+		if _, err := db.Exec(tc.sql); err == nil {
+			t.Errorf("%s: insert succeeded, want CHECK violation", tc.name)
+		}
+	}
+}
+
+// readIdentities returns every row keyed "channel/native_id" →
+// "trust/owner_id/label" (NULLs rendered empty) for seed assertions.
+func readIdentities(t *testing.T, db *sql.DB) map[string]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT channel, native_id, trust, COALESCE(owner_id, ''), COALESCE(label, '') FROM identities`)
+	if err != nil {
+		t.Fatalf("query identities: %v", err)
+	}
+	defer rows.Close()
+	got := make(map[string]string)
+	for rows.Next() {
+		var channel, nativeID, trust, ownerID, label string
+		if err := rows.Scan(&channel, &nativeID, &trust, &ownerID, &label); err != nil {
+			t.Fatalf("scan identities: %v", err)
+		}
+		got[channel+"/"+nativeID] = trust + "/" + ownerID + "/" + label
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate identities: %v", err)
+	}
+	return got
+}
+
+// TestSeedIdentitiesInsertsConfiguredRows: seeding writes each enrolled
+// (channel, native_id) with its trust, owner_id, and label (§6).
+func TestSeedIdentitiesInsertsConfiguredRows(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	err := store.SeedIdentities(context.Background(), db, []store.Identity{
+		{Channel: "discord", NativeID: "42", Trust: "owner", OwnerID: "brian", Label: "Brian"},
+		{Channel: "sms", NativeID: "+15555550100", Trust: "known", Label: "Brian (SMS)"},
+	})
+	if err != nil {
+		t.Fatalf("SeedIdentities: %v", err)
+	}
+
+	want := map[string]string{
+		"discord/42":       "owner/brian/Brian",
+		"sms/+15555550100": "known//Brian (SMS)",
+	}
+	got := readIdentities(t, db)
+	if len(got) != len(want) {
+		t.Errorf("identities rows = %v, want %v", got, want)
+	}
+	for key, row := range want {
+		if got[key] != row {
+			t.Errorf("identities[%s] = %q, want %q", key, got[key], row)
+		}
+	}
+}
+
+// TestSeedIdentitiesSyncsToConfig: approach.toml is the source of truth,
+// so a re-seed is a full sync — rows dropped from the config are REVOKED,
+// changed rows are updated, and an empty set empties the table. Upsert-only
+// seeding would leave a removed person enrolled forever (§6).
+func TestSeedIdentitiesSyncsToConfig(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	first := []store.Identity{
+		{Channel: "discord", NativeID: "42", Trust: "owner", OwnerID: "brian", Label: "Brian"},
+		{Channel: "discord", NativeID: "77", Trust: "known", Label: "Guest"},
+	}
+	if err := store.SeedIdentities(ctx, db, first); err != nil {
+		t.Fatalf("first SeedIdentities: %v", err)
+	}
+
+	// Guest removed (revoked), Brian's label changed.
+	second := []store.Identity{
+		{Channel: "discord", NativeID: "42", Trust: "owner", OwnerID: "brian", Label: "Brian B."},
+	}
+	if err := store.SeedIdentities(ctx, db, second); err != nil {
+		t.Fatalf("second SeedIdentities: %v", err)
+	}
+
+	got := readIdentities(t, db)
+	want := map[string]string{"discord/42": "owner/brian/Brian B."}
+	if len(got) != 1 || got["discord/42"] != want["discord/42"] {
+		t.Errorf("after re-seed identities = %v, want %v", got, want)
+	}
+
+	if err := store.SeedIdentities(ctx, db, nil); err != nil {
+		t.Fatalf("empty SeedIdentities: %v", err)
+	}
+	if got := readIdentities(t, db); len(got) != 0 {
+		t.Errorf("after empty re-seed identities = %v, want no rows", got)
+	}
+}
