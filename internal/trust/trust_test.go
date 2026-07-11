@@ -103,3 +103,49 @@ func TestTaints(t *testing.T) {
 		}
 	}
 }
+
+// TestStamp: the §6 channel-auth clamp at the identity-stamping path.
+// Config validation rejects owner-on-weak at load, but the identities
+// table is the runtime source of truth and can drift (manual DB edits,
+// stale seed) — so the invariant "a weak channel can NEVER stamp owner
+// trust" must hold again here, at the point of stamping. The auth set
+// is closed and case-sensitive; anything else — including "" from a
+// channel absent from [channels] — fails closed to the bottom.
+func TestStamp(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		auth   string
+		lookup trust.Level
+		want   trust.Stamped
+	}{
+		{"strong channel, owner", "strong", trust.Owner,
+			trust.Stamped{Trust: trust.Owner, ReadOnly: false, MayApprove: true}},
+		{"strong channel, known", "strong", trust.Known,
+			trust.Stamped{Trust: trust.Known, ReadOnly: false, MayApprove: true}},
+		// MayApprove is the CHANNEL capability, not a verdict: §4.4
+		// approval matching separately requires the owner_id match, so an
+		// untrusted sender on a strong channel still cannot approve.
+		{"strong channel, unmapped sender", "strong", trust.Untrusted,
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: false, MayApprove: true}},
+		// THE clamp: an owner row that drifted onto a weak channel past
+		// config validation stamps at most known, read-only, no approval.
+		{"weak channel, drifted owner row", "weak", trust.Owner,
+			trust.Stamped{Trust: trust.Known, ReadOnly: true, MayApprove: false}},
+		{"weak channel, known", "weak", trust.Known,
+			trust.Stamped{Trust: trust.Known, ReadOnly: true, MayApprove: false}},
+		{"weak channel, unmapped sender", "weak", trust.Untrusted,
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}},
+		{"unconfigured channel fails closed", "", trust.Owner,
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}},
+		{"junk auth fails closed", "Strong", trust.Owner,
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}},
+		// A junk lookup level (Level is a string type) reads as the
+		// bottom even on a strong channel, mirroring Min.
+		{"junk lookup level fails closed", "strong", trust.Level("admin"),
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: false, MayApprove: true}},
+	} {
+		if got := trust.Stamp(tc.auth, tc.lookup); got != tc.want {
+			t.Errorf("%s: Stamp(%q, %q) = %+v, want %+v", tc.name, tc.auth, tc.lookup, got, tc.want)
+		}
+	}
+}

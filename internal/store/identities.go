@@ -86,6 +86,24 @@ func ResolveTrust(ctx context.Context, db *sql.DB, channel, nativeID string) (tr
 	return level, nil
 }
 
+// ResolveStamped is the full §6 stamping decision for one inbound
+// event: ResolveTrust's lookup clamped by the channel's auth grade
+// (trust.Stamp), so a weak channel can never stamp owner trust even
+// from a drifted identities row. auth is the channel's configured auth
+// string, read off config.Channel by the caller — the store deliberately
+// does not import config (see Identity) — and "" for a channel absent
+// from [channels] fails closed inside Stamp. A lookup failure returns
+// the bottom stamp (untrusted, read-only, no approval) alongside the
+// error: forcing read-only on error even for a strong channel is
+// deliberate, so a caller that drops the error holds nothing at all.
+func ResolveStamped(ctx context.Context, db *sql.DB, channel, nativeID, auth string) (trust.Stamped, error) {
+	level, err := ResolveTrust(ctx, db, channel, nativeID)
+	if err != nil {
+		return trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}, err
+	}
+	return trust.Stamp(auth, level), nil
+}
+
 // SeedIdentities syncs the identities table to ids, in one transaction.
 // A full sync, not an upsert: approach.toml is the source of truth, so a
 // row dropped from the config is revoked here at the next startup —
