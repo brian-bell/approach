@@ -131,6 +131,12 @@ type Identity struct {
 // for the runtime stamping path — keep the two in sync.
 type Channel struct {
 	Auth string `toml:"auth"`
+	// TokenFile is the path to the platform credential for gateway
+	// channels (discord, slack), readable at daemon startup — a plain
+	// file so systemd LoadCredential can supply it. The secret itself
+	// never lives in approach.toml: the config is checked into dotfiles
+	// and read more widely than a credential should travel (§7).
+	TokenFile string `toml:"token_file"`
 }
 
 // MaxTrust is the highest trust an identity on this channel can be
@@ -245,10 +251,28 @@ func (c *Config) validateModels(fail failFunc) {
 	}
 }
 
+// gatewayChannels is the closed set of channels the daemon implements
+// a gateway adapter for — the only places a token_file means anything.
+// Grows with each adapter (slack arrives with the C1 contract's second
+// implementation, approach-cb5.3.1).
+var gatewayChannels = map[string]bool{"discord": true}
+
 func (c *Config) validateChannels(fail failFunc) {
 	for name, ch := range c.Channels {
 		if ch.Auth != "strong" && ch.Auth != "weak" {
 			fail("channels.%s.auth must be %q or %q, got %q", name, "strong", "weak", ch.Auth)
+		}
+		// token_file is only honored on channels the daemon has a
+		// gateway adapter for — a closed set, so a typo'd channel name
+		// or a not-yet-supported platform fails HERE instead of
+		// silently ignoring the credential and leaving the operator
+		// believing a gateway is live (closed config, §6). Weak
+		// channels (sms, email) never qualify: no gateway, no token.
+		if ch.TokenFile != "" && !gatewayChannels[name] {
+			fail("channels.%s.token_file: no gateway adapter exists for channel %q — supported: discord", name, name)
+		}
+		if ch.Auth == "weak" && ch.TokenFile != "" {
+			fail("channels.%s.token_file: weak-auth channels have no gateway credential — remove the key", name)
 		}
 	}
 }

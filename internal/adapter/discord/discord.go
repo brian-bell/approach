@@ -1,0 +1,343 @@
+// Package discord is the C1 Discord adapter's gateway connection layer
+// (§3, §8): a thin, owned connector living inside the daemon — never a
+// separate bridge process (§10). This layer owns connect, reconnect
+// backoff, and the DM + thread subscription; every inbound message is
+// handed raw to an injected handler. Normalization into the §6 event
+// contract and trust stamping are the next slices (x6n.1.2, x6n.1.3) —
+// this package deliberately imports nothing from store or trust.
+package discord
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math/rand/v2"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/bwmarrin/discordgo"
+	"github.com/gorilla/websocket"
+)
+
+// MessageHandler receives every inbound message the subscription
+// delivers, raw. The connection layer filters only the bot's own
+// messages (echo-loop foreclosure); sender policy belongs downstream.
+type MessageHandler func(*discordgo.MessageCreate)
+
+// intents is the pinned, minimal gateway subscription (§7 posture):
+// DMs, guild messages (thread messages arrive as ordinary MessageCreate
+// events on the thread's channel id under this intent), message content
+// (privileged — must be enabled on the bot in the dev portal, or the
+// gateway closes 4014, which Run treats as terminal), and guild
+// metadata (Guilds carries the channel/thread objects the state cache
+// needs to CLASSIFY a channel — without it every guild message is
+// unclassifiable and the thread boundary below fails closed into
+// dropping all of them). Widening this set is surface creep and must
+// fail the pin test deliberately.
+const intents = discordgo.IntentsDirectMessages |
+	discordgo.IntentsGuildMessages |
+	discordgo.IntentsMessageContent |
+	discordgo.IntentsGuilds
+
+// The adapter owns the WHOLE reconnect story: discordgo's session-level
+// auto-reconnect is disabled (ShouldReconnectOnError=false, pinned by a
+// test) because its internal loop retries every failure forever without
+// classification — a token revoked mid-stream would be hammered against
+// the gateway indefinitely behind a daemon that still looks healthy.
+// Instead, a Disconnect event re-enters Run's loop: close the dead
+// session, reopen through the same classified backoff below, so
+// terminal refusals (4004/4013/4014) surface on REconnect exactly as
+// they do on first connect.
+const (
+	backoffBase = time.Second
+	backoffCap  = time.Minute
+
+	// healthyReset is how long a connection must survive before the
+	// backoff counter resets. Success alone is not health: a link that
+	// completes the handshake and drops instantly would otherwise
+	// reconnect at full speed forever — and Discord rate-limits
+	// IDENTIFY, so a zero-delay connect/drop cycle is a ban risk, not
+	// just noise.
+	healthyReset = time.Minute
+)
+
+// Adapter is one Discord gateway connection. Construct with New; drive
+// with Run.
+type Adapter struct {
+	session *discordgo.Session
+	handle  MessageHandler
+	log     *slog.Logger
+
+	// disconnected carries the gateway-drop signal from the Disconnect
+	// handler into Run's loop. Buffered so a drop that fires before Run
+	// reaches its select is held, not lost; coalescing repeats is fine —
+	// one reconnect cycle covers them.
+	disconnected chan struct{}
+
+	// Seams for the lifecycle tests: production values are the
+	// discordgo session's own methods, a context-aware sleep, and the
+	// wall clock.
+	open    func() error
+	closeFn func() error
+	sleep   func(context.Context, time.Duration) error
+	now     func() time.Time
+}
+
+// New builds the adapter around a discordgo session. The token is used
+// once to construct the session and never stored, logged, or echoed
+// into an error (§7). A blank token or nil handler is refused loudly:
+// both are misconfigurations a retry cannot fix.
+func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, errors.New("discord: empty bot token")
+	}
+	if handle == nil {
+		return nil, errors.New("discord: nil message handler")
+	}
+	if logger == nil {
+		return nil, errors.New("discord: nil logger — the adapter's connection state must be observable")
+	}
+	session, err := discordgo.New("Bot " + token)
+	if err != nil {
+		// discordgo.New never inspects the token today, but if that
+		// changes the error must not carry it out of this package.
+		return nil, errors.New("discord: session construction failed")
+	}
+	session.Identify.Intents = intents
+	// The adapter owns reconnect (see the constant block above); the
+	// library loop would bypass terminal classification.
+	session.ShouldReconnectOnError = false
+	// Synchronous dispatch: discordgo otherwise runs each handler in
+	// its own goroutine, and two messages received in order could
+	// persist out of order once the handler writes events — the §4.1
+	// receive-order FIFO must not depend on downstream re-serializing.
+	session.SyncEvents = true
+	a := &Adapter{
+		session:      session,
+		handle:       handle,
+		log:          logger,
+		disconnected: make(chan struct{}, 1),
+		open:         session.Open,
+		closeFn:      session.Close,
+		sleep:        sleepCtx,
+		now:          time.Now,
+	}
+	session.AddHandler(a.onMessageCreate)
+	session.AddHandler(func(*discordgo.Session, *discordgo.Connect) {
+		logger.Info("discord gateway connected")
+	})
+	session.AddHandler(func(*discordgo.Session, *discordgo.Disconnect) {
+		select {
+		case a.disconnected <- struct{}{}:
+		default: // a reconnect cycle is already pending
+		}
+	})
+	return a, nil
+}
+
+// Run opens the gateway and holds it until ctx is cancelled (drain or
+// the §3 kill switch), reconnecting through the same loop on mid-stream
+// drops. A retryable failure backs off exponentially (counter reset
+// once a connect succeeds — a link that flapped an hour ago must not
+// inherit a maxed-out delay); a terminal one (bad credential, refused
+// intents) returns immediately, on first connect and reconnect alike —
+// the daemon must surface it, not hammer the gateway with a token that
+// can never work.
+func (a *Adapter) Run(ctx context.Context) error {
+	attempt := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err, cancelled := a.openCancellable(ctx)
+		if cancelled {
+			return ctx.Err()
+		}
+		if err != nil {
+			if terminal(err) {
+				return fmt.Errorf("discord: gateway refused the connection — credential or intents problem, a restart cannot fix this: %w", err)
+			}
+			delay := backoffDelay(attempt)
+			attempt++
+			a.log.Warn("discord gateway open failed — retrying", "error", err.Error(), "delay", delay.String(), "attempt", attempt)
+			if err := a.sleep(ctx, delay); err != nil {
+				return err
+			}
+			continue
+		}
+		connectedAt := a.now()
+		a.log.Info("discord gateway open")
+		select {
+		case <-ctx.Done():
+			a.close()
+			return ctx.Err()
+		case <-a.disconnected:
+			// Deliberately NO close here: the only emitter of the
+			// Disconnect event is discordgo's CloseWithCode, so this
+			// signal MEANS the session is already fully torn down
+			// (listen() closes before reconnect-dispatch). Closing
+			// again would emit a fresh Disconnect, and that stale
+			// buffered signal would close the next healthy connection
+			// — an endless churn loop after the first real drop
+			// (pinned by TestRunDisconnectDoesNotChurn).
+			if a.now().Sub(connectedAt) >= healthyReset {
+				attempt = 0
+				a.log.Warn("discord gateway disconnected — reconnecting")
+				continue
+			}
+			// A connection that died this fast counts as a failure
+			// epoch, not a fresh start: back off before re-dialing.
+			delay := backoffDelay(attempt)
+			attempt++
+			a.log.Warn("discord gateway dropped shortly after connect — backing off before reconnecting",
+				"delay", delay.String(), "attempt", attempt)
+			if err := a.sleep(ctx, delay); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// openCancellable runs Open without letting it hold up a drain:
+// discordgo's Open blocks in the gateway handshake with no context
+// hook, so it runs in a goroutine selected against ctx. On cancel the
+// call is abandoned to a reaper that closes a late-succeeding handshake
+// — a connection nobody is supervising must not stay live consuming
+// messages.
+func (a *Adapter) openCancellable(ctx context.Context) (err error, cancelled bool) {
+	done := make(chan error, 1)
+	go func() { done <- a.open() }()
+	select {
+	case err := <-done:
+		return err, false
+	case <-ctx.Done():
+		go func() {
+			if err := <-done; err == nil {
+				a.close()
+			}
+		}()
+		return nil, true
+	}
+}
+
+// close logs rather than propagates: by the time it runs the adapter is
+// reconnecting or shutting down, and a close error must not mask why.
+func (a *Adapter) close() {
+	if err := a.closeFn(); err != nil {
+		a.log.Error("discord gateway close", "error", err.Error())
+	}
+}
+
+// onMessageCreate enforces the subscription boundary: DMs and threads
+// only (§3 C1). The guild-messages intent necessarily delivers every
+// visible guild channel, so plain guild channels are dropped here —
+// and a channel the state cache cannot classify reads as NOT a thread
+// (fail closed, §7: an unclassifiable channel must not widen the trust
+// surface). The bot's own messages are dropped too — relaying our
+// replies back in as inbound events is an echo loop. Everything else
+// passes through raw, other bots and authorless edge cases included:
+// whether they become events is the normalizer's policy call
+// (x6n.1.2), not the connection layer's.
+func (a *Adapter) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if m.Author != nil && s.State != nil && s.State.User != nil && m.Author.ID == s.State.User.ID {
+		return
+	}
+	if m.GuildID != "" && !a.isThread(s, m.ChannelID) {
+		return
+	}
+	a.handle(m)
+}
+
+// isThread classifies a guild channel via the state cache (populated
+// under the Guilds intent). Unknown is false: fail closed.
+func (a *Adapter) isThread(s *discordgo.Session, channelID string) bool {
+	if s.State == nil {
+		return false
+	}
+	ch, err := s.State.Channel(channelID)
+	if err != nil {
+		a.log.Debug("dropping guild message from unclassifiable channel", "channel_id", channelID)
+		return false
+	}
+	if !ch.IsThread() {
+		return false
+	}
+	return true
+}
+
+// terminal reports whether a gateway error can never be fixed by
+// retrying: an auth rejection (4004 / REST 401 — bad or revoked token)
+// or an intents refusal (4013 invalid, 4014 disallowed — the
+// privileged message-content intent not enabled for the bot), plus
+// 4012 (invalid API version — a discordgo/pin mismatch). Retrying any
+// of these hammers the gateway with a request it already refused and
+// invites a ban; everything else is presumed transient.
+func terminal(err error) bool {
+	if errors.Is(err, discordgo.ErrUnauthorized) {
+		return true
+	}
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case 4004, 4012, 4013, 4014:
+			return true
+		}
+	}
+	return false
+}
+
+// backoffDelay is the outer connect loop's curve: base·2^attempt,
+// capped, plus up to 25% jitter so a fleet of restarts (or one daemon
+// behind a flapping link) does not reconnect in lockstep.
+func backoffDelay(attempt int) time.Duration {
+	d := backoffCap
+	// Guard the shift: past 2^6 the uncapped value already exceeds the
+	// cap, and shifting by ~63+ would overflow into the negative.
+	if attempt < 6 {
+		d = min(backoffBase<<attempt, backoffCap)
+	}
+	return d + rand.N(d/4+1)
+}
+
+// sleepCtx sleeps for d unless ctx is cancelled first — drain must
+// never wait out a backoff (§3).
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// PlaceholderHandler records receipt at debug level and drops the
+// message — the M1 slice that normalizes inbound messages into §6
+// events (x6n.1.2) replaces it. Content is never logged: message text
+// is externally-authored data, and the journal is not the event store.
+func PlaceholderHandler(logger *slog.Logger) MessageHandler {
+	return func(m *discordgo.MessageCreate) {
+		logger.Debug("discord message received — dropped, normalizer lands in x6n.1.2",
+			"channel_id", m.ChannelID, "message_id", m.ID)
+	}
+}
+
+// ReadToken reads the bot credential from the file named by
+// channels.discord.token_file (a plain path so systemd LoadCredential
+// can supply it) and trims surrounding whitespace — a trailing newline
+// from echo or an editor is not part of the secret. Errors name the
+// path, never any file content.
+func ReadToken(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("discord: read token file: %w", err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("discord: token file %s is empty", path)
+	}
+	return token, nil
+}

@@ -22,6 +22,10 @@ critique  = "codex"             # optional: C12 on-demand critique
 # approval.
 [channels.discord]
 auth = "strong"
+# Path to the bot token — the file's CONTENT is the secret, this is just
+# where to read it. Works as a systemd credential:
+#   LoadCredential=discord:/path/to/token  →  token_file = "/run/credentials/approach.service/discord"
+token_file = "/run/credentials/approach.service/discord"
 
 [channels.sms]
 auth = "weak"

@@ -72,6 +72,49 @@ auth = "weak"
 // validChannels defines one strong and one weak channel for identity tests.
 const validChannels = "[channels.discord]\nauth = \"strong\"\n[channels.sms]\nauth = \"weak\"\n"
 
+func TestChannels_TokenFile(t *testing.T) {
+	cases := []struct {
+		name, toml string
+		wantErr    bool
+	}{
+		{
+			"token_file on a strong channel",
+			"[channels.discord]\nauth = \"strong\"\ntoken_file = \"/run/credentials/approach/discord\"\n",
+			false,
+		},
+		{
+			"token_file on a weak channel rejected",
+			"[channels.sms]\nauth = \"weak\"\ntoken_file = \"/run/credentials/approach/sms\"\n",
+			true,
+		},
+		{
+			"strong channel without token_file still valid",
+			"[channels.discord]\nauth = \"strong\"\n",
+			false,
+		},
+		{
+			// A typo'd or not-yet-supported channel must not swallow a
+			// credential path silently — the daemon only wires gateway
+			// adapters it implements, and an ignored token_file leaves
+			// the operator believing a gateway is live.
+			"token_file on a channel with no gateway adapter rejected",
+			"[channels.disocrd]\nauth = \"strong\"\ntoken_file = \"/run/credentials/approach/discord\"\n",
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Parse(strings.NewReader(validModels + tc.toml))
+			if tc.wantErr && err == nil {
+				t.Fatal("want error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestIdentities_ValidRowsParse(t *testing.T) {
 	c, err := config.Parse(strings.NewReader(validModels + validChannels + `
 [[identity]]
