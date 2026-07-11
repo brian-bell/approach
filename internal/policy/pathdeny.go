@@ -178,38 +178,49 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 			return path, reason, err
 		}
 		for _, e := range externals {
-			target, err := filepath.EvalSymlinks(e.source)
+			// Every hop of the link's own chain, not just the collapsed
+			// EvalSymlinks result: src/link -> ../safe -> .config ->
+			// config-target loses the .config spelling under plain
+			// resolution, and config-target/gh is still reachable as
+			// .config/gh. rootSpellings returns each hop's spelling with
+			// the fully resolved target last — the same treatment the
+			// read root itself gets.
+			spellings, err := rootSpellings(e.source)
 			if err != nil {
-				return "", "", fmt.Errorf("policy: resolve symlink %s: %w", e.source, err)
+				return "", "", err
 			}
+			target := spellings[len(spellings)-1]
 			if !within(resolvedCwd, target) {
 				return e.source, "symlink escapes the session cwd subtree (§7 cwd confinement)", nil
 			}
-			// Judge the resolved target AND its alias spelling: the link
-			// name may carry a context rule (.config/gh) the real path
-			// lacks. Re-walking under the source spelling then applies
+			// Judge every chain spelling AND the alias spelling: a hop or
+			// the link name may carry a context rule (.config/gh) the real
+			// path lacks. Re-walking under those spellings then applies
 			// that context to the target's children (depth-1 is all the
 			// context rules need).
-			if denied, why := DeniedPath(target); denied {
-				return e.source, why, nil
-			}
 			if denied, why := DeniedPath(e.sourceLogical); denied {
 				return e.source, why, nil
+			}
+			for _, spelling := range spellings {
+				if denied, why := DeniedPath(spelling); denied {
+					return e.source, why, nil
+				}
 			}
 			info, err := os.Stat(target)
 			if err != nil {
 				return "", "", fmt.Errorf("policy: inspect symlink target %s: %w", target, err)
 			}
 			if info.IsDir() {
-				// Both spellings of the target enter the queue: the alias
+				// Every spelling of the target enters the queue: the alias
 				// spelling because the link name may carry context its real
-				// path lacks, and the RESOLVED spelling because the inverse
-				// holds too — src/link -> ../real/.config reaches gh/… as
-				// src/link/gh under the alias, and only real/.config/gh
-				// fires the context rule. Whichever runs second hits the
-				// visited branch and gets the depth-1 alias check.
+				// path lacks, and each chain spelling (resolved target
+				// included) because the inverse holds too. Whichever runs
+				// first does the full walk; the rest hit the visited branch
+				// and get the depth-1 alias check under their spelling.
 				queue = append(queue, walkItem{physical: target, logical: e.sourceLogical})
-				queue = append(queue, walkItem{physical: target, logical: target})
+				for _, spelling := range spellings {
+					queue = append(queue, walkItem{physical: target, logical: spelling})
+				}
 			}
 		}
 	}
@@ -383,14 +394,17 @@ func walkTreeLogical(fsys fs.FS, physicalRoot, logicalRoot string) (path, reason
 	return path, reason, externals, nil
 }
 
-// rootSpellings resolves the absolute read root component by component,
+// rootSpellings resolves an absolute path component by component,
 // following symlinks anywhere in the path — not just the final
 // component — and returns every lexical spelling of the final target
-// seen along the way. A denylisted segment introduced by a symlink at
-// ANY position (safe/gh where safe -> .config; or safe -> .config ->
-// config-target) appears in one of these spellings even though
-// EvalSymlinks collapses it away. Resolution is bounded by a hop cap;
-// EvalSymlinks has already rejected a cyclic root before this runs.
+// seen along the way, resolved target last. A denylisted segment
+// introduced by a symlink at ANY position (safe/gh where safe ->
+// .config; or safe -> .config -> config-target) appears in one of
+// these spellings even though EvalSymlinks collapses it away. Two
+// callers need this: the read root itself, and each external symlink
+// met during the walk — the link's own chain hides spellings the same
+// way. Resolution is bounded by a hop cap, so a cyclic chain fails
+// closed as an error rather than spinning.
 func rootSpellings(root string) ([]string, error) {
 	vol := filepath.VolumeName(root)
 	rest := strings.Split(root[len(vol):], string(filepath.Separator))
@@ -410,7 +424,7 @@ func rootSpellings(root string) ([]string, error) {
 		next := filepath.Join(resolved, comp)
 		info, err := os.Lstat(next)
 		if err != nil {
-			return nil, fmt.Errorf("policy: inspect read root component %s: %w", next, err)
+			return nil, fmt.Errorf("policy: inspect path component %s: %w", next, err)
 		}
 		if info.Mode()&os.ModeSymlink == 0 {
 			resolved = next
@@ -418,11 +432,11 @@ func rootSpellings(root string) ([]string, error) {
 		}
 		hops++
 		if hops > 255 {
-			return nil, fmt.Errorf("policy: read root %s exceeds the symlink-resolution limit", root)
+			return nil, fmt.Errorf("policy: path %s exceeds the symlink-resolution limit", root)
 		}
 		target, err := os.Readlink(next)
 		if err != nil {
-			return nil, fmt.Errorf("policy: read root symlink %s: %w", next, err)
+			return nil, fmt.Errorf("policy: read symlink %s: %w", next, err)
 		}
 		if filepath.IsAbs(target) {
 			tvol := filepath.VolumeName(target)

@@ -652,3 +652,39 @@ func TestDeniedDirExternalTargetResolvedContext(t *testing.T) {
 		t.Error("src/link -> ../real/.config exposed gh/hosts.yml as clean — the target's resolved spelling must be judged too")
 	}
 }
+
+// TestDeniedDirExternalChainSpellings: a denylisted spelling hiding at
+// an INTERMEDIATE hop of an external link's own chain. src/link ->
+// ../safe -> .config -> config-target: EvalSymlinks collapses the
+// chain to config-target and the source alias is src/link, so neither
+// retained spelling carries .config — but config-target/gh/hosts.yml
+// is still reachable as .config/gh. Every hop of an external target's
+// chain must be judged, exactly as rootSpellings does for the root.
+func TestDeniedDirExternalChainSpellings(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "config-target", "gh"), 0o755); err != nil {
+		t.Fatalf("mkdir config-target/gh: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "config-target", "gh", "hosts.yml"), []byte("oauth_token: secret"), 0o600); err != nil {
+		t.Fatalf("write hosts.yml: %v", err)
+	}
+	if err := os.Symlink("config-target", filepath.Join(cwd, ".config")); err != nil {
+		t.Fatalf("symlink .config: %v", err)
+	}
+	if err := os.Symlink(".config", filepath.Join(cwd, "safe")); err != nil {
+		t.Fatalf("symlink safe: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, "src"), 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "safe"), filepath.Join(cwd, "src", "link")); err != nil {
+		t.Fatalf("symlink src/link: %v", err)
+	}
+	path, _, err := policy.DeniedDir(cwd, filepath.Join(cwd, "src"))
+	if err != nil {
+		t.Fatalf("DeniedDir with chained external target: %v", err)
+	}
+	if path == "" {
+		t.Error("src/link -> ../safe -> .config -> config-target exposed gh/hosts.yml as clean — intermediate hop spellings must be judged too")
+	}
+}
