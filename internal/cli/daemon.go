@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,6 +19,14 @@ import (
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/store"
 )
+
+// exitUnrecoverable is the daemon's exit status for startup refusals
+// that no restart can fix (schema newer than the binary, §6): the
+// systemd unit excludes it via RestartPreventExitStatus so the daemon
+// stays down with one actionable journal record instead of
+// restart-looping every RestartSec. Keep in sync with
+// deploy/systemd/approach.service.
+const exitUnrecoverable = 3
 
 // defaultStateDir is where the daemon keeps its socket and store:
 // $APPROACH_HOME/state, defaulting to ~/approach/state (§6).
@@ -99,6 +108,9 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	db, err = store.Open(filepath.Join(*state, "approach.db"))
 	if err != nil {
 		logger.Error("open state store", "error", err.Error())
+		if errors.Is(err, store.ErrSchemaTooNew) {
+			return exitUnrecoverable
+		}
 		return 1
 	}
 	logger.Info("state store open", "state", *state)
