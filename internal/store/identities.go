@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/brian-bell/approach/internal/trust"
 )
 
 // Identity is one hand-enrolled row for the §6 identities table. It
@@ -40,6 +42,48 @@ func ResolveOwnerID(ctx context.Context, db *sql.DB, channel, nativeID string) (
 		return "", false, fmt.Errorf("store: resolve owner_id for %s/%s: %w", channel, nativeID, err)
 	}
 	return ownerID, true, nil
+}
+
+// ResolveTrust is the §6 lookup every gate reduces to: the trust level
+// enrolled for (channel, native_id), where a miss IS Untrusted —
+// deny-by-default, a valid verdict rather than an error. The lookup is
+// exact-match: platform native IDs are case-sensitive. Every failure
+// returns Untrusted alongside the error, so even a caller that wrongly
+// drops the error cannot hold an elevated level.
+func ResolveTrust(ctx context.Context, db *sql.DB, channel, nativeID string) (trust.Level, error) {
+	var (
+		enrolled string
+		ownerID  sql.NullString
+	)
+	err := db.QueryRowContext(ctx,
+		`SELECT trust, owner_id FROM identities WHERE channel = ? AND native_id = ?`,
+		channel, nativeID,
+	).Scan(&enrolled, &ownerID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return trust.Untrusted, nil
+	}
+	if err != nil {
+		return trust.Untrusted, fmt.Errorf("store: resolve trust for %s/%s: %w", channel, nativeID, err)
+	}
+	// The 0002 CHECKs make drifted rows unrepresentable through this
+	// binary, but this table is the root of §7 — a row edited past them
+	// (manual DB surgery, corruption) must fail closed as an error,
+	// never stamp a level. The full row shape is re-judged here: the
+	// closed level set, owner rows carrying a real principal (an owner
+	// stamp from a principal-less row would elevate trust that §4.4
+	// approval matching could never verify), known rows carrying none,
+	// and no stored 'untrusted' — absence of a row is what that means.
+	level, err := trust.Parse(enrolled)
+	if err != nil {
+		return trust.Untrusted, fmt.Errorf("store: resolve trust for %s/%s: %w", channel, nativeID, err)
+	}
+	switch {
+	case level == trust.Untrusted,
+		level == trust.Owner && (!ownerID.Valid || ownerID.String == ""),
+		level == trust.Known && ownerID.Valid:
+		return trust.Untrusted, fmt.Errorf("store: resolve trust for %s/%s: row violates identities invariants (drifted past schema CHECK)", channel, nativeID)
+	}
+	return level, nil
 }
 
 // SeedIdentities syncs the identities table to ids, in one transaction.
