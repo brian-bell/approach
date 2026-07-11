@@ -1,0 +1,31 @@
+formula = "feature-delivery"
+description = "Deliver one bead: detailed TDD plan, test-first implementation, structured autoreview, then a local commit."
+version = 1
+type = "workflow"
+
+[vars.bead]
+description = "Target bead id to deliver (e.g. approach-1zr.1.6)"
+required = true
+
+[[steps]]
+id = "plan"
+title = "Write detailed TDD plan for {{bead}}"
+description = "FIRST claim {{bead}} (bd update {{bead}} --claim) — ownership before any mutation, so two workers cannot both plan it. Then read the bead, its spec sections, and the surrounding code, and write a detailed TDD plan: design decisions, edge cases, and a red-to-green test sequence (one behavior per cycle). Save the plan to the bead with bd update {{bead}} --design."
+
+[[steps]]
+id = "implement"
+title = "Implement {{bead}} test-first"
+needs = ["plan"]
+description = "Claim {{bead}} and execute the plan with strict TDD vertical slices: one failing test, minimal code to green, refactor. Run quality gates (make check) until clean. Leave {{bead}} open — it closes with the commit step, after review."
+
+[[steps]]
+id = "autoreview"
+title = "Autoreview the {{bead}} change"
+needs = ["implement"]
+description = "Run the structured autoreview helper on the uncommitted diff (--mode local). Verify every finding against the real code path; fix accepted findings, rerun focused tests and the review until no actionable findings remain."
+
+[[steps]]
+id = "commit"
+title = "Commit the {{bead}} change"
+needs = ["autoreview"]
+description = "Commit the reviewed change as one logical commit on the shared delivery branch, then close {{bead}} — completion means reviewed AND committed. Do not push."
