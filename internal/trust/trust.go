@@ -57,6 +57,38 @@ func Min(a, b Level) Level {
 	return b
 }
 
+// Stamped is the §6 decision stamped onto an inbound event: the
+// effective trust after the channel-auth clamp, plus the channel's
+// capability bits the §7 gates consult alongside it. MayApprove is the
+// CHANNEL capability, not a verdict — §4.4 approval matching separately
+// requires the owner_id match, so it can be true on an untrusted stamp.
+type Stamped struct {
+	Trust      Level
+	ReadOnly   bool
+	MayApprove bool
+}
+
+// Stamp applies the §6 channel-auth clamp: effective trust is
+// min(lookup, the channel's max). Config validation already rejects
+// owner enrollment on weak channels, but the identities table is the
+// runtime source of truth and can drift past it (manual DB edits, a
+// stale seed) — so the weak-channel-never-stamps-owner invariant is
+// enforced again here, at the point of stamping. The auth set is closed
+// and case-sensitive, mirroring config validation and the derived
+// accessors on config.Channel (MaxTrust/MayApprove/ReadOnly — keep the
+// two in sync): anything outside it, including "" from a channel absent
+// from [channels], fails closed to untrusted, read-only, no approval.
+func Stamp(auth string, lookup Level) Stamped {
+	switch auth {
+	case "strong":
+		return Stamped{Trust: Min(lookup, Owner), ReadOnly: false, MayApprove: true}
+	case "weak":
+		return Stamped{Trust: Min(lookup, Known), ReadOnly: true, MayApprove: false}
+	default:
+		return Stamped{Trust: Untrusted, ReadOnly: true, MayApprove: false}
+	}
+}
+
 // IngestKind classifies content arriving in a session for the taint
 // rule (§7 rule 3). The set is closed: new ingestion paths must decide
 // their taint behavior here, explicitly.

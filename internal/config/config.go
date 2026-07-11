@@ -127,7 +127,8 @@ type Identity struct {
 // Channel binds a chat surface and grades its sender authentication (§6):
 // platform- or network-authenticated channels are "strong"; spoofable ones
 // (sms, email) are "weak" and clamped to at most known trust, never able
-// to satisfy an approval.
+// to satisfy an approval. trust.Stamp encodes the same strong/weak rules
+// for the runtime stamping path — keep the two in sync.
 type Channel struct {
 	Auth string `toml:"auth"`
 }

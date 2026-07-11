@@ -361,3 +361,63 @@ func TestResolveTrustRowInvariants(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveStamped: the §6 stamping decision — lookup trust clamped
+// by the channel's auth grade, with the channel capability bits carried
+// alongside. The core case is the drifted owner row on a weak channel:
+// config validation rejects owner-on-weak, but the identities table can
+// drift past it, and the clamp must hold at the point of stamping.
+func TestResolveStamped(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	// The sms owner row simulates table drift: SeedIdentities and the
+	// schema are channel-auth-agnostic, so nothing below config stops it.
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '42', 'owner', 'brian');
+		 INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('sms', '+15550100', 'owner', 'brian')`,
+	); err != nil {
+		t.Fatalf("enroll identities: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name, channel, nativeID, auth string
+		want                          trust.Stamped
+	}{
+		{"owner on a strong channel", "discord", "42", "strong",
+			trust.Stamped{Trust: trust.Owner, ReadOnly: false, MayApprove: true}},
+		{"drifted owner row on a weak channel clamps", "sms", "+15550100", "weak",
+			trust.Stamped{Trust: trust.Known, ReadOnly: true, MayApprove: false}},
+		{"miss on a weak channel", "sms", "+15550199", "weak",
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}},
+		{"miss on an unconfigured channel", "carrier-pigeon", "7", "",
+			trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}},
+	} {
+		got, err := store.ResolveStamped(ctx, db, tc.channel, tc.nativeID, tc.auth)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got != tc.want {
+			t.Errorf("%s: stamped %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestResolveStampedFailsClosed: a broken store returns an error AND
+// the bottom stamp — untrusted, read-only, no approval — so even a
+// caller that wrongly drops the error holds nothing, on any channel.
+func TestResolveStampedFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	got, err := store.ResolveStamped(ctx, db, "discord", "42", "strong")
+	if err == nil {
+		t.Error("ResolveStamped on a closed store returned no error, want fail-closed error")
+	}
+	want := trust.Stamped{Trust: trust.Untrusted, ReadOnly: true, MayApprove: false}
+	if got != want {
+		t.Errorf("failed lookup stamped %+v, want the bottom %+v", got, want)
+	}
+}
