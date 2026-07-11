@@ -462,6 +462,14 @@ func aliasDenies(fsys fs.FS, targetRel, targetAbs, aliasLogical string) (path, r
 		return "", "", fmt.Errorf("policy: read symlink target %s: %w", targetAbs, err)
 	}
 	for _, e := range entries {
+		// Same .claude carve-out as the ordinary walk: a real .claude
+		// DIRECTORY is judged by its children (only hooks/skills/settings
+		// are control surface), and those children are covered by the
+		// walk of the target's real tree. Denying it wholesale here would
+		// refuse a benign alias whose target merely holds .claude/commands.
+		if e.IsDir() && strings.EqualFold(e.Name(), ".claude") {
+			continue
+		}
 		if denied, why := DeniedPath(filepath.Join(aliasLogical, e.Name())); denied {
 			return filepath.Join(targetAbs, e.Name()), why, nil
 		}

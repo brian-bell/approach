@@ -277,6 +277,37 @@ func TestDeniedDescendantSymlinkAliasContext(t *testing.T) {
 		t.Errorf("benign in-root alias refused (%s at %s)", reason, path)
 	}
 
+	// A benign alias whose target holds only allowed .claude content
+	// stays legal — the alias check must mirror the .claude carve-out,
+	// not refuse the whole read on a terminal .claude child.
+	claudeAlias := fstest.MapFS{
+		"latest":                             &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/main.go":                &fstest.MapFile{Data: []byte("ok")},
+		"releases/v2/.claude/commands/ok.md": &fstest.MapFile{Data: []byte("ok")},
+	}
+	path, reason, err = policy.DeniedDescendant(claudeAlias, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on alias to allowed .claude content: %v", err)
+	}
+	if path != "" {
+		t.Errorf("benign alias to .claude/commands refused (%s at %s) — carve-out must apply", reason, path)
+	}
+
+	// But an alias whose target holds real .claude control surface is
+	// still refused — the carve-out descends to judge children, and
+	// settings.json is denied wherever it sits.
+	claudeAliasBad := fstest.MapFS{
+		"latest":                            &fstest.MapFile{Data: []byte("releases/v2"), Mode: fs.ModeSymlink},
+		"releases/v2/.claude/settings.json": &fstest.MapFile{Data: []byte("secret")},
+	}
+	path, _, err = policy.DeniedDescendant(claudeAliasBad, "/repo")
+	if err != nil {
+		t.Fatalf("DeniedDescendant on alias to .claude control surface: %v", err)
+	}
+	if path == "" {
+		t.Error("alias target with .claude/settings.json read as clean, want denied")
+	}
+
 	// An alias to the walk root itself still needs its context judged:
 	// sub/.config -> the root makes .config/gh/hosts.yml reachable, and
 	// the alias's direct-child check must not be skipped as a cycle.
