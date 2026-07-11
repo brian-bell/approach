@@ -111,17 +111,30 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 	}
 
 	// Link targets inside the cwd but outside the walked tree become
-	// further roots to inspect; the visited set breaks link cycles.
+	// further roots to inspect, carrying the source's lexical spelling as
+	// the deny context (a link named ~/.config aliases its target's
+	// children under .config/…). visited is keyed by resolved physical
+	// path so a symlink cycle within the cwd terminates — the alias
+	// spelling grows each hop, so keying on it too would never converge.
 	visited := map[string]bool{}
-	queue := []string{resolvedRoot}
+	queue := []walkItem{{physical: resolvedRoot, logical: resolvedRoot}}
 	for len(queue) > 0 {
-		r := queue[0]
+		item := queue[0]
 		queue = queue[1:]
-		if visited[r] {
+		if visited[item.physical] {
+			// Already walked under some spelling, but a different alias
+			// path can reach the same directory carrying a context rule
+			// (…/.config) its earlier spelling lacked. Re-walking would
+			// risk a cycle, so apply just this alias's depth-1 context to
+			// the directory's direct children — all the context rules need.
+			p, r, aerr := aliasDenies(os.DirFS(item.physical), ".", item.physical, item.logical)
+			if aerr != nil || p != "" {
+				return p, r, aerr
+			}
 			continue
 		}
-		visited[r] = true
-		path, reason, externals, err := walkTree(os.DirFS(r), r)
+		visited[item.physical] = true
+		path, reason, externals, err := walkTreeLogical(os.DirFS(item.physical), item.physical, item.logical)
 		if err != nil || path != "" {
 			return path, reason, err
 		}
@@ -133,7 +146,15 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 			if !within(resolvedCwd, target) {
 				return e.source, "symlink escapes the session cwd subtree (§7 cwd confinement)", nil
 			}
+			// Judge the resolved target AND its alias spelling: the link
+			// name may carry a context rule (.config/gh) the real path
+			// lacks. Re-walking under the source spelling then applies
+			// that context to the target's children (depth-1 is all the
+			// context rules need).
 			if denied, why := DeniedPath(target); denied {
+				return e.source, why, nil
+			}
+			if denied, why := DeniedPath(e.sourceLogical); denied {
 				return e.source, why, nil
 			}
 			info, err := os.Stat(target)
@@ -141,11 +162,20 @@ func DeniedDir(cwd, root string) (path, reason string, err error) {
 				return "", "", fmt.Errorf("policy: inspect symlink target %s: %w", target, err)
 			}
 			if info.IsDir() {
-				queue = append(queue, target)
+				queue = append(queue, walkItem{physical: target, logical: e.sourceLogical})
 			}
 		}
 	}
 	return "", "", nil
+}
+
+// walkItem is a subtree to inspect: physical is where its files are read
+// from, logical is the lexical path the denylist judges them under. The
+// two differ when a symlink aliases the subtree under a name (…/.config)
+// its real location lacks.
+type walkItem struct {
+	physical string
+	logical  string
 }
 
 // within reports whether p sits inside (or is) the base subtree.
@@ -179,34 +209,60 @@ func DeniedDescendant(fsys fs.FS, root string) (path, reason string, err error) 
 // externalLink is a walked symlink whose lexical target leaves the
 // walked root: legal or not is the CALLER's boundary decision.
 type externalLink struct {
-	source string // absolute path of the link itself
-	target string // absolute lexical target
+	source        string // absolute physical path of the link itself
+	sourceLogical string // the link's lexical spelling (deny context on re-walk)
+	target        string // absolute lexical target
 }
 
 // walkTree walks fsys (the tree at absolute path root) and applies the
-// denylist to every entry: the entry's own name is judged FIRST — a
-// link NAMED .env or .codex must not slip through on the strength of a
-// benign target — then symlinks are resolved lexically and their
-// targets judged. In-root targets are allowed through (the walk visits
-// the real files anyway); out-of-root targets are collected for the
-// caller to judge against ITS boundary. The walk does not descend into
-// denied directories — the directory itself is already the verdict.
+// denylist to every entry under root's own name. See walkTreeLogical
+// for the full contract; here physical and logical coincide.
 func walkTree(fsys fs.FS, root string) (path, reason string, externals []externalLink, err error) {
-	if denied, why := DeniedPath(root); denied {
-		return root, why, nil, nil
+	return walkTreeLogical(fsys, root, root)
+}
+
+// walkTreeLogical walks fsys — the tree physically at physicalRoot —
+// and applies the denylist to every entry under logicalRoot, the
+// lexical path by which the entry is reached. The two coincide except
+// under an in-root symlink that aliases a subtree beneath a name its
+// real location lacks (…/.config -> config-target): the alias spelling
+// can match a context rule (.config/gh) the target's real path does
+// not, so the aliased subtree is RE-WALKED under the source name, not
+// only visited under the target's real one. The entry's own name is
+// judged FIRST — a link NAMED .env or .codex must not slip through on
+// the strength of a benign target — then symlinks are resolved
+// lexically and their targets judged. Out-of-root targets are collected
+// for the caller to judge against ITS boundary. The walk does not
+// descend into denied directories — the directory itself is the verdict.
+func walkTreeLogical(fsys fs.FS, physicalRoot, logicalRoot string) (path, reason string, externals []externalLink, err error) {
+	if denied, why := DeniedPath(logicalRoot); denied {
+		return logicalRoot, why, nil, nil
 	}
+	// In-root symlinked directories to give the depth-1 alias-context
+	// check after the walk (see aliasDenies). WalkDir does not descend
+	// symlinks, so the target's children are reached only under the
+	// target's real name; the alias name (…/.config) must be applied to
+	// those children separately.
+	type aliasDir struct {
+		logical   string // alias spelling of the target
+		targetRel string // target path relative to fsys (slash form)
+		targetAbs string // absolute physical target
+	}
+	var aliases []aliasDir
 	err = fs.WalkDir(fsys, ".", func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return fmt.Errorf("policy: inspect %s: %w", filepath.Join(root, p), walkErr)
+			return fmt.Errorf("policy: inspect %s: %w", filepath.Join(physicalRoot, p), walkErr)
 		}
 		if p == "." {
 			return nil
 		}
-		// Judged with the root joined on, NOT the bare walk-relative
-		// entry: rules that span the root boundary (.config/gh under a
-		// walk rooted at ~/.config) need the ancestor segments, which
-		// WalkDir's relative paths drop.
-		if denied, why := DeniedPath(filepath.Join(root, p)); denied {
+		// Judged under logicalRoot, NOT the bare walk-relative entry:
+		// rules that span the root boundary (.config/gh under a walk
+		// rooted at ~/.config, or an alias spelling) need the ancestor
+		// segments, which WalkDir's relative paths drop.
+		logical := filepath.Join(logicalRoot, p)
+		physical := filepath.Join(physicalRoot, p)
+		if denied, why := DeniedPath(logical); denied {
 			// One carve-out: a real .claude DIRECTORY met mid-walk is
 			// judged by its children — only the enumerated hooks/
 			// skills/settings surface inside it is denied, and commands
@@ -215,33 +271,46 @@ func walkTree(fsys fs.FS, root string) (path, reason string, externals []externa
 			// the control surface; here the walk visits every child
 			// individually, so descending IS the finer judgment.)
 			if !d.IsDir() || !strings.EqualFold(gopath.Base(p), ".claude") {
-				path, reason = filepath.Join(root, p), why
+				path, reason = physical, why
 				return fs.SkipAll
 			}
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
 			rl, ok := fsys.(fs.ReadLinkFS)
 			if !ok {
-				path, reason = filepath.Join(root, p), "symlinked descendant on a filesystem that cannot resolve links — refused unresolved (§7)"
+				path, reason = physical, "symlinked descendant on a filesystem that cannot resolve links — refused unresolved (§7)"
 				return fs.SkipAll
 			}
 			target, err := rl.ReadLink(p)
 			if err != nil {
-				path, reason = filepath.Join(root, p), "unreadable symlinked descendant — refused unresolved (§7)"
+				path, reason = physical, "unreadable symlinked descendant — refused unresolved (§7)"
 				return fs.SkipAll
 			}
 			absTarget := filepath.Clean(target)
 			if !filepath.IsAbs(target) {
-				absTarget = filepath.Clean(filepath.Join(root, gopath.Dir(p), target))
+				absTarget = filepath.Clean(filepath.Join(physicalRoot, gopath.Dir(p), target))
 			}
 			if denied, why := DeniedPath(absTarget); denied {
-				path, reason = filepath.Join(root, p), why
+				path, reason = physical, why
 				return fs.SkipAll
 			}
-			if !within(root, absTarget) {
+			if within(physicalRoot, absTarget) {
+				// In-root alias: the target subtree is walked directly
+				// under its real name, so its files are covered — but not
+				// under the alias name, which may carry a context rule the
+				// real path lacks. Queue a depth-1 child check under the
+				// alias spelling. rel == "." (a link to the root itself)
+				// still needs the check, so it is not skipped.
+				rel, relErr := filepath.Rel(physicalRoot, absTarget)
+				if relErr != nil {
+					return fmt.Errorf("policy: relativize symlink target %s: %w", absTarget, relErr)
+				}
+				aliases = append(aliases, aliasDir{logical: logical, targetRel: filepath.ToSlash(rel), targetAbs: absTarget})
+			} else {
 				externals = append(externals, externalLink{
-					source: filepath.Join(root, p),
-					target: absTarget,
+					source:        physical,
+					sourceLogical: logical,
+					target:        absTarget,
 				})
 			}
 		}
@@ -250,5 +319,45 @@ func walkTree(fsys fs.FS, root string) (path, reason string, externals []externa
 	if err != nil {
 		return "", "", nil, err
 	}
+	if path != "" {
+		return path, reason, externals, nil
+	}
+	// Depth-1 alias-context check. The only context-spanning deny rules
+	// (.config/{gh,gcloud}, .claude/{hooks,skills,settings}) fire on a
+	// parent segment plus ONE child, so judging each direct child of an
+	// aliased directory under the alias spelling is exactly sufficient —
+	// and needs no recursion, so no symlink cycle can diverge here.
+	for _, a := range aliases {
+		p, r, err := aliasDenies(fsys, a.targetRel, a.targetAbs, a.logical)
+		if err != nil || p != "" {
+			return p, r, externals, err
+		}
+	}
 	return path, reason, externals, nil
+}
+
+// aliasDenies judges the direct children of an aliased directory (at
+// targetRel within fsys, absolute targetAbs) under the alias spelling
+// aliasLogical, catching a denied path (…/.config/gh) reachable only
+// through the link even though the target's real path is benign. A
+// target that is not a directory re-spells only its own path, already
+// judged at the symlink entry, so it contributes nothing here.
+func aliasDenies(fsys fs.FS, targetRel, targetAbs, aliasLogical string) (path, reason string, err error) {
+	info, err := fs.Stat(fsys, targetRel)
+	if err != nil {
+		return "", "", fmt.Errorf("policy: inspect symlink target %s: %w", targetAbs, err)
+	}
+	if !info.IsDir() {
+		return "", "", nil
+	}
+	entries, err := fs.ReadDir(fsys, targetRel)
+	if err != nil {
+		return "", "", fmt.Errorf("policy: read symlink target %s: %w", targetAbs, err)
+	}
+	for _, e := range entries {
+		if denied, why := DeniedPath(filepath.Join(aliasLogical, e.Name())); denied {
+			return filepath.Join(targetAbs, e.Name()), why, nil
+		}
+	}
+	return "", "", nil
 }
