@@ -21,6 +21,7 @@ import (
 	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
+	"github.com/brian-bell/approach/internal/engine"
 	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
 )
@@ -132,6 +133,15 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		// A configured credential that cannot be read is a refusal a
 		// restart cannot fix (deploy the file, then start) — same
 		// posture as ErrSchemaTooNew.
+		return exitUnrecoverable
+	}
+
+	// The §2 version pin is verified in the same pre-store phase: a
+	// drifted CLI changes the hook lifecycle the harness enforces
+	// through, and a restart cannot fix it — redeploy the pinned CLI or
+	// bump the pin deliberately.
+	if err := verifyEnginePin(cfg, logger); err != nil {
+		logger.Error("engine pin", "error", err.Error())
 		return exitUnrecoverable
 	}
 
@@ -258,6 +268,24 @@ var newDiscordRunner = func(cfg *config.Config, db *sql.DB, queues *router.Queue
 		return nil, err
 	}
 	return a, nil
+}
+
+// verifyEnginePin proves the deployed Claude Code binary matches the
+// [engine] version pin (§2) before the store opens — same refusal
+// phase as a bad credential. No [engine] section is a bootable,
+// dormant posture (adapters and queues run; turn dispatch waits for
+// the engine wiring) but must be loudly visible, never silent.
+func verifyEnginePin(cfg *config.Config, logger *slog.Logger) error {
+	if cfg == nil || cfg.Engine == nil {
+		logger.Warn("no [engine] section — no CLI pinned; turn dispatch stays dormant (§2)")
+		return nil
+	}
+	if err := engine.VerifyVersion(context.Background(), cfg.Engine.Bin, cfg.Engine.Version); err != nil {
+		return err
+	}
+	logger.Info("engine pin verified", "bin", cfg.Engine.Bin, "version", cfg.Engine.Version,
+		"enrolled_hooks", len(cfg.Engine.Hooks))
+	return nil
 }
 
 // placeholderTurn is the M1 scaffold handler: the queue claims,
