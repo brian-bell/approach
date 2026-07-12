@@ -15,7 +15,7 @@ import (
 // machinery: one Turn (first turn activates it).
 func activeThread(t *testing.T, m *session.Manager, db *sql.DB, cwd string) store.LiveSession {
 	t.Helper()
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd); err != nil {
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err != nil {
 		t.Fatalf("setup Turn: %v", err)
 	}
 	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
@@ -40,7 +40,7 @@ func TestTurnDegradesOnResumeFailed(t *testing.T) {
 	old := activeThread(t, m, db, cwd)
 
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd); err != nil {
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err != nil {
 		t.Fatalf("Turn over a dead transcript: %v (must degrade, never hard-error — §4.6)", err)
 	}
 
@@ -101,7 +101,7 @@ func TestTurnDegradesOnCwdGone(t *testing.T) {
 
 	newCwd := t.TempDir()
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", newCwd); err != nil {
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", newCwd, "hi"); err != nil {
 		t.Fatalf("Turn over a vanished cwd: %v (must degrade — §4.6, §11)", err)
 	}
 
@@ -142,7 +142,7 @@ func TestTurnDoesNotDegradeOnTransientError(t *testing.T) {
 	old := activeThread(t, m, db, cwd)
 
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd); err == nil {
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err == nil {
 		t.Fatal("Turn swallowed a transient resume failure")
 	}
 	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
