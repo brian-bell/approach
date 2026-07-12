@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/brian-bell/approach/internal/store"
 )
@@ -20,7 +21,12 @@ func (m *Manager) rotationCause(live store.LiveSession) string {
 	if idleSince == 0 {
 		idleSince = live.CreatedAt
 	}
-	if m.now().Unix()-idleSince >= int64(m.idleTTL.Seconds()) {
+	// Compared in duration space: timestamps are whole seconds, but the
+	// TTL may be fractional (1500ms is a valid config duration), and
+	// flooring it would rotate up to a second EARLY. This comparison
+	// only fires once a whole second ≥ the full TTL has elapsed —
+	// ceiling semantics, matching the activation deadline's.
+	if time.Duration(m.now().Unix()-idleSince)*time.Second >= m.idleTTL {
 		return "idle_ttl"
 	}
 	return ""
