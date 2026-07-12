@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -49,6 +50,11 @@ func New(cfg Config) (*Engine, error) {
 	switch {
 	case cfg.Bin == "":
 		return nil, fmt.Errorf("engine: no binary path — the invocation must be pinned, never $PATH luck (§7)")
+	case !filepath.IsAbs(cfg.Bin):
+		// A relative name resolves through the daemon's PATH at spawn
+		// time — a changed or attacker-influenced PATH would swap the
+		// engine out from under the pin. Absolute or nothing.
+		return nil, fmt.Errorf("engine: binary path %q is not absolute — a PATH-resolved engine is not pinned (§7)", cfg.Bin)
 	case cfg.Model == "":
 		return nil, fmt.Errorf("engine: no model — the CLI default is settings-derived, pin it (§8)")
 	case cfg.MaxTurns < 1:
@@ -105,8 +111,12 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 	cmd := exec.CommandContext(ctx, e.bin, args...)
 	cmd.Dir = spec.Cwd
 	cmd.Stdin = strings.NewReader(promptText(spec))
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	// Bounded: stderr is diagnostics, and an unbounded buffer hands a
+	// misbehaving (or prompt-injected) child a path to exhaust daemon
+	// memory long before its timeout — the cap is enforced at write
+	// time, not after the fact.
+	stderr := &boundedBuffer{limit: stderrCap}
+	cmd.Stderr = stderr
 	// The child leads its own process group: the CLI spawns tool
 	// children of its own, and a timeout that kills only the leader
 	// leaves grandchildren running — holding this thread's pipes open
@@ -162,6 +172,41 @@ func promptText(spec session.Spec) string {
 // drill re-verifies it on every bump.
 func isTranscriptGone(stderr string) bool {
 	return strings.Contains(strings.ToLower(stderr), "no conversation found")
+}
+
+// stderrCap bounds how much child stderr the daemon retains: plenty
+// for the CLI's error lines (the transcript-gone match needs only
+// one), nothing a hostile writer can grow.
+const stderrCap = 64 * 1024
+
+// boundedBuffer keeps the first limit bytes and drops (but counts as
+// accepted) the rest — a Write error here would kill the child's
+// stderr pipe mid-turn.
+type boundedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if room := b.limit - b.buf.Len(); room > 0 {
+		if len(p) > room {
+			b.buf.Write(p[:room])
+			b.truncated = true
+		} else {
+			b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	if b.truncated {
+		return b.buf.String() + "…(stderr truncated)"
+	}
+	return b.buf.String()
 }
 
 // excerpt bounds stderr for error messages: enough to diagnose, not

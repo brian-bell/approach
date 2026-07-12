@@ -207,6 +207,26 @@ func TestTransparencyNotePrependedToPrompt(t *testing.T) {
 	}
 }
 
+// TestStderrBounded: a child that floods stderr must not grow daemon
+// memory without limit — the buffer caps at write time, and the error
+// still carries a usable (truncation-marked) excerpt.
+func TestStderrBounded(t *testing.T) {
+	dir := t.TempDir()
+	// ~2MB of stderr, then a failing exit.
+	bin := fakeCLI(t, dir, `i=0
+while [ $i -lt 2048 ]; do printf '%01024d' 7 >&2; i=$((i+1)); done
+exit 1`)
+	e := newEngine(t, bin, 30*time.Second)
+
+	err := e.Start(context.Background(), spec(t.TempDir()))
+	if err == nil {
+		t.Fatal("Start returned nil from a failing CLI")
+	}
+	if len(err.Error()) > 2000 {
+		t.Errorf("error carries %d bytes of stderr — the bound leaked", len(err.Error()))
+	}
+}
+
 // TestConfigValidation: every field is load-bearing (§8 model pin,
 // §11 runaway controls) — New refuses a config missing any of them.
 func TestConfigValidation(t *testing.T) {
@@ -219,6 +239,7 @@ func TestConfigValidation(t *testing.T) {
 		mutate func(*engine.Config)
 	}{
 		{"missing bin", func(c *engine.Config) { c.Bin = "" }},
+		{"relative bin (PATH-resolved is not pinned)", func(c *engine.Config) { c.Bin = "claude" }},
 		{"missing model", func(c *engine.Config) { c.Model = "" }},
 		{"zero max turns", func(c *engine.Config) { c.MaxTurns = 0 }},
 		{"negative max turns", func(c *engine.Config) { c.MaxTurns = -1 }},
