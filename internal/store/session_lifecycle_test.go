@@ -30,7 +30,7 @@ func TestResolveLiveSession(t *testing.T) {
 		CreatedAt:          1700000000,
 		ActivationDeadline: 1700000120,
 	}
-	if err := store.InsertSession(ctx, db, s); err != nil {
+	if _, err := store.InsertSession(ctx, db, s); err != nil {
 		t.Fatalf("InsertSession: %v", err)
 	}
 
@@ -71,7 +71,7 @@ func TestActivateSession(t *testing.T) {
 		CreatedAt:          1700000000,
 		ActivationDeadline: 1700000120,
 	}
-	if err := store.InsertSession(ctx, db, s); err != nil {
+	if _, err := store.InsertSession(ctx, db, s); err != nil {
 		t.Fatalf("InsertSession: %v", err)
 	}
 	if err := store.ActivateSession(ctx, db, s.SessionID); err != nil {
@@ -110,7 +110,7 @@ func TestFailSession(t *testing.T) {
 		CreatedAt:          1700000000,
 		ActivationDeadline: 1700000120,
 	}
-	if err := store.InsertSession(ctx, db, s); err != nil {
+	if _, err := store.InsertSession(ctx, db, s); err != nil {
 		t.Fatalf("InsertSession: %v", err)
 	}
 	if err := store.ActivateSession(ctx, db, s.SessionID); err != nil {

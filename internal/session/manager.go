@@ -142,17 +142,26 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 		CreatedAt:          now,
 		ActivationDeadline: now + int64(m.window.Seconds()),
 	}
-	if err := store.InsertSession(ctx, m.db, s); err != nil {
+	// The insert is the LAST fallible step: once it commits, this
+	// method must report success — a read-back could fail (context
+	// cancelled at shutdown) after the row committed, reporting a live
+	// pin as unpinned and stranding the thread's first turn until the
+	// deadline expiry. InsertSession returns the canonical cwd it
+	// stored, so the row is reconstructed from what was written.
+	canonical, err := store.InsertSession(ctx, m.db, s)
+	if err != nil {
 		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: %w", threadKey, err)
 	}
-	// Re-read rather than hand-assemble: the row is the truth, and the
-	// store canonicalized the cwd on the way in (§6).
-	live, ok, err := store.ResolveLiveSession(ctx, m.db, threadKey)
-	if err != nil || !ok {
-		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: inserted row did not resolve (ok=%v): %w", threadKey, ok, err)
-	}
 	m.logger.Info("pinned new session", "thread_key", threadKey, "session_id", id)
-	return live, true, nil
+	return store.LiveSession{
+		ThreadKey:          threadKey,
+		SessionID:          id,
+		Status:             "creating",
+		Cwd:                canonical,
+		TrustFloor:         trustFloor,
+		CreatedAt:          s.CreatedAt,
+		ActivationDeadline: s.ActivationDeadline,
+	}, true, nil
 }
 
 // StartNew runs the first engine turn for a freshly-pinned session and
