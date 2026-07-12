@@ -217,6 +217,13 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	remaining := time.Duration(current.ActivationDeadline-nowUnix) * time.Second
 	turnCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
+	// A dead context is a refusal, not an input: shutdown may have
+	// begun after the live-row query above, and Engine has no contract
+	// to no-op on a cancelled context — starting no new turn once
+	// shutdown begins is the router's lifetime promise (§4.1).
+	if err := turnCtx.Err(); err != nil {
+		return fmt.Errorf("session: first turn for %s not started: %w", current.SessionID, err)
+	}
 	if err := m.engine.Start(turnCtx, Spec{
 		SessionID: current.SessionID,
 		ThreadKey: current.ThreadKey,

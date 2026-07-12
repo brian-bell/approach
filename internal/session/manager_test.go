@@ -398,6 +398,28 @@ func TestStartNewUsesDurableFieldsNotSnapshot(t *testing.T) {
 	}
 }
 
+// TestStartNewRefusesCancelledContext: shutdown between the live-row
+// query and the spawn must refuse the turn — engines are not obligated
+// to no-op on a dead context.
+func TestStartNewRefusesCancelledContext(t *testing.T) {
+	db := mustOpen(t)
+	eng := &fakeEngine{}
+	m := newManager(db, eng, 1700000000)
+
+	live, _, err := m.Ensure(context.Background(), "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.StartNew(cancelled, live); err == nil {
+		t.Fatal("StartNew ran a first turn under a cancelled context")
+	}
+	if len(eng.specs) != 0 {
+		t.Errorf("engine spawned %d times under a cancelled context, want 0", len(eng.specs))
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {
