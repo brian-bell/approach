@@ -66,11 +66,23 @@ const (
 )
 
 // Adapter is one Discord gateway connection. Construct with New; drive
-// with Run.
+// with Run; deliver outbound with Send.
 type Adapter struct {
-	session *discordgo.Session
-	handle  MessageHandler
-	log     *slog.Logger
+	// session is written by adopt (Run's goroutine, on session
+	// rebuild) and read by Send's caller goroutine — always through
+	// sessionGate. Run's own reads stay direct: they are the same
+	// goroutine that writes.
+	session     *discordgo.Session
+	sessionGate sync.Mutex
+	handle      MessageHandler
+	log         *slog.Logger
+
+	// dmChannels caches user id → DM channel id for the outbound path:
+	// the §6 dm thread key holds the USER (the durable conversation
+	// identity), and re-resolving the platform channel per message
+	// would spend a REST round-trip under Discord's rate limits.
+	dmGate     sync.Mutex
+	dmChannels map[string]string
 
 	// disconnected carries the gateway-drop signal from the Disconnect
 	// handler (registered once, for the adapter's whole lifetime — see
@@ -114,6 +126,11 @@ type Adapter struct {
 	// and discordgo's close path does not join handlers — a write on
 	// rebuild would be a data race against a straggling handler.
 	fetchChannel func(s *discordgo.Session, id string) (*discordgo.Channel, error)
+	// sendMessage / createDMChannel are the outbound REST seams — same
+	// write-once rule as fetchChannel (Send runs on the caller's
+	// goroutine), session passed per call.
+	sendMessage     func(ctx context.Context, s *discordgo.Session, channelID, content string) (*discordgo.Message, error)
+	createDMChannel func(ctx context.Context, s *discordgo.Session, userID string) (*discordgo.Channel, error)
 }
 
 // New builds the adapter around a discordgo session. The token is used
@@ -145,6 +162,13 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		fetchChannel: func(s *discordgo.Session, id string) (*discordgo.Channel, error) {
 			return s.Channel(id)
 		},
+		sendMessage: func(ctx context.Context, s *discordgo.Session, channelID, content string) (*discordgo.Message, error) {
+			return s.ChannelMessageSend(channelID, content, discordgo.WithContext(ctx))
+		},
+		createDMChannel: func(ctx context.Context, s *discordgo.Session, userID string) (*discordgo.Channel, error) {
+			return s.UserChannelCreate(userID, discordgo.WithContext(ctx))
+		},
+		dmChannels: make(map[string]string),
 	}
 	a.reset = a.resetSession
 	a.adopt(session)
@@ -174,7 +198,9 @@ func (a *Adapter) adopt(session *discordgo.Session) {
 		default: // a wakeup is already pending
 		}
 	})
+	a.sessionGate.Lock()
 	a.session = session
+	a.sessionGate.Unlock()
 	a.open = session.Open
 	a.closeFn = session.Close
 }
