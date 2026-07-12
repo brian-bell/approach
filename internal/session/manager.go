@@ -36,6 +36,12 @@ type Spec struct {
 	SessionID string
 	ThreadKey string
 	Cwd       string
+	// TransparencyNote is set only on the first turn of a §4.6
+	// degradation successor: the one line the reply must carry —
+	// history was lost, facts intact, starting fresh. The engine
+	// injects it into the turn; the full fact-package seeding of a
+	// fresh session belongs to the context assembler (C6), not here.
+	TransparencyNote string
 }
 
 // Config wires a Manager. ActivationWindow bounds how long a session
@@ -247,6 +253,12 @@ func (m *Manager) touch(ctx context.Context, sessionID string) {
 // below closes the other half — a turn that limps in after expiry must
 // not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
+	return m.startNew(ctx, live, "")
+}
+
+// startNew is StartNew plus the §4.6 transparency note a degradation
+// successor's first turn carries.
+func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note string) error {
 	// The caller's snapshot identifies WHICH session; every durable
 	// fact about it — status, deadline, cwd — is re-read from the row
 	// before the spawn. Engine.Start is a side-effecting call, the one
@@ -294,9 +306,10 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 		return fmt.Errorf("session: first turn for %s not started: %w", current.SessionID, err)
 	}
 	if err := m.engine.Start(turnCtx, Spec{
-		SessionID: current.SessionID,
-		ThreadKey: current.ThreadKey,
-		Cwd:       current.Cwd,
+		SessionID:        current.SessionID,
+		ThreadKey:        current.ThreadKey,
+		Cwd:              current.Cwd,
+		TransparencyNote: note,
 	}); err != nil {
 		return fmt.Errorf("session: first turn for %s: %w", current.SessionID, err)
 	}

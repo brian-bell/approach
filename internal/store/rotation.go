@@ -18,13 +18,27 @@ var ErrNotActive = errors.New("session is not active")
 // half-rotation would strand the thread with no live session (old
 // demoted, successor missing) or two (both live under
 // one_live_session, which the schema refuses anyway).
+func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
+	return retireSession(ctx, db, oldSessionID, successor, "rotated")
+}
+
+// ResumeFailSession is the §4.6 degradation twin of RotateSession: the
+// old row is kept as resume_failed — a rotation CAUSE, preserved for
+// forensics — with the same successor link and creating successor, in
+// the same all-or-nothing shape.
+func ResumeFailSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
+	return retireSession(ctx, db, oldSessionID, successor, "resume_failed")
+}
+
+// retireSession retires a thread's active session into retiredStatus
+// and mints its successor, atomically.
 //
 // Step order is forced by the schema's immediate constraints:
 // demoting the old row FIRST frees one_live_session for the successor
 // insert; the rotated_to link is written LAST because its foreign key
 // needs the successor row to exist. All three inside one transaction,
 // so every intermediate state is invisible.
-func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
+func retireSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session, retiredStatus string) (string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
@@ -39,8 +53,8 @@ func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 	// while inserting thread B's successor — committing a state where A
 	// has no live session and its history links into B's conversation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE sessions SET status = 'rotated' WHERE session_id = ? AND status = 'active' AND thread_key = ?`,
-		oldSessionID, successor.ThreadKey,
+		`UPDATE sessions SET status = ? WHERE session_id = ? AND status = 'active' AND thread_key = ?`,
+		retiredStatus, oldSessionID, successor.ThreadKey,
 	)
 	if err != nil {
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)

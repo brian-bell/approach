@@ -85,7 +85,19 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) e
 	case "creating":
 		return m.StartNew(ctx, live)
 	case "active":
-		return m.Resume(ctx, live)
+		err := m.Resume(ctx, live)
+		if err == nil || !isResumeFailure(err) {
+			return err
+		}
+		// The transcript is unrecoverable — degrade per §4.6 instead of
+		// erroring: old row kept as resume_failed, and THIS event runs
+		// as the fresh successor's first turn, its reply carrying the
+		// transparency note. Amnesia-with-notes, never a hard failure.
+		fresh, derr := m.degradeResumeFailed(ctx, live, cwd)
+		if derr != nil {
+			return fmt.Errorf("session: turn for %s: resume failed (%v) and degradation also failed: %w", threadKey, err, derr)
+		}
+		return m.startNew(ctx, fresh, resumeFailureNote)
 	default:
 		// ResolveLiveSession only returns the two live states; a third
 		// here means the store contract broke — refuse loudly.
