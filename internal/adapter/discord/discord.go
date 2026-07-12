@@ -126,11 +126,14 @@ type Adapter struct {
 	// and discordgo's close path does not join handlers — a write on
 	// rebuild would be a data race against a straggling handler.
 	fetchChannel func(s *discordgo.Session, id string) (*discordgo.Channel, error)
-	// sendMessage / createDMChannel are the outbound REST seams — same
-	// write-once rule as fetchChannel (Send runs on the caller's
-	// goroutine), session passed per call.
+	// sendMessage / createDMChannel / editMessage / typing are the
+	// outbound REST seams — same write-once rule as fetchChannel
+	// (Send and Relay run on caller goroutines), session passed per
+	// call.
 	sendMessage     func(ctx context.Context, s *discordgo.Session, channelID, content string) (*discordgo.Message, error)
 	createDMChannel func(ctx context.Context, s *discordgo.Session, userID string) (*discordgo.Channel, error)
+	editMessage     func(ctx context.Context, s *discordgo.Session, channelID, messageID, content string) (*discordgo.Message, error)
+	typing          func(ctx context.Context, s *discordgo.Session, channelID string) error
 }
 
 // New builds the adapter around a discordgo session. The token is used
@@ -167,6 +170,12 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		},
 		createDMChannel: func(ctx context.Context, s *discordgo.Session, userID string) (*discordgo.Channel, error) {
 			return s.UserChannelCreate(userID, discordgo.WithContext(ctx))
+		},
+		editMessage: func(ctx context.Context, s *discordgo.Session, channelID, messageID, content string) (*discordgo.Message, error) {
+			return s.ChannelMessageEdit(channelID, messageID, content, discordgo.WithContext(ctx))
+		},
+		typing: func(ctx context.Context, s *discordgo.Session, channelID string) error {
+			return s.ChannelTyping(channelID, discordgo.WithContext(ctx))
 		},
 		dmChannels: make(map[string]string),
 	}

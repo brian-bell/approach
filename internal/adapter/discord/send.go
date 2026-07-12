@@ -31,17 +31,7 @@ func (a *Adapter) Send(ctx context.Context, threadKey, text string) (string, err
 	}
 	msg, err := a.sendMessage(ctx, a.currentSession(), channelID, text)
 	if err != nil {
-		// A DM send failure invalidates the cached user→channel
-		// mapping: the platform can re-mint a DM channel (the reason
-		// the §6 dm key holds the USER id), and a permanently cached
-		// stale id would wedge every outbox retry until restart.
-		// Invalidating on ANY error over-forgets on transients, which
-		// only costs the retry one idempotent UserChannelCreate.
-		if userID, ok := strings.CutPrefix(threadKey, "discord:dm:"); ok {
-			a.dmGate.Lock()
-			delete(a.dmChannels, userID)
-			a.dmGate.Unlock()
-		}
+		a.invalidateDMChannel(threadKey)
 		return "", fmt.Errorf("discord: send to %s: %w", threadKey, err)
 	}
 	if msg == nil || msg.ID == "" {
@@ -87,6 +77,24 @@ func (a *Adapter) resolveSendChannel(ctx context.Context, threadKey string) (str
 	a.dmChannels[userID] = ch.ID
 	a.dmGate.Unlock()
 	return ch.ID, nil
+}
+
+// invalidateDMChannel drops the cached user→channel mapping behind a
+// dm thread key after a send failure: the platform can re-mint a DM
+// channel (the reason the §6 dm key holds the USER id), and a
+// permanently cached stale id would wedge every retry — outbox resend
+// or relayed turn alike — until restart. Invalidating on ANY error
+// over-forgets on transients, which only costs the retry one
+// idempotent UserChannelCreate. Every outbound path (Send, Relay)
+// must route its send failures through here. No-op for non-DM keys.
+func (a *Adapter) invalidateDMChannel(threadKey string) {
+	userID, ok := strings.CutPrefix(threadKey, "discord:dm:")
+	if !ok {
+		return
+	}
+	a.dmGate.Lock()
+	delete(a.dmChannels, userID)
+	a.dmGate.Unlock()
 }
 
 // currentSession snapshots the session pointer under the gate: Send
