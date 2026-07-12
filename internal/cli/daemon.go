@@ -21,6 +21,7 @@ import (
 	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
+	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
 )
 
@@ -154,20 +155,35 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		return 1
 	}
 
-	// The adapter is built only now — its ingest handler writes to the
-	// store, which had to open (and migrate, and seed) first. The
-	// credential was already proven readable by validateDiscordAdapter
-	// above, so a failure here is unexpected but still unrecoverable.
-	runner, err := newDiscordRunner(cfg, db, logger)
-	if err != nil {
-		logger.Error("discord adapter", "error", err.Error())
-		return exitUnrecoverable
-	}
-
 	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
+
+	// The §4.1 router: per-thread queues over the events table, rebuilt
+	// BEFORE ingest goes live — restart recovery (parking crash-
+	// interrupted turns, re-indexing queued ones) must finish before new
+	// traffic can interleave with it. A rebuild that cannot write its
+	// parks is a startup refusal, not a degraded boot.
+	queues := router.New(ctx, db, router.Options{
+		Handler: placeholderTurn(logger),
+		Logger:  logger,
+	})
+	if err := queues.Rebuild(ctx); err != nil {
+		logger.Error("rebuild event queues", "error", err.Error())
+		return 1
+	}
+
+	// The adapter is built only now — its ingest handler persists through
+	// the router into the store, which had to open (and migrate, and
+	// seed, and rebuild) first. The credential was already proven
+	// readable by validateDiscordAdapter above, so a failure here is
+	// unexpected but still unrecoverable.
+	runner, err := newDiscordRunner(cfg, db, queues, logger)
+	if err != nil {
+		logger.Error("discord adapter", "error", err.Error())
+		return exitUnrecoverable
+	}
 
 	// The adapter runs supervised: Run only returns on cancellation
 	// (drain/signal) or a terminal gateway refusal — retryable failures
@@ -193,9 +209,12 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// Serve has returned (drain, signal, or adapter-triggered cancel):
 	// stop the adapter and WAIT for it — the ingest path must be dead
 	// before the deferred db.Close runs, or a message received during
-	// shutdown races a closing store (§4.1).
+	// shutdown races a closing store (§4.1). The router drains after
+	// the adapter: Wait requires producers quiesced first, and an
+	// in-flight turn must finish its writes before the store closes.
 	cancel()
 	<-adapterDone
+	queues.Wait()
 	if adapterErr != nil {
 		logger.Error("discord adapter terminated", "error", adapterErr.Error())
 		return exitUnrecoverable
@@ -222,7 +241,7 @@ type adapterRunner interface {
 // run": no config, no discord channel, or a dormant channel without a
 // token_file — validateDiscordAdapter already warned about that
 // loudly before the store opened.
-var newDiscordRunner = func(cfg *config.Config, db *sql.DB, logger *slog.Logger) (adapterRunner, error) {
+var newDiscordRunner = func(cfg *config.Config, db *sql.DB, queues *router.Queues, logger *slog.Logger) (adapterRunner, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -234,11 +253,24 @@ var newDiscordRunner = func(cfg *config.Config, db *sql.DB, logger *slog.Logger)
 	if err != nil {
 		return nil, err
 	}
-	a, err := discord.New(token, discordIngest(db, ch.Auth, logger, time.Now), logger)
+	a, err := discord.New(token, discordIngest(queues, db, ch.Auth, logger, time.Now), logger)
 	if err != nil {
 		return nil, err
 	}
 	return a, nil
+}
+
+// placeholderTurn is the M1 scaffold handler: the queue claims,
+// serializes, and survives restarts NOW, but the turn flows that
+// resolve a session and run the engine land with x6n.2.5/2.6/2.9 —
+// so dispatch deliberately leaves the row 'received' (durable, re-
+// indexed on every restart, visible in the table) rather than faking
+// a lifecycle transition no engine performed.
+func placeholderTurn(logger *slog.Logger) router.Handler {
+	return func(_ context.Context, ev store.QueuedEvent) {
+		logger.Debug("turn dispatch not yet wired — event stays durably queued (x6n.2.5)",
+			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+	}
 }
 
 // validateDiscordAdapter proves the C1 Discord adapter COULD start —
