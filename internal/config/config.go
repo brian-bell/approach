@@ -214,6 +214,15 @@ func Parse(r io.Reader) (*Config, error) {
 			}
 		}
 	}
+	// Same presence-vs-omission rule for token_file: an explicitly empty
+	// path would decode like an omitted key and downgrade a configured
+	// credential mistake to the dormant-channel warning instead of a
+	// startup refusal.
+	for name, ch := range c.Channels {
+		if ch.TokenFile == "" && md.IsDefined("channels", name, "token_file") {
+			errs = append(errs, fmt.Errorf("config: channels.%s.token_file: empty path — omit the key for a dormant channel, or point it at the credential file", name))
+		}
+	}
 	errs = append(errs, c.validate())
 	if err := errors.Join(errs...); err != nil {
 		return nil, err

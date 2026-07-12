@@ -101,6 +101,15 @@ func TestChannels_TokenFile(t *testing.T) {
 			"[channels.disocrd]\nauth = \"strong\"\ntoken_file = \"/run/credentials/approach/discord\"\n",
 			true,
 		},
+		{
+			// An explicitly empty token_file decodes to the same zero
+			// value as an omitted key, which would downgrade a configured
+			// credential mistake to the dormant-channel warning instead
+			// of a startup refusal.
+			"explicitly empty token_file rejected",
+			"[channels.discord]\nauth = \"strong\"\ntoken_file = \"\"\n",
+			true,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
