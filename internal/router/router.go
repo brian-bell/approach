@@ -148,12 +148,29 @@ func (q *Queues) Enqueue(ev store.QueuedEvent) {
 // order, so per-thread FIFO order is reconstructed exactly. Call before
 // ingest goes live: Rebuild enqueues directly, relying on the scan's
 // ordering rather than the per-thread ingest lock.
+//
+// A row found in 'processing' was mid-turn when the daemon died. Its
+// side effects are mechanically unknowable (the email may or may not
+// have gone out), so it parks as interrupted — NEVER auto-rerun (§4.6)
+// — out-of-band, so the thread's queue keeps flowing. Surfacing the
+// parked turn to its originating thread with a retry offer is the §4.6
+// delivery flow's job (epic 1.3); the park here is the durable state it
+// reads from. A park that cannot be written is a startup refusal: booting
+// anyway would either replay the turn later or lose it from view.
 func (q *Queues) Rebuild(ctx context.Context) error {
 	rows, err := store.UnprocessedEvents(ctx, q.db)
 	if err != nil {
 		return fmt.Errorf("router: rebuild queues: %w", err)
 	}
 	for _, ev := range rows {
+		if ev.Status == "processing" {
+			if err := store.ParkEvent(ctx, q.db, ev.ID, q.now().Unix()); err != nil {
+				return fmt.Errorf("router: rebuild queues: park crash-interrupted event: %w", err)
+			}
+			q.logger.Warn("crash-interrupted event parked as interrupted — never auto-rerun (§4.6)",
+				"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+			continue
+		}
 		q.Enqueue(ev)
 	}
 	return nil

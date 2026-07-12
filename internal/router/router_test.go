@@ -163,13 +163,17 @@ func TestRebuildDispatchesUnprocessed(t *testing.T) {
 	db := mustOpen(t)
 	bg := context.Background()
 
-	for i, tk := range []string{"discord:dm:a", "discord:dm:a", "discord:dm:b"} {
+	for i, tk := range []string{"discord:dm:a", "discord:dm:a", "discord:dm:b", "discord:dm:c"} {
 		if _, _, err := store.InsertEvent(bg, db, storeEvent(int64(i+1), tk)); err != nil {
 			t.Fatalf("InsertEvent: %v", err)
 		}
 	}
 	if _, err := db.Exec(`UPDATE events SET status = 'completed' WHERE dedup_key = 'discord:msg:1'`); err != nil {
 		t.Fatalf("advance msg 1: %v", err)
+	}
+	// msg 4 was mid-turn at the crash: §4.6 says interrupted, never rerun.
+	if _, err := db.Exec(`UPDATE events SET status = 'processing' WHERE dedup_key = 'discord:msg:4'`); err != nil {
+		t.Fatalf("mark msg 4 processing: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(bg)
@@ -201,6 +205,16 @@ func TestRebuildDispatchesUnprocessed(t *testing.T) {
 		if k == "discord:msg:1" {
 			t.Fatalf("completed event re-dispatched after restart: %v", got)
 		}
+		if k == "discord:msg:4" {
+			t.Fatalf("crash-interrupted processing event re-ran on restart — §4.6 forbids side-effect replay: %v", got)
+		}
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM events WHERE dedup_key = 'discord:msg:4'`).Scan(&status); err != nil {
+		t.Fatalf("read back msg 4: %v", err)
+	}
+	if status != "interrupted" {
+		t.Errorf("crash-interrupted event status = %q after Rebuild, want interrupted (§4.6)", status)
 	}
 }
 
