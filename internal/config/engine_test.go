@@ -12,6 +12,14 @@ const validEngine = `
 [engine]
 bin = "/usr/local/bin/claude"
 version = "2.1.199"
+hooks = ["Stop"]
+`
+
+// engineNoHooks is the base for cases that supply their own hooks key.
+const engineNoHooks = `
+[engine]
+bin = "/usr/local/bin/claude"
+version = "2.1.199"
 `
 
 // TestEngineSection: the §2 pins as config — binary path, version,
@@ -77,14 +85,16 @@ func TestEngineValidation(t *testing.T) {
 	cases := []struct {
 		name, engine, wantErr string
 	}{
-		{"missing bin", "[engine]\nversion = \"2.1.199\"\n", "engine.bin"},
-		{"relative bin", "[engine]\nbin = \"claude\"\nversion = \"2.1.199\"\n", "engine.bin"},
-		{"missing version", "[engine]\nbin = \"/usr/local/bin/claude\"\n", "engine.version"},
+		{"missing bin", "[engine]\nversion = \"2.1.199\"\nhooks = [\"Stop\"]\n", "engine.bin"},
+		{"relative bin", "[engine]\nbin = \"claude\"\nversion = \"2.1.199\"\nhooks = [\"Stop\"]\n", "engine.bin"},
+		{"missing version", "[engine]\nbin = \"/usr/local/bin/claude\"\nhooks = [\"Stop\"]\n", "engine.version"},
 		{"zero max_turns", validEngine + "max_turns = 0\n", "engine.max_turns"},
 		{"negative max_turns", validEngine + "max_turns = -3\n", "engine.max_turns"},
 		{"sub-second turn_timeout", validEngine + "turn_timeout = \"500ms\"\n", "engine.turn_timeout"},
-		{"duplicate hook", validEngine + "hooks = [\"Stop\", \"Stop\"]\n", "engine.hooks"},
-		{"empty hook name", validEngine + "hooks = [\"\"]\n", "engine.hooks"},
+		{"missing hooks (no enforcement substrate)", engineNoHooks, "engine.hooks"},
+		{"empty hooks list", engineNoHooks + "hooks = []\n", "engine.hooks"},
+		{"duplicate hook", engineNoHooks + "hooks = [\"Stop\", \"Stop\"]\n", "engine.hooks"},
+		{"empty hook name", engineNoHooks + "hooks = [\"\"]\n", "engine.hooks"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -349,6 +349,13 @@ func (c *Config) validateEngine(fail failFunc) {
 	if e.TurnTimeout < Duration(time.Second) {
 		fail("engine.turn_timeout must be at least 1s, got %v (§11 — a turn without a wall clock is the runaway shape)", e.TurnTimeout.Duration())
 	}
+	// The enrolled set must be DECLARED, not defaulted or empty: hooks
+	// are the enforcement and reflection substrate (§2), and an engine
+	// pinned with zero hooks is the un-enforced shape §7 forbids —
+	// omitting the key must not quietly produce it.
+	if len(e.Hooks) == 0 {
+		fail("engine.hooks must declare the enrolled hook set — an engine with no hooks has no enforcement substrate (§2, §7)")
+	}
 	seen := make(map[string]bool)
 	for i, h := range e.Hooks {
 		if h == "" {

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"syscall"
 	"time"
 )
 
@@ -35,13 +36,28 @@ func VerifyVersion(ctx context.Context, bin, pinned string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "--version").Output()
+	// Same teardown discipline as a turn: the probe leads its own
+	// process group, so a malformed or substituted binary that forks a
+	// pipe-holding descendant cannot wedge daemon startup past the
+	// timeout — and its output is bounded, not trusted.
+	cmd := exec.CommandContext(ctx, bin, "--version")
+	out := &boundedBuffer{limit: 4096}
+	cmd.Stdout = out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	}
+	cmd.WaitDelay = 5 * time.Second
+	err := cmd.Run()
+	if cmd.Process != nil && ctx.Err() != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // straggler sweep; ESRCH fine
+	}
 	if err != nil {
 		return fmt.Errorf("engine: version probe %s --version: %w", bin, err)
 	}
-	got := semver.FindString(string(out))
+	got := semver.FindString(out.String())
 	if got == "" {
-		return fmt.Errorf("engine: version probe: no x.y.z token in output %q — cannot prove the pin (§2)", excerpt(string(out)))
+		return fmt.Errorf("engine: version probe: no x.y.z token in output %q — cannot prove the pin (§2)", excerpt(out.String()))
 	}
 	if got != pinned {
 		return fmt.Errorf("engine: version drift: binary reports %s, config pins %s — redeploy the pinned CLI or bump the pin deliberately (§2)", got, pinned)

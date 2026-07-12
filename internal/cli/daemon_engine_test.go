@@ -36,6 +36,7 @@ heartbeat = "claude-haiku-4-5"
 [engine]
 bin = %q
 version = %q
+hooks = ["SessionStart", "Stop"]
 `, bin, wantPin)
 	if err := os.WriteFile(filepath.Join(dir, "approach.toml"), []byte(cfgBody), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
