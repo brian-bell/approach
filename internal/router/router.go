@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"time"
 
 	"github.com/brian-bell/approach/internal/store"
 )
@@ -28,39 +29,106 @@ import (
 // gracefully", not as this event's failure.
 type Handler func(context.Context, store.QueuedEvent)
 
+// Options configures New. Handler and Logger are required; Now defaults
+// to time.Now — injectable so tests own the clock (§6 convention).
+type Options struct {
+	Handler Handler
+	Logger  *slog.Logger
+	Now     func() time.Time
+}
+
 // Queues is the per-thread dispatch index. Zero value is not usable —
-// New wires the lifetime context, handler, and logger.
+// New wires the store handle, lifetime context, handler, and logger.
 type Queues struct {
 	ctx     context.Context
+	db      *sql.DB
 	handler Handler
 	logger  *slog.Logger
+	now     func() time.Time
 
 	mu      sync.Mutex
-	pending map[string][]store.QueuedEvent // per-thread FIFO, enqueue order
+	pending map[string][]store.QueuedEvent // per-thread FIFO, receipt (id) order
 	claimed map[string]bool                // threads with a live drain goroutine
+	ingest  map[string]*sync.Mutex         // per-thread persist+enqueue serialization
 	wg      sync.WaitGroup                 // one per live drain goroutine
 }
 
-// New builds the queue index. ctx bounds every dispatch: once it is
-// cancelled no NEW turn starts — in-flight handlers finish (see Wait)
-// and everything still queued stays in the events table for the next
-// restart's Rebuild.
-func New(ctx context.Context, handler Handler, logger *slog.Logger) *Queues {
+// New builds the queue index over db's events table. ctx bounds every
+// dispatch: once it is cancelled no NEW turn starts — in-flight
+// handlers finish (see Wait) and everything still queued stays in the
+// events table for the next restart's Rebuild.
+func New(ctx context.Context, db *sql.DB, opts Options) *Queues {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &Queues{
 		ctx:     ctx,
-		handler: handler,
-		logger:  logger,
+		db:      db,
+		handler: opts.Handler,
+		logger:  opts.Logger,
+		now:     now,
 		pending: make(map[string][]store.QueuedEvent),
 		claimed: make(map[string]bool),
+		ingest:  make(map[string]*sync.Mutex),
 	}
 }
 
+// Persist is the ingest chokepoint for a live daemon: write the event
+// row (§4.1: durability before anything), then index it — atomically
+// per thread. The per-thread lock exists because receipt order IS
+// dispatch order: without it, two concurrent ingests on one thread can
+// insert rows 1,2 but enqueue 2,1 if the first goroutine is descheduled
+// between insert and enqueue — a FIFO violation Rebuild would never
+// have produced. A collapsed duplicate (inserted=false) is not
+// enqueued: the original row is either already indexed or already
+// processed, and re-enqueueing it would double-dispatch (§4.1: dup
+// delivery → one turn).
+func (q *Queues) Persist(ctx context.Context, ev store.Event) (inserted bool, err error) {
+	lock := q.ingestLock(ev.ThreadKey)
+	lock.Lock()
+	defer lock.Unlock()
+	id, inserted, err := store.InsertEvent(ctx, q.db, ev)
+	if err != nil || !inserted {
+		return inserted, err
+	}
+	q.Enqueue(store.QueuedEvent{
+		ID:        id,
+		DedupKey:  ev.DedupKey,
+		ThreadKey: ev.ThreadKey,
+		Kind:      ev.Kind,
+		Trust:     ev.Trust,
+		Payload:   ev.Payload,
+		Status:    "received",
+		Received:  ev.Received,
+	})
+	return true, nil
+}
+
+// ingestLock returns the per-thread persist+enqueue mutex, creating it
+// on first use. Locks accumulate one per thread_key ever seen — bounded
+// by the thread population, and a lock is a few words; an eviction
+// scheme would risk two goroutines holding "the" lock for one thread.
+func (q *Queues) ingestLock(threadKey string) *sync.Mutex {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	l, ok := q.ingest[threadKey]
+	if !ok {
+		l = &sync.Mutex{}
+		q.ingest[threadKey] = l
+	}
+	return l
+}
+
 // Enqueue appends the event to its thread's FIFO and claims the thread
-// — spawns its drain goroutine — if no claim is live. Called by ingest
-// after the row is durably inserted (§4.1: persist before anything),
-// and by Rebuild on restart. After shutdown begins this is a no-op:
-// the row is already durable, and starting a turn against a store
-// that is about to close would lose the turn's writes, not the event.
+// — spawns its drain goroutine — if no claim is live. Callers own the
+// FIFO contract: events for one thread must be enqueued in receipt (id)
+// order. Rebuild satisfies it by scanning in id order before ingest is
+// live; concurrent ingest must go through Persist, whose per-thread
+// lock makes insert+enqueue atomic. After shutdown begins this is a
+// no-op: the row is already durable, and starting a turn against a
+// store that is about to close would lose the turn's writes, not the
+// event.
 func (q *Queues) Enqueue(ev store.QueuedEvent) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -77,9 +145,11 @@ func (q *Queues) Enqueue(ev store.QueuedEvent) {
 
 // Rebuild reloads the index from the durable queue (§4.1: rebuilt from
 // the table on restart). UnprocessedEvents returns rows in id (receipt)
-// order, so per-thread FIFO order is reconstructed exactly.
-func (q *Queues) Rebuild(ctx context.Context, db *sql.DB) error {
-	rows, err := store.UnprocessedEvents(ctx, db)
+// order, so per-thread FIFO order is reconstructed exactly. Call before
+// ingest goes live: Rebuild enqueues directly, relying on the scan's
+// ordering rather than the per-thread ingest lock.
+func (q *Queues) Rebuild(ctx context.Context) error {
+	rows, err := store.UnprocessedEvents(ctx, q.db)
 	if err != nil {
 		return fmt.Errorf("router: rebuild queues: %w", err)
 	}
@@ -123,18 +193,28 @@ func (q *Queues) drain(threadKey string) {
 	}
 }
 
-// dispatch runs one turn, converting a handler panic into a loud log
-// instead of a dead thread queue: the daemon must survive a bad turn
-// (§4.6 — every failure ends visible; a wedged queue that silently
-// ignores a thread forever is the failure mode this forecloses). The
-// event row keeps whatever status the handler reached — recovery
-// reasons from the table, not from this goroutine's fate.
+// dispatch runs one turn. A handler panic must end in a durable,
+// human-visible state, not a log line the queue forgets (§4.6): the
+// event was already removed from the RAM index, so without a store
+// write it would strand — row still 'received'/'processing', never
+// rescheduled until a daemon restart. So a panicking turn parks its
+// event as interrupted: never auto-retried (the panic's side effects
+// are unknowable), but durably out-of-band where the §4.6 surfacing
+// flows find it. The thread's queue itself continues — one bad turn
+// must not silence a thread.
 func (q *Queues) dispatch(ev store.QueuedEvent) {
 	defer func() {
 		if p := recover(); p != nil {
-			q.logger.Error("turn handler panicked — thread queue continues",
+			q.logger.Error("turn handler panicked — parking event as interrupted (§4.6)",
 				"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey,
 				"panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			// Background context: the panic may be unwinding during
+			// shutdown, and parking is exactly the write that must not
+			// be skipped then.
+			if err := store.ParkEvent(context.Background(), q.db, ev.ID, q.now().Unix()); err != nil {
+				q.logger.Error("park after panic failed — event stranded until restart recovery",
+					"dedup_key", ev.DedupKey, "error", err.Error())
+			}
 		}
 	}()
 	q.handler(q.ctx, ev)

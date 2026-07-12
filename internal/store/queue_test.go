@@ -27,7 +27,7 @@ func TestUnprocessedEventsOrderAndFilter(t *testing.T) {
 				`{"dedup_key":"discord:msg:%d","thread_key":"%s","kind":"message","trust":"owner"}`, i+1, tk),
 			Received: int64(1700000000 + i),
 		}
-		if _, err := store.InsertEvent(ctx, db, ev); err != nil {
+		if _, _, err := store.InsertEvent(ctx, db, ev); err != nil {
 			t.Fatalf("InsertEvent %d: %v", i+1, err)
 		}
 	}
@@ -73,6 +73,48 @@ func TestUnprocessedEventsOrderAndFilter(t *testing.T) {
 	}
 	if rows[1].Status != "processing" {
 		t.Errorf("crash-interrupted row status = %q, want processing preserved for recovery (§4.6)", rows[1].Status)
+	}
+}
+
+// TestParkEventGuards: parking only advances rows still owed a turn —
+// a row the handler already finished (completed, dead) must not be
+// resurrected as visible failure, while received/processing rows park
+// as interrupted (§4.6).
+func TestParkEventGuards(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	for i, status := range []string{"received", "processing", "completed"} {
+		ev := store.Event{
+			DedupKey:  fmt.Sprintf("discord:msg:%d", i+1),
+			ThreadKey: "discord:dm:a",
+			Kind:      "message",
+			Trust:     "owner",
+			Payload: fmt.Sprintf(
+				`{"dedup_key":"discord:msg:%d","thread_key":"discord:dm:a","kind":"message","trust":"owner"}`, i+1),
+			Received: int64(1700000000 + i),
+		}
+		id, _, err := store.InsertEvent(ctx, db, ev)
+		if err != nil {
+			t.Fatalf("InsertEvent %d: %v", i+1, err)
+		}
+		if _, err := db.Exec(`UPDATE events SET status = ? WHERE id = ?`, status, id); err != nil {
+			t.Fatalf("set status %s: %v", status, err)
+		}
+		if err := store.ParkEvent(ctx, db, id, 1700009999); err != nil {
+			t.Fatalf("ParkEvent(%s): %v", status, err)
+		}
+		var got string
+		if err := db.QueryRow(`SELECT status FROM events WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		want := "interrupted"
+		if status == "completed" {
+			want = "completed"
+		}
+		if got != want {
+			t.Errorf("ParkEvent over %s row: status = %q, want %q", status, got, want)
+		}
 	}
 }
 

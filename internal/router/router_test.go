@@ -2,6 +2,7 @@ package router_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -24,7 +25,22 @@ type discard struct{}
 
 func (discard) Write(p []byte) (int, error) { return len(p), nil }
 
-// qe builds a minimal queued event for dispatch tests.
+// mustOpen opens a store in a temp dir, closed via cleanup.
+func mustOpen(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "state", "approach.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	return db
+}
+
+// qe builds a minimal queued event for direct-Enqueue dispatch tests.
 func qe(id int64, threadKey string) store.QueuedEvent {
 	return store.QueuedEvent{
 		ID:        id,
@@ -38,24 +54,18 @@ func qe(id int64, threadKey string) store.QueuedEvent {
 	}
 }
 
-// collect returns a handler that appends each event's dedup key to a
-// shared slice and signals on done, plus accessors for the recording.
-func collect() (handler func(context.Context, store.QueuedEvent), keys func() []string, calls *atomic.Int64) {
-	var mu sync.Mutex
-	var got []string
-	calls = new(atomic.Int64)
-	handler = func(_ context.Context, ev store.QueuedEvent) {
-		mu.Lock()
-		got = append(got, ev.DedupKey)
-		mu.Unlock()
-		calls.Add(1)
+// storeEvent builds a valid insertable event (payload mirrors columns,
+// as InsertEvent demands) for tests that go through the real table.
+func storeEvent(n int64, threadKey string) store.Event {
+	return store.Event{
+		DedupKey:  fmt.Sprintf("discord:msg:%d", n),
+		ThreadKey: threadKey,
+		Kind:      "message",
+		Trust:     "owner",
+		Payload: fmt.Sprintf(
+			`{"dedup_key":"discord:msg:%d","thread_key":"%s","kind":"message","trust":"owner"}`, n, threadKey),
+		Received: 1700000000 + n,
 	}
-	keys = func() []string {
-		mu.Lock()
-		defer mu.Unlock()
-		return append([]string(nil), got...)
-	}
-	return handler, keys, calls
 }
 
 // waitFor polls until cond is true or the deadline passes.
@@ -80,17 +90,20 @@ func TestFIFOWithinThread(t *testing.T) {
 	var inFlight, maxInFlight atomic.Int64
 	var mu sync.Mutex
 	var got []string
-	q := router.New(ctx, func(_ context.Context, ev store.QueuedEvent) {
-		n := inFlight.Add(1)
-		if m := maxInFlight.Load(); n > m {
-			maxInFlight.Store(n)
-		}
-		time.Sleep(time.Millisecond) // widen any overlap window
-		mu.Lock()
-		got = append(got, ev.DedupKey)
-		mu.Unlock()
-		inFlight.Add(-1)
-	}, discardLogger())
+	q := router.New(ctx, nil, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			n := inFlight.Add(1)
+			if m := maxInFlight.Load(); n > m {
+				maxInFlight.Store(n)
+			}
+			time.Sleep(time.Millisecond) // widen any overlap window
+			mu.Lock()
+			got = append(got, ev.DedupKey)
+			mu.Unlock()
+			inFlight.Add(-1)
+		},
+		Logger: discardLogger(),
+	})
 
 	const n = 20
 	for i := int64(1); i <= n; i++ {
@@ -118,21 +131,24 @@ func TestThreadsRunConcurrently(t *testing.T) {
 	defer cancel()
 
 	bDone := make(chan struct{})
-	q := router.New(ctx, func(_ context.Context, ev store.QueuedEvent) {
-		switch ev.ThreadKey {
-		case "discord:dm:a":
-			// Thread a parks until thread b's event completes: if
-			// dispatch were global-serial this would deadlock the test
-			// (and trip its timeout).
-			select {
-			case <-bDone:
-			case <-time.After(5 * time.Second):
-				t.Error("thread a blocked thread b — dispatch is not per-thread")
+	q := router.New(ctx, nil, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			switch ev.ThreadKey {
+			case "discord:dm:a":
+				// Thread a parks until thread b's event completes: if
+				// dispatch were global-serial this would deadlock the
+				// test (and trip its timeout).
+				select {
+				case <-bDone:
+				case <-time.After(5 * time.Second):
+					t.Error("thread a blocked thread b — dispatch is not per-thread")
+				}
+			case "discord:dm:b":
+				close(bDone)
 			}
-		case "discord:dm:b":
-			close(bDone)
-		}
-	}, discardLogger())
+		},
+		Logger: discardLogger(),
+	})
 
 	q.Enqueue(qe(1, "discord:dm:a"))
 	q.Enqueue(qe(2, "discord:dm:b"))
@@ -144,28 +160,11 @@ func TestThreadsRunConcurrently(t *testing.T) {
 // (§4.1) — completed history must not re-dispatch, and per-thread order
 // is receipt (id) order.
 func TestRebuildDispatchesUnprocessed(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "state", "approach.db"))
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Errorf("close: %v", err)
-		}
-	})
+	db := mustOpen(t)
 	bg := context.Background()
 
 	for i, tk := range []string{"discord:dm:a", "discord:dm:a", "discord:dm:b"} {
-		ev := store.Event{
-			DedupKey:  fmt.Sprintf("discord:msg:%d", i+1),
-			ThreadKey: tk,
-			Kind:      "message",
-			Trust:     "owner",
-			Payload: fmt.Sprintf(
-				`{"dedup_key":"discord:msg:%d","thread_key":"%s","kind":"message","trust":"owner"}`, i+1, tk),
-			Received: int64(1700000000 + i),
-		}
-		if _, err := store.InsertEvent(bg, db, ev); err != nil {
+		if _, _, err := store.InsertEvent(bg, db, storeEvent(int64(i+1), tk)); err != nil {
 			t.Fatalf("InsertEvent: %v", err)
 		}
 	}
@@ -175,15 +174,26 @@ func TestRebuildDispatchesUnprocessed(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(bg)
 	defer cancel()
-	handler, keys, calls := collect()
-	q := router.New(ctx, handler, discardLogger())
-	if err := q.Rebuild(bg, db); err != nil {
+	var mu sync.Mutex
+	var got []string
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			mu.Lock()
+			got = append(got, ev.DedupKey)
+			mu.Unlock()
+			calls.Add(1)
+		},
+		Logger: discardLogger(),
+	})
+	if err := q.Rebuild(bg); err != nil {
 		t.Fatalf("Rebuild: %v", err)
 	}
 	waitFor(t, func() bool { return calls.Load() == 2 }, "rebuild dispatch")
 	q.Wait()
 
-	got := keys()
+	mu.Lock()
+	defer mu.Unlock()
 	if len(got) != 2 {
 		t.Fatalf("dispatched %v, want exactly msgs 2 and 3", got)
 	}
@@ -205,15 +215,18 @@ func TestEnqueueDuringProcessing(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var got []string
-	q := router.New(ctx, func(_ context.Context, ev store.QueuedEvent) {
-		if ev.ID == 1 {
-			close(started)
-			<-release
-		}
-		mu.Lock()
-		got = append(got, ev.DedupKey)
-		mu.Unlock()
-	}, discardLogger())
+	q := router.New(ctx, nil, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			if ev.ID == 1 {
+				close(started)
+				<-release
+			}
+			mu.Lock()
+			got = append(got, ev.DedupKey)
+			mu.Unlock()
+		},
+		Logger: discardLogger(),
+	})
 
 	q.Enqueue(qe(1, "discord:dm:a"))
 	<-started // thread a is mid-turn
@@ -228,28 +241,128 @@ func TestEnqueueDuringProcessing(t *testing.T) {
 	}
 }
 
-// TestHandlerPanicDoesNotWedgeThread: a panicking turn is a loud log,
-// not a wedged queue — the next event on the thread still runs (§4.6:
-// every failure ends in a durable, visible state; a silently dead
-// thread queue is the opposite).
-func TestHandlerPanicDoesNotWedgeThread(t *testing.T) {
+// TestPersistOrdersConcurrentIngest: receipt order IS dispatch order,
+// even when ingests race on one thread (§4.1). Without the per-thread
+// persist+enqueue lock, a goroutine descheduled between InsertEvent and
+// Enqueue lets a younger row jump the queue — Rebuild would never
+// produce that order, and the live daemon must not either.
+func TestPersistOrdersConcurrentIngest(t *testing.T) {
+	db := mustOpen(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	var handled atomic.Int64
-	q := router.New(ctx, func(_ context.Context, ev store.QueuedEvent) {
-		if ev.ID == 1 {
-			panic("engine exploded")
-		}
-		handled.Add(1)
-	}, discardLogger())
+	var mu sync.Mutex
+	var got []int64
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			mu.Lock()
+			got = append(got, ev.ID)
+			mu.Unlock()
+			calls.Add(1)
+		},
+		Logger: discardLogger(),
+	})
 
-	q.Enqueue(qe(1, "discord:dm:a"))
-	q.Enqueue(qe(2, "discord:dm:a"))
+	const n = 30
+	var wg sync.WaitGroup
+	for i := int64(1); i <= n; i++ {
+		wg.Add(1)
+		go func(i int64) {
+			defer wg.Done()
+			inserted, err := q.Persist(ctx, storeEvent(i, "discord:dm:a"))
+			if err != nil {
+				t.Errorf("Persist %d: %v", i, err)
+			}
+			if !inserted {
+				t.Errorf("Persist %d reported inserted=false on a fresh event", i)
+			}
+		}(i)
+	}
+	wg.Wait()
+	waitFor(t, func() bool { return calls.Load() == n }, "all events dispatched")
+	q.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 1; i < len(got); i++ {
+		if got[i] < got[i-1] {
+			t.Fatalf("dispatch order by row id %v is not receipt order — id %d ran before %d", got, got[i], got[i-1])
+		}
+	}
+}
+
+// TestPersistDuplicateNotEnqueued: a collapsed duplicate must not
+// double-dispatch (§4.1: duplicate delivery → one turn) — the original
+// row is the only claimable copy.
+func TestPersistDuplicateNotEnqueued(t *testing.T) {
+	db := mustOpen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) { calls.Add(1) },
+		Logger:  discardLogger(),
+	})
+
+	if inserted, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil || !inserted {
+		t.Fatalf("first Persist: inserted=%v err=%v", inserted, err)
+	}
+	if inserted, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil || inserted {
+		t.Fatalf("duplicate Persist: inserted=%v err=%v, want false, nil", inserted, err)
+	}
+	q.Wait()
+	if calls.Load() != 1 {
+		t.Errorf("dispatched %d turns for a duplicated delivery, want 1", calls.Load())
+	}
+}
+
+// TestHandlerPanicParksEventAndContinues: a panicking turn must end in
+// a durable, visible state — the event parks as interrupted (§4.6),
+// because its side effects are unknowable and it is no longer in the
+// RAM index — and the thread's next event still runs: one bad turn
+// never silences a thread.
+func TestHandlerPanicParksEventAndContinues(t *testing.T) {
+	db := mustOpen(t)
+	bg := context.Background()
+	for i := int64(1); i <= 2; i++ {
+		if _, _, err := store.InsertEvent(bg, db, storeEvent(i, "discord:dm:a")); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	var handled atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			if ev.DedupKey == "discord:msg:1" {
+				panic("engine exploded")
+			}
+			handled.Add(1)
+		},
+		Logger: discardLogger(),
+		Now:    func() time.Time { return time.Unix(1700009999, 0) },
+	})
+	if err := q.Rebuild(bg); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
 	q.Wait()
 
 	if handled.Load() != 1 {
 		t.Errorf("event after a panicking turn was not dispatched — thread queue wedged")
+	}
+	var status string
+	var updated sql.NullInt64
+	if err := db.QueryRow(`SELECT status, updated FROM events WHERE dedup_key = 'discord:msg:1'`).Scan(&status, &updated); err != nil {
+		t.Fatalf("read back panicked event: %v", err)
+	}
+	if status != "interrupted" {
+		t.Errorf("panicked turn's event status = %q, want interrupted (§4.6 — else it strands until restart)", status)
+	}
+	if !updated.Valid || updated.Int64 != 1700009999 {
+		t.Errorf("parked event updated = %+v, want the injected clock's 1700009999", updated)
 	}
 }
 
@@ -262,13 +375,16 @@ func TestCancelStopsDispatch(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var handled atomic.Int64
-	q := router.New(ctx, func(_ context.Context, ev store.QueuedEvent) {
-		if ev.ID == 1 {
-			close(started)
-			<-release
-		}
-		handled.Add(1)
-	}, discardLogger())
+	q := router.New(ctx, nil, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			if ev.ID == 1 {
+				close(started)
+				<-release
+			}
+			handled.Add(1)
+		},
+		Logger: discardLogger(),
+	})
 
 	q.Enqueue(qe(1, "discord:dm:a"))
 	<-started

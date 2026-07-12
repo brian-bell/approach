@@ -43,7 +43,7 @@ func discordIngest(db *sql.DB, auth string, logger *slog.Logger, now func() time
 			logger.Error("discord event payload marshal failed", "dedup_key", ev.DedupKey, "error", err.Error())
 			return
 		}
-		inserted, err := store.InsertEvent(context.Background(), db, store.Event{
+		_, inserted, err := store.InsertEvent(context.Background(), db, store.Event{
 			DedupKey:  ev.DedupKey,
 			ThreadKey: ev.ThreadKey,
 			Kind:      ev.Kind,
