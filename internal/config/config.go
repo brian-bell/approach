@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,7 +24,25 @@ type Config struct {
 	Channels   map[string]Channel `toml:"channels"`
 	Identities []Identity         `toml:"identity"`
 	Sessions   Sessions           `toml:"sessions"`
+	Engine     *Engine            `toml:"engine"`
 	Policy     Policy             `toml:"policy"`
+}
+
+// Engine is the §2 pin block: which Claude Code binary the daemon
+// spawns, WHICH VERSION it expects (the hook lifecycle is
+// version-sensitive — a silent CLI upgrade changes the enforcement
+// substrate, so the daemon verifies this pin at startup and refuses
+// on drift), the §11 runaway caps, and the enrolled hook set as
+// config — the deterministic-lifecycle events the harness relies on,
+// declared here so drift is reviewable in one place. A pointer:
+// absence means a dormant, engine-less daemon (bootable; adapters and
+// queues still run), which validate skips entirely.
+type Engine struct {
+	Bin         string   `toml:"bin"`          // absolute path; a PATH-resolved engine is not pinned (§7)
+	Version     string   `toml:"version"`      // exact-match verified at startup (§2)
+	MaxTurns    int      `toml:"max_turns"`    // --max-turns per spawn (§11); default 25
+	TurnTimeout Duration `toml:"turn_timeout"` // wall-clock kill per turn (§11); default 10m
+	Hooks       []string `toml:"hooks"`        // enrolled hook set (§2) — consumed by C8/C9 enrollment
 }
 
 // Policy is the §7 capability × trust matrix. STUB in this milestone:
@@ -204,6 +223,17 @@ func Parse(r io.Reader) (*Config, error) {
 		}
 		errs = append(errs, fmt.Errorf("config: unknown keys: %s", strings.Join(keys, ", ")))
 	}
+	// Engine caps default only when OMITTED — an explicit zero is a
+	// validation error, not a silent 25/10m. Needs decode metadata to
+	// tell the two apart, so it lives here rather than in validate.
+	if c.Engine != nil {
+		if !md.IsDefined("engine", "max_turns") {
+			c.Engine.MaxTurns = 25
+		}
+		if !md.IsDefined("engine", "turn_timeout") {
+			c.Engine.TurnTimeout = Duration(10 * time.Minute)
+		}
+	}
 	// An explicitly configured empty action would silently normalize to
 	// deny; only an omitted column may mean deny. Needs decode metadata
 	// to tell the two apart, so it lives here rather than in validate.
@@ -245,6 +275,7 @@ func (c *Config) validate() error {
 	c.validateModels(fail)
 	c.validateChannels(fail)
 	c.validateSessions(fail)
+	c.validateEngine(fail)
 	c.validatePolicy(fail)
 	c.validateIdentities(fail)
 
@@ -296,6 +327,45 @@ func (c *Config) validateSessions(fail failFunc) {
 	}
 	if c.Sessions.TurnCap < 1 {
 		fail("sessions.turn_cap must be >= 1, got %d", c.Sessions.TurnCap)
+	}
+}
+
+func (c *Config) validateEngine(fail failFunc) {
+	e := c.Engine
+	if e == nil {
+		return
+	}
+	if e.Bin == "" {
+		fail("engine.bin is required — the invocation must be pinned to a path (§7)")
+	} else if !filepath.IsAbs(e.Bin) {
+		fail("engine.bin %q is not absolute — a PATH-resolved engine is not pinned (§7)", e.Bin)
+	}
+	if e.Version == "" {
+		fail("engine.version is required — the hook lifecycle is version-sensitive; pin it (§2)")
+	}
+	if e.MaxTurns < 1 {
+		fail("engine.max_turns must be >= 1, got %d (§11 runaway cap)", e.MaxTurns)
+	}
+	if e.TurnTimeout < Duration(time.Second) {
+		fail("engine.turn_timeout must be at least 1s, got %v (§11 — a turn without a wall clock is the runaway shape)", e.TurnTimeout.Duration())
+	}
+	// The enrolled set must be DECLARED, not defaulted or empty: hooks
+	// are the enforcement and reflection substrate (§2), and an engine
+	// pinned with zero hooks is the un-enforced shape §7 forbids —
+	// omitting the key must not quietly produce it.
+	if len(e.Hooks) == 0 {
+		fail("engine.hooks must declare the enrolled hook set — an engine with no hooks has no enforcement substrate (§2, §7)")
+	}
+	seen := make(map[string]bool)
+	for i, h := range e.Hooks {
+		if h == "" {
+			fail("engine.hooks[%d]: empty hook name", i)
+			continue
+		}
+		if seen[h] {
+			fail("engine.hooks[%d]: duplicate hook %q — the enrolled set is a set", i, h)
+		}
+		seen[h] = true
 	}
 }
 

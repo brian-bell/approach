@@ -66,3 +66,16 @@ turn_cap = 50
 owner     = "allow"
 known     = "ask"
 untrusted = "sandbox"
+
+# The Claude Code engine pin (§2, §7, §11). The daemon verifies the
+# binary's --version against this pin at startup and refuses to boot
+# on drift — the hook lifecycle is version-sensitive, so a silent CLI
+# upgrade would change the enforcement substrate. hooks declares the
+# enrolled hook set as config, one reviewable place. Omit the whole
+# section for an engine-less (dormant) daemon.
+[engine]
+bin = "/usr/local/bin/claude"
+version = "2.1.199"
+max_turns = 25        # --max-turns per spawn (§11); default 25
+turn_timeout = "10m"  # wall-clock kill per turn (§11); default 10m
+hooks = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]
