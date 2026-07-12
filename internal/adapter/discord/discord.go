@@ -85,10 +85,11 @@ type Adapter struct {
 	disconnected chan struct{}
 
 	// Seams for the lifecycle tests: production values are the
-	// discordgo session's own methods, a context-aware sleep, and the
-	// wall clock.
+	// discordgo session's own methods, the session rebuild below, a
+	// context-aware sleep, and the wall clock.
 	open    func() error
 	closeFn func() error
+	reset   func() error
 	sleep   func(context.Context, time.Duration) error
 	now     func() time.Time
 }
@@ -113,6 +114,22 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		// changes the error must not carry it out of this package.
 		return nil, errors.New("discord: session construction failed")
 	}
+	a := &Adapter{
+		handle:       handle,
+		log:          logger,
+		disconnected: make(chan struct{}, 1),
+		sleep:        sleepCtx,
+		now:          time.Now,
+	}
+	a.reset = a.resetSession
+	a.adopt(session)
+	return a, nil
+}
+
+// adopt wires a session to the adapter — shared by New and resetSession
+// so a rebuilt session can never silently lose a pinned posture setting
+// or a handler.
+func (a *Adapter) adopt(session *discordgo.Session) {
 	session.Identify.Intents = intents
 	// The adapter owns reconnect (see the constant block above); the
 	// library loop would bypass terminal classification.
@@ -122,19 +139,9 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 	// persist out of order once the handler writes events — the §4.1
 	// receive-order FIFO must not depend on downstream re-serializing.
 	session.SyncEvents = true
-	a := &Adapter{
-		session:      session,
-		handle:       handle,
-		log:          logger,
-		disconnected: make(chan struct{}, 1),
-		open:         session.Open,
-		closeFn:      session.Close,
-		sleep:        sleepCtx,
-		now:          time.Now,
-	}
 	session.AddHandler(a.onMessageCreate)
 	session.AddHandler(func(*discordgo.Session, *discordgo.Connect) {
-		logger.Info("discord gateway connected")
+		a.log.Info("discord gateway connected")
 	})
 	session.AddHandler(func(*discordgo.Session, *discordgo.Disconnect) {
 		select {
@@ -142,7 +149,27 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		default: // a wakeup is already pending
 		}
 	})
-	return a, nil
+	a.session = session
+	a.open = session.Open
+	a.closeFn = session.Close
+}
+
+// resetSession replaces the session with a brand new one so the next
+// Open sends a fresh Identify. It exists because discordgo never clears
+// sessionID/sequence — not on Close, not on error — and Open resumes
+// whenever they're set: after a 4007/4009 the old session's resume
+// state is permanently poisoned and rebuilding is the only exported way
+// to shed it. The token is read back from the session it constructed —
+// still never stored on the adapter (§7).
+func (a *Adapter) resetSession() error {
+	session, err := discordgo.New(a.session.Token)
+	if err != nil {
+		// Same containment as New: no error text that could carry the
+		// token out of this package.
+		return errors.New("discord: session reconstruction failed")
+	}
+	a.adopt(session)
+	return nil
 }
 
 // Run opens the gateway and holds it until ctx is cancelled (drain or
@@ -196,6 +223,15 @@ func (a *Adapter) Run(ctx context.Context) error {
 				}
 				if terminal(err) {
 					return fmt.Errorf("discord: gateway refused the connection — credential or intents problem, a restart cannot fix this: %w", err)
+				}
+				if staleSession(err) {
+					// Retryable, but never with this session: shed the
+					// poisoned resume state so the retry identifies
+					// fresh instead of re-sending the refused resume.
+					if rerr := a.reset(); rerr != nil {
+						return fmt.Errorf("discord: replacing a session the gateway refused to resume: %w", rerr)
+					}
+					a.log.Warn("discord gateway refused to resume — session discarded, next attempt identifies fresh")
 				}
 				delay := backoffDelay(attempt)
 				attempt++
@@ -335,6 +371,27 @@ func terminal(err error) bool {
 	if errors.As(err, &closeErr) {
 		switch closeErr.Code {
 		case 4004, 4012, 4013, 4014:
+			return true
+		}
+	}
+	return false
+}
+
+// staleSession reports whether the gateway refused to RESUME this
+// session: 4007 (invalid seq) and 4009 (session timed out) are
+// retryable, but only with a NEW session — the gateway has already
+// discarded this one. Retrying as-is would loop forever: discordgo's
+// Open resumes whenever sessionID/sequence are set and nothing ever
+// clears them, so the same dead resume would be re-sent until a daemon
+// restart. Mid-stream drops with these codes converge here too: the
+// Disconnect event carries no code, but the blind resume that follows
+// is answered with the same close during Open's handshake, where it
+// surfaces as this error.
+func staleSession(err error) bool {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		switch closeErr.Code {
+		case 4007, 4009:
 			return true
 		}
 	}

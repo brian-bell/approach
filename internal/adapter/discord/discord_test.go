@@ -415,6 +415,92 @@ func TestRunTerminalErrorOnReconnect(t *testing.T) {
 	}
 }
 
+// TestRunDiscardsSessionAfterResumeRefused: close codes 4007 (invalid
+// seq) and 4009 (session timed out) mean the gateway refused to resume
+// THIS session — discordgo keeps sessionID/sequence forever, so Open
+// would retry the same dead resume until the daemon restarts. Those
+// codes must discard the session (fresh Identify) before the retry;
+// every other retryable failure must NOT, or a transient blip would
+// throw away a perfectly resumable session.
+func TestRunDiscardsSessionAfterResumeRefused(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		wantReset bool
+	}{
+		{"4007 invalid seq", &websocket.CloseError{Code: 4007, Text: "Invalid seq."}, true},
+		{"4009 session timed out", &websocket.CloseError{Code: 4009, Text: "Session timed out."}, true},
+		{"4000 unknown error keeps resume state", &websocket.CloseError{Code: 4000, Text: "Unknown error."}, false},
+		{"dial failure keeps resume state", errors.New("dial tcp: connection refused"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestAdapter(t)
+			var opens, resets int
+			resetBeforeRetry := false
+			a.open = func() error {
+				opens++
+				if opens == 1 {
+					return tc.err
+				}
+				resetBeforeRetry = resets == 1
+				return nil
+			}
+			a.closeFn = func() error { return nil }
+			a.reset = func() error { resets++; return nil }
+			a.sleep = func(context.Context, time.Duration) error { return nil }
+
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- a.Run(ctx) }()
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Run did not return")
+			}
+
+			if tc.wantReset && resets != 1 {
+				t.Errorf("resets = %d, want 1 (session must be discarded after %v)", resets, tc.err)
+			}
+			if tc.wantReset && resets == 1 && !resetBeforeRetry {
+				t.Error("session was reset after the retry opened, not before — the retry still resumed the dead session")
+			}
+			if !tc.wantReset && resets != 0 {
+				t.Errorf("resets = %d, want 0 — a resumable failure must not discard resume state", resets)
+			}
+		})
+	}
+}
+
+// TestResetSessionRebuildsWithPins: the production reset must yield a
+// genuinely new discordgo session (fresh resume state is the whole
+// point) that carries the same credential and the same pinned posture —
+// intents, library reconnect off, synchronous dispatch — as New built.
+func TestResetSessionRebuildsWithPins(t *testing.T) {
+	a := newTestAdapter(t)
+	old := a.session
+	if err := a.resetSession(); err != nil {
+		t.Fatalf("resetSession: %v", err)
+	}
+	if a.session == old {
+		t.Fatal("resetSession kept the old session — resume state survives")
+	}
+	if a.session.Token != old.Token {
+		t.Error("resetSession changed the credential")
+	}
+	if a.session.Identify.Intents != old.Identify.Intents {
+		t.Errorf("Identify.Intents = %b, want %b (pins must survive a session rebuild)", a.session.Identify.Intents, old.Identify.Intents)
+	}
+	if a.session.ShouldReconnectOnError {
+		t.Error("ShouldReconnectOnError = true after rebuild — library reconnect pin lost")
+	}
+	if !a.session.SyncEvents {
+		t.Error("SyncEvents = false after rebuild — synchronous dispatch pin lost")
+	}
+}
+
 // TestRunFlappingConnectionBacksOff: a connection that drops
 // immediately after every successful handshake must NOT reconnect at
 // full speed — Discord rate-limits IDENTIFY, and a zero-delay
