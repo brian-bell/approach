@@ -37,6 +37,30 @@ func turnAndResolve(t *testing.T, m *session.Manager, db *sql.DB, cwd string) st
 	return live
 }
 
+// TestSubSecondIdleTTLDefaults: a positive sub-second TTL would
+// truncate to zero whole seconds and rotate every session on its next
+// event — it reads as misconfiguration and takes the default instead.
+func TestSubSecondIdleTTLDefaults(t *testing.T) {
+	db := mustOpen(t)
+	clock := int64(1700000000)
+	eng := &resumeEngine{}
+	m := session.NewManager(db, eng, session.Config{
+		ActivationWindow: 2 * time.Minute,
+		IdleTTL:          500 * time.Millisecond,
+		TurnCap:          100,
+		Logger:           discardLogger(),
+		Now:              func() time.Time { return time.Unix(clock, 0) },
+	})
+	cwd := t.TempDir()
+
+	first := turnAndResolve(t, m, db, cwd)
+	clock += 10 // well within any sane TTL, far past 500ms
+	second := turnAndResolve(t, m, db, cwd)
+	if second.SessionID != first.SessionID {
+		t.Error("sub-second idle TTL rotated an active session on its next event")
+	}
+}
+
 // TestTurnTouchesBookkeeping: every successful turn — first or resumed
 // — advances last_seen and turns; rotation triggers read these (§6).
 func TestTurnTouchesBookkeeping(t *testing.T) {

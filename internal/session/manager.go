@@ -45,7 +45,7 @@ type Spec struct {
 // after mutating the store or mints rows the schema rejects.
 type Config struct {
 	ActivationWindow time.Duration // < 1s (incl. zero) → defaultActivationWindow
-	IdleTTL          time.Duration // ≤ 0 → defaultIdleTTL; rotation trigger (§3)
+	IdleTTL          time.Duration // < 1s (incl. zero) → defaultIdleTTL; rotation trigger (§3)
 	TurnCap          int64         // < 1 → defaultTurnCap; rotation trigger (§3)
 	Logger           *slog.Logger  // nil → slog.Default()
 	Now              func() time.Time
@@ -98,8 +98,11 @@ func NewManager(db *sql.DB, engine Engine, cfg Config) *Manager {
 	if window < time.Second {
 		window = defaultActivationWindow
 	}
+	// Like ActivationWindow: sub-second values truncate to zero whole
+	// seconds in the trigger math, which would rotate every session on
+	// its next event — a misconfiguration, not a cadence.
 	idleTTL := cfg.IdleTTL
-	if idleTTL <= 0 {
+	if idleTTL < time.Second {
 		idleTTL = defaultIdleTTL
 	}
 	turnCap := cfg.TurnCap
