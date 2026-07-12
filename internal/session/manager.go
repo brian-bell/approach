@@ -157,7 +157,7 @@ func (m *Manager) Ensure(ctx context.Context, threadKey, trustFloor, cwd string)
 // creating (the schema default), activation deadline stamped in the
 // same insert so a crash can never separate them.
 func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (store.LiveSession, bool, error) {
-	s, err := m.mint(threadKey, trustFloor, cwd)
+	s, err := m.mint(threadKey, trustFloor, cwd, "")
 	if err != nil {
 		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: %w", threadKey, err)
 	}
@@ -190,7 +190,7 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 // 1s minimum, a session pinned at :00.999 would expire a millisecond
 // later. Rounding up guarantees the row never expires before
 // ActivationWindow has actually elapsed (§4.1).
-func (m *Manager) mint(threadKey, trustFloor, cwd string) (store.Session, error) {
+func (m *Manager) mint(threadKey, trustFloor, cwd, origin string) (store.Session, error) {
 	id, err := newSessionID()
 	if err != nil {
 		return store.Session{}, err
@@ -205,6 +205,7 @@ func (m *Manager) mint(threadKey, trustFloor, cwd string) (store.Session, error)
 		ThreadKey:          threadKey,
 		SessionID:          id,
 		Cwd:                cwd,
+		Origin:             origin,
 		TrustFloor:         trustFloor,
 		CreatedAt:          created.Unix(),
 		ActivationDeadline: deadline,

@@ -176,6 +176,52 @@ func TestRotateNow(t *testing.T) {
 	}
 }
 
+// TestRotationPreservesWorkerOrigin: a task:* worker session's
+// successor must keep its origin — the thread that spawned the work
+// (§4.5) — both because the worker stays traceable and because the
+// store rejects a worker row without one, which would roll the whole
+// rotation back and wedge the worker at its cap.
+func TestRotationPreservesWorkerOrigin(t *testing.T) {
+	db := mustOpen(t)
+	clock := int64(1700000000)
+	eng := &resumeEngine{}
+	m := rotationManager(db, eng, &clock)
+	cwd := t.TempDir()
+
+	// Seed an ACTIVE worker session directly (the claim section that
+	// mints these in production is epic 6.2's).
+	worker := store.Session{
+		ThreadKey:          "task:approach-123",
+		SessionID:          "33333333-3333-4333-8333-333333333333",
+		Cwd:                cwd,
+		Origin:             "discord:dm:a",
+		TrustFloor:         "owner",
+		CreatedAt:          clock,
+		ActivationDeadline: clock + 120,
+	}
+	if _, err := store.InsertSession(context.Background(), db, worker); err != nil {
+		t.Fatalf("seed worker: %v", err)
+	}
+	if err := store.ActivateSession(context.Background(), db, worker.SessionID); err != nil {
+		t.Fatalf("activate worker: %v", err)
+	}
+
+	successor, err := m.RotateNow(context.Background(), "task:approach-123")
+	if err != nil {
+		t.Fatalf("RotateNow on a worker session: %v", err)
+	}
+	if successor.Origin != worker.Origin {
+		t.Errorf("successor origin = %q, want the spawning thread %q (§4.5)", successor.Origin, worker.Origin)
+	}
+	var origin string
+	if err := db.QueryRow(`SELECT origin FROM sessions WHERE session_id = ?`, successor.SessionID).Scan(&origin); err != nil {
+		t.Fatalf("read back successor origin: %v", err)
+	}
+	if origin != worker.Origin {
+		t.Errorf("durable successor origin = %q, want %q", origin, worker.Origin)
+	}
+}
+
 // TestRotationPreservesPinDiscipline: the successor is born creating
 // with a daemon-minted id and its own activation window — the next
 // event's StartNew runs against it exactly like any fresh pin.

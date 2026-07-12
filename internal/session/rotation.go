@@ -38,7 +38,11 @@ func (m *Manager) rotationCause(live store.LiveSession) string {
 // trust floor, cwd; content seeding of the fresh session is the
 // context assembler's job (C6), not ours.
 func (m *Manager) rotate(ctx context.Context, live store.LiveSession, cause string) (store.LiveSession, error) {
-	successor, err := m.mint(live.ThreadKey, live.TrustFloor, live.Cwd)
+	// Origin carries over too: a task:* worker's successor must keep
+	// reporting to the thread that spawned the work (§4.5) — and the
+	// schema-level validation rejects a worker row without one, which
+	// would roll the whole rotation back.
+	successor, err := m.mint(live.ThreadKey, live.TrustFloor, live.Cwd, live.Origin)
 	if err != nil {
 		return store.LiveSession{}, fmt.Errorf("session: rotate %s: %w", live.SessionID, err)
 	}
@@ -53,6 +57,7 @@ func (m *Manager) rotate(ctx context.Context, live store.LiveSession, cause stri
 		SessionID:          successor.SessionID,
 		Status:             "creating",
 		Cwd:                canonical,
+		Origin:             successor.Origin,
 		TrustFloor:         successor.TrustFloor,
 		CreatedAt:          successor.CreatedAt,
 		ActivationDeadline: successor.ActivationDeadline,
