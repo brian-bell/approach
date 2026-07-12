@@ -214,9 +214,12 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	// One clock read serves both the guard and the timeout below: a
 	// second read could cross the deadline in between, and a zero
 	// timeout is not a refusal — engines may do work under a cancelled
-	// context.
-	nowUnix := m.now().Unix()
-	if nowUnix >= current.ActivationDeadline {
+	// context. The remaining window is computed at full precision
+	// against the whole-second persisted deadline: flooring `now`
+	// would hand the engine up to an extra fractional second past the
+	// instant Ensure already considers the row expired.
+	remaining := time.Unix(current.ActivationDeadline, 0).Sub(m.now())
+	if remaining <= 0 {
 		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", current.SessionID)
 	}
 	// Only the ENGINE runs under the deadline: the activation write
@@ -226,7 +229,6 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	// against the wall clock — so the enforcement clock is the same
 	// injectable one every other decision in this package uses
 	// (positive by the pre-check above).
-	remaining := time.Duration(current.ActivationDeadline-nowUnix) * time.Second
 	turnCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	// A dead context is a refusal, not an input: shutdown may have
