@@ -171,6 +171,13 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 // below closes the other half — a turn that limps in after expiry must
 // not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
+	// Refuse before spawning, not just after: queue delays can eat the
+	// whole window between Ensure and here, and Engine has no contract
+	// to be side-effect-free on an already-cancelled context — the only
+	// spawn that provably does nothing is the one never started.
+	if m.now().Unix() >= live.ActivationDeadline {
+		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", live.SessionID)
+	}
 	// Only the ENGINE runs under the deadline: the activation write
 	// below is a local store update that must not be starved by a turn
 	// that finished with seconds to spare.

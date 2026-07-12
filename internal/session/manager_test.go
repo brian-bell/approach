@@ -307,11 +307,15 @@ func TestStartNewRefusesLateActivation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	// Same session, but the clock has passed the deadline by the time
-	// the turn finishes.
+	// Same session, but the queue delayed StartNew past the deadline.
 	late := newManager(db, eng, 1700000121)
 	if err := late.StartNew(ctx, live); err == nil {
 		t.Fatal("StartNew activated a session after its activation deadline")
+	}
+	// The engine must never have spawned: past the window, the only
+	// provably side-effect-free turn is the one never started.
+	if len(eng.specs) != 0 {
+		t.Errorf("engine invoked %d times after the deadline, want 0", len(eng.specs))
 	}
 	var status string
 	if err := db.QueryRow(`SELECT status FROM sessions WHERE session_id = ?`, live.SessionID).Scan(&status); err != nil {
