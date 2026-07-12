@@ -71,9 +71,17 @@ type Adapter struct {
 	log     *slog.Logger
 
 	// disconnected carries the gateway-drop signal from the Disconnect
-	// handler into Run's loop. Buffered so a drop that fires before Run
-	// reaches its select is held, not lost; coalescing repeats is fine —
-	// one reconnect cycle covers them.
+	// handler (registered once, for the adapter's whole lifetime — see
+	// New) into Run's loop. Buffered so a drop that fires before Run
+	// reaches its select is held, not lost; a duplicate for the SAME
+	// drop (discordgo's listen() and heartbeat() paths can each call
+	// Close(), and CloseWithCode emits unconditionally) just coalesces
+	// into the one pending wakeup. Run does not trust this signal
+	// blindly: see the ErrWSAlreadyOpen handling in Run, which is what
+	// actually protects against a stale or duplicate wakeup — discordgo
+	// dispatches every Disconnect to every currently-registered handler
+	// (see handle() in the library), so there is no way to scope a
+	// handler itself to a single connection generation.
 	disconnected chan struct{}
 
 	// Seams for the lifecycle tests: production values are the
@@ -131,7 +139,7 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 	session.AddHandler(func(*discordgo.Session, *discordgo.Disconnect) {
 		select {
 		case a.disconnected <- struct{}{}:
-		default: // a reconnect cycle is already pending
+		default: // a wakeup is already pending
 		}
 	})
 	return a, nil
@@ -147,55 +155,96 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 // can never work.
 func (a *Adapter) Run(ctx context.Context) error {
 	attempt := 0
+	needOpen := true
+	var connectedAt time.Time
 	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		err, cancelled := a.openCancellable(ctx)
-		if cancelled {
-			return ctx.Err()
-		}
-		if err != nil {
-			if terminal(err) {
-				return fmt.Errorf("discord: gateway refused the connection — credential or intents problem, a restart cannot fix this: %w", err)
-			}
-			delay := backoffDelay(attempt)
-			attempt++
-			a.log.Warn("discord gateway open failed — retrying", "error", err.Error(), "delay", delay.String(), "attempt", attempt)
-			if err := a.sleep(ctx, delay); err != nil {
+		if needOpen {
+			// This is reached either before ever connecting, or right
+			// after consuming a disconnect signal we have not yet
+			// verified with Open — and that signal can be a stale
+			// duplicate chasing a connection that's still genuinely
+			// live (see the ErrWSAlreadyOpen handling below). a.close()
+			// is always safe to call here: discordgo's Close is a
+			// no-op when the socket is already down, so this can only
+			// ever help — it's what keeps a stale-duplicate-caused
+			// cancellation from leaking a live connection past the
+			// kill switch instead of leaving it unsupervised.
+			if err := ctx.Err(); err != nil {
+				a.close()
 				return err
 			}
-			continue
+			err, cancelled := a.openCancellable(ctx)
+			if cancelled {
+				return ctx.Err()
+			}
+			if err != nil {
+				if errors.Is(err, discordgo.ErrWSAlreadyOpen) {
+					// The wakeup that got us here was a stale or
+					// duplicate Disconnect: discordgo's listen() and
+					// heartbeat() paths can each call Close() for the
+					// same drop, and the second can arrive arbitrarily
+					// late — even after we'd already believed the
+					// connection gone and come back around to reopen
+					// it. Open's own already-open check is ground
+					// truth: the session was never actually torn down.
+					// Resume watching the connection that's already
+					// live; this isn't a failure, so no backoff and no
+					// attempt-counter churn.
+					a.log.Warn("discord gateway already open — a stale duplicate Disconnect was chased; resuming supervision of the live connection")
+					needOpen = false
+					continue
+				}
+				if terminal(err) {
+					return fmt.Errorf("discord: gateway refused the connection — credential or intents problem, a restart cannot fix this: %w", err)
+				}
+				delay := backoffDelay(attempt)
+				attempt++
+				a.log.Warn("discord gateway open failed — retrying", "error", err.Error(), "delay", delay.String(), "attempt", attempt)
+				if err := a.sleep(ctx, delay); err != nil {
+					return err
+				}
+				continue
+			}
+			connectedAt = a.now()
+			a.log.Info("discord gateway open")
 		}
-		connectedAt := a.now()
-		a.log.Info("discord gateway open")
 		select {
 		case <-ctx.Done():
 			a.close()
 			return ctx.Err()
 		case <-a.disconnected:
-			// Deliberately NO close here: the only emitter of the
-			// Disconnect event is discordgo's CloseWithCode, so this
-			// signal MEANS the session is already fully torn down
-			// (listen() closes before reconnect-dispatch). Closing
-			// again would emit a fresh Disconnect, and that stale
-			// buffered signal would close the next healthy connection
-			// — an endless churn loop after the first real drop
-			// (pinned by TestRunDisconnectDoesNotChurn).
-			if a.now().Sub(connectedAt) >= healthyReset {
-				attempt = 0
-				a.log.Warn("discord gateway disconnected — reconnecting")
-				continue
-			}
-			// A connection that died this fast counts as a failure
-			// epoch, not a fresh start: back off before re-dialing.
-			delay := backoffDelay(attempt)
-			attempt++
-			a.log.Warn("discord gateway dropped shortly after connect — backing off before reconnecting",
-				"delay", delay.String(), "attempt", attempt)
-			if err := a.sleep(ctx, delay); err != nil {
-				return err
-			}
+		}
+		needOpen = true
+		// Deliberately NO close here: the only emitter of the
+		// Disconnect event is discordgo's CloseWithCode, so this
+		// signal MEANS the session is already fully torn down
+		// (listen() closes before reconnect-dispatch) — UNLESS it was
+		// stale, which the ErrWSAlreadyOpen check above catches on the
+		// next iteration. Closing here too would emit a fresh
+		// Disconnect, and that extra buffered signal would close the
+		// next healthy connection — an endless churn loop after the
+		// first real drop (pinned by TestRunDisconnectDoesNotChurn).
+		if a.now().Sub(connectedAt) >= healthyReset {
+			attempt = 0
+			a.log.Warn("discord gateway disconnected — reconnecting")
+			continue
+		}
+		// A connection that died this fast counts as a failure epoch,
+		// not a fresh start: back off before re-dialing.
+		delay := backoffDelay(attempt)
+		attempt++
+		a.log.Warn("discord gateway dropped shortly after connect — backing off before reconnecting",
+			"delay", delay.String(), "attempt", attempt)
+		if err := a.sleep(ctx, delay); err != nil {
+			// The disconnect just backed off from could be a stale
+			// duplicate chasing a still-live connection (see the
+			// ErrWSAlreadyOpen handling above) — this cancellation
+			// lands before an Open attempt could tell us either way.
+			// a.close() is always safe (a no-op if already down), and
+			// it's what keeps that possibility from leaking a live
+			// connection past the kill switch.
+			a.close()
+			return err
 		}
 	}
 }
@@ -205,7 +254,11 @@ func (a *Adapter) Run(ctx context.Context) error {
 // hook, so it runs in a goroutine selected against ctx. On cancel the
 // call is abandoned to a reaper that closes a late-succeeding handshake
 // — a connection nobody is supervising must not stay live consuming
-// messages.
+// messages. A nil error means Open just established a brand new
+// connection nobody's watching; ErrWSAlreadyOpen means the connection
+// was already live before this call (chasing a stale disconnect, see
+// Run) and is just as unsupervised now that Run is exiting — both must
+// be reaped, so the check is not a plain success/failure branch.
 func (a *Adapter) openCancellable(ctx context.Context) (err error, cancelled bool) {
 	done := make(chan error, 1)
 	go func() { done <- a.open() }()
@@ -214,7 +267,7 @@ func (a *Adapter) openCancellable(ctx context.Context) (err error, cancelled boo
 		return err, false
 	case <-ctx.Done():
 		go func() {
-			if err := <-done; err == nil {
+			if err := <-done; err == nil || errors.Is(err, discordgo.ErrWSAlreadyOpen) {
 				a.close()
 			}
 		}()

@@ -298,6 +298,75 @@ func TestRunDisconnectDoesNotChurn(t *testing.T) {
 	}
 }
 
+// TestRunResumesAfterStaleDuplicateChasesLiveConnection: a single socket
+// loss can emit Disconnect twice — discordgo's listen() and heartbeat()
+// paths can each call Close(), and CloseWithCode emits unconditionally.
+// discordgo dispatches every Disconnect to whichever handler is
+// currently registered, so a duplicate that arrives late (after the
+// reconnect it belongs to already completed) is indistinguishable, at
+// the handler, from a genuine drop of the connection now live: Run has
+// no way to tell them apart by inspecting the signal alone. It must
+// instead recognize its mistake when Open reports the socket is already
+// open — self-correcting by resuming supervision, not by churning the
+// healthy connection or hammering an already-open session forever.
+func TestRunResumesAfterStaleDuplicateChasesLiveConnection(t *testing.T) {
+	a := newTestAdapter(t)
+	var opens, closes int
+	opened := make(chan struct{}, 8)
+	refused := make(chan struct{})
+	a.open = func() error {
+		opens++
+		if opens == 3 {
+			// The chased reopen of the still-live connection: discordgo
+			// itself refuses, since nothing ever actually closed it.
+			close(refused)
+			return discordgo.ErrWSAlreadyOpen
+		}
+		opened <- struct{}{}
+		return nil
+	}
+	a.closeFn = func() error { closes++; return nil }
+	a.sleep = func(context.Context, time.Duration) error {
+		t.Error("slept while chasing a stale duplicate — an already-open refusal is not a failure")
+		return nil
+	}
+	// Long-healthy connections: both reconnects are immediate (no flap
+	// backoff), isolating the already-open self-correction.
+	fakeNow := time.Unix(1700000000, 0)
+	a.now = func() time.Time {
+		fakeNow = fakeNow.Add(2 * healthyReset)
+		return fakeNow
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+
+	<-opened                     // first connect
+	a.disconnected <- struct{}{} // one real drop
+	<-opened                     // reconnect (now live)
+
+	// The stale duplicate for the drop that led to the reconnect fires
+	// late. Run believes the live connection just dropped and tries to
+	// reopen it — discordgo refuses (opens == 3, above) since it never
+	// actually closed.
+	a.disconnected <- struct{}{}
+	<-refused // wait for Run to actually chase and get refused
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if opens != 3 {
+		t.Errorf("opens = %d, want 3 (connect, reconnect, chased-and-refused reopen)", opens)
+	}
+	if closes != 1 {
+		t.Errorf("closes = %d, want 1 (final close only — no close on the chased reopen)", closes)
+	}
+}
+
 // TestRunTerminalErrorOnReconnect: terminal classification applies to
 // REconnects too — a token revoked mid-stream surfaces on the next
 // open instead of being retried forever (the reason library reconnect
@@ -331,7 +400,7 @@ func TestRunTerminalErrorOnReconnect(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- a.Run(context.Background()) }()
 	<-opened
-	a.disconnected <- struct{}{}
+	a.disconnected <- struct{}{} // drop of the live connection
 
 	select {
 	case err := <-done:
@@ -432,6 +501,44 @@ func TestRunCancelDuringOpenReturnsPromptly(t *testing.T) {
 	}
 }
 
+// TestRunCancelDuringStaleReopenClosesAlreadyOpenConnection: cancellation
+// can win openCancellable's select at the exact moment a chased,
+// still-live connection's Open call is about to report
+// ErrWSAlreadyOpen. That error means a connection was live all along,
+// not that nothing exists — the reaper must close it just as it would a
+// late-succeeding brand new Open, or the live gateway survives drain
+// unsupervised.
+func TestRunCancelDuringStaleReopenClosesAlreadyOpenConnection(t *testing.T) {
+	a := newTestAdapter(t)
+	release := make(chan struct{})
+	closed := make(chan struct{}, 1)
+	a.open = func() error { <-release; return discordgo.ErrWSAlreadyOpen }
+	a.closeFn = func() error { closed <- struct{}{}; return nil }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	time.Sleep(10 * time.Millisecond) // let Run enter open
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run stayed blocked in a hung gateway handshake after cancel — drain is defeated")
+	}
+
+	// The chased Open call reports already-open late.
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a connection reported already-open after cancel was never closed — leaked live gateway connection")
+	}
+}
+
 // TestRunCancelDuringBackoffAborts: drain must not wait out a backoff
 // sleep (§3 kill switch) — a cancelled context aborts the retry loop
 // immediately, with no further open attempts.
@@ -454,6 +561,44 @@ func TestRunCancelDuringBackoffAborts(t *testing.T) {
 	}
 	if opens != 1 {
 		t.Errorf("open attempts = %d after cancel-during-backoff, want 1", opens)
+	}
+}
+
+// TestRunCancelDuringQuickDropBackoffCloses: cancellation that lands
+// during the quick-drop backoff (after a disconnect signal, before the
+// next Open attempt) must still close the session. That disconnect
+// signal could be a stale duplicate chasing a connection that's
+// actually still live (see TestRunResumesAfterStaleDuplicateChasesLiveConnection);
+// only an Open attempt would reveal that, and cancellation here means
+// one never happens. The kill switch must not leak a live connection
+// just because a stale signal happened to be in flight when it fired.
+func TestRunCancelDuringQuickDropBackoffCloses(t *testing.T) {
+	a := newTestAdapter(t)
+	var opens, closes int
+	ctx, cancel := context.WithCancel(context.Background())
+	opened := make(chan struct{}, 1)
+	a.open = func() error { opens++; opened <- struct{}{}; return nil }
+	a.closeFn = func() error { closes++; return nil }
+	a.sleep = func(ctx context.Context, _ time.Duration) error {
+		cancel() // cancellation lands mid-backoff
+		return ctx.Err()
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- a.Run(ctx) }()
+	<-opened
+	a.disconnected <- struct{}{} // instant drop — quick-drop backoff path
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Run returned %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+	if closes != 1 {
+		t.Errorf("closes = %d, want 1 — cancellation mid-backoff must still close a possibly-still-live connection", closes)
 	}
 }
 
