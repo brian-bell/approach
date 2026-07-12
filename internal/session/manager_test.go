@@ -420,6 +420,47 @@ func TestStartNewRefusesCancelledContext(t *testing.T) {
 	}
 }
 
+// cancelThenSucceedEngine simulates SIGTERM arriving exactly as the
+// first turn's child exits cleanly: it cancels the caller's context,
+// then reports success.
+type cancelThenSucceedEngine struct {
+	cancel context.CancelFunc
+	specs  int
+}
+
+func (e *cancelThenSucceedEngine) Start(context.Context, session.Spec) error {
+	e.specs++
+	e.cancel()
+	return nil
+}
+
+// TestStartNewActivatesThroughShutdown: a first turn that SUCCEEDED
+// must activate even if shutdown began while it ran — losing the
+// transition would fail-and-refresh a session whose transcript exists,
+// discarding real conversation state (§4.1).
+func TestStartNewActivatesThroughShutdown(t *testing.T) {
+	db := mustOpen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eng := &cancelThenSucceedEngine{cancel: cancel}
+	m := newManager(db, eng, 1700000000)
+
+	live, _, err := m.Ensure(ctx, "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := m.StartNew(ctx, live); err != nil {
+		t.Fatalf("StartNew across shutdown: %v", err)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM sessions WHERE session_id = ?`, live.SessionID).Scan(&status); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "active" {
+		t.Errorf("successful first turn left status %q under shutdown, want active", status)
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {

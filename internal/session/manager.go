@@ -234,7 +234,11 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	if m.now().Unix() >= current.ActivationDeadline {
 		return fmt.Errorf("session: first turn for %s finished after its activation deadline — left creating for the §4.1 expiry retry", current.SessionID)
 	}
-	if err := store.ActivateSession(ctx, m.db, current.SessionID); err != nil {
+	// The turn HAPPENED — its activation must not be lost to a SIGTERM
+	// that landed as the child exited. The router waits for in-flight
+	// handlers precisely so their durable writes finish; WithoutCancel
+	// lets this one write complete while new work stays refused.
+	if err := store.ActivateSession(context.WithoutCancel(ctx), m.db, current.SessionID); err != nil {
 		return fmt.Errorf("session: activate %s: %w", current.SessionID, err)
 	}
 	return nil
