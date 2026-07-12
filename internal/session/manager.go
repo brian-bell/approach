@@ -37,12 +37,23 @@ type Spec struct {
 
 // Config wires a Manager. ActivationWindow bounds how long a session
 // may sit in creating before the thread retries fresh (§4.1); Now is
-// injectable so tests own the clock.
+// injectable so tests own the clock. Every field has a safe default —
+// a zero-value Config yields a working manager, never one that panics
+// after mutating the store or mints rows the schema rejects.
 type Config struct {
-	ActivationWindow time.Duration
-	Logger           *slog.Logger
+	ActivationWindow time.Duration // < 1s (incl. zero) → defaultActivationWindow
+	Logger           *slog.Logger  // nil → slog.Default()
 	Now              func() time.Time
 }
+
+// defaultActivationWindow is how long a creating session may wait for
+// its first turn before the thread retries fresh (§4.1). Two minutes:
+// generous against a slow model warm-up, short enough that a wedged
+// spawn doesn't hold a thread hostage. Sub-second windows (including
+// the zero value) are rejected in favor of this default — Seconds()
+// truncation would stamp deadline == created_at, a born-expired row
+// InsertSession refuses.
+const defaultActivationWindow = 2 * time.Minute
 
 // Manager drives session rows through their §4.1 lifecycle. One
 // manager per daemon; its methods are called from per-thread queue
@@ -64,12 +75,20 @@ func NewManager(db *sql.DB, engine Engine, cfg Config) *Manager {
 	if now == nil {
 		now = time.Now
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	window := cfg.ActivationWindow
+	if window < time.Second {
+		window = defaultActivationWindow
+	}
 	return &Manager{
 		db:     db,
 		engine: engine,
-		logger: cfg.Logger,
+		logger: logger,
 		now:    now,
-		window: cfg.ActivationWindow,
+		window: window,
 	}
 }
 

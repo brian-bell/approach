@@ -58,6 +58,26 @@ func newManager(db *sql.DB, eng session.Engine, at int64) *session.Manager {
 	})
 }
 
+// TestZeroValueConfigIsSafe: a Manager built from Config{} must mint
+// working sessions — not panic on a nil logger after the insert, and
+// not stamp deadline == created_at (a born-expired row the schema
+// layer rejects).
+func TestZeroValueConfigIsSafe(t *testing.T) {
+	db := mustOpen(t)
+	m := session.NewManager(db, &fakeEngine{}, session.Config{})
+
+	live, fresh, err := m.Ensure(context.Background(), "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure with zero-value Config: %v", err)
+	}
+	if !fresh {
+		t.Error("Ensure reported fresh=false on an empty thread")
+	}
+	if live.ActivationDeadline <= live.CreatedAt {
+		t.Errorf("deadline %d not after created_at %d — the default window did not apply", live.ActivationDeadline, live.CreatedAt)
+	}
+}
+
 var uuidV4 = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // TestEnsureMintsCreatingSession: a thread with no live session gets a
