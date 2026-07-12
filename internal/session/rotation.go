@@ -21,12 +21,14 @@ func (m *Manager) rotationCause(live store.LiveSession) string {
 	if idleSince == 0 {
 		idleSince = live.CreatedAt
 	}
-	// Compared in duration space: timestamps are whole seconds, but the
-	// TTL may be fractional (1500ms is a valid config duration), and
-	// flooring it would rotate up to a second EARLY. This comparison
-	// only fires once a whole second ≥ the full TTL has elapsed —
-	// ceiling semantics, matching the activation deadline's.
-	if time.Duration(m.now().Unix()-idleSince)*time.Second >= m.idleTTL {
+	// Timestamps are floored whole seconds, so the computed idle span
+	// overestimates the true one by up to a second (a turn at :00.9
+	// stores :00; an event at :02.0 computes 2s idle when 1.1s truly
+	// elapsed). Requiring one extra whole second beyond the TTL makes
+	// "never rotate early" hold for ANY TTL, fractional included — and
+	// an extra second of patience is invisible at the hours scale §3
+	// intends these caps for.
+	if time.Duration(m.now().Unix()-idleSince)*time.Second >= m.idleTTL+time.Second {
 		return "idle_ttl"
 	}
 	return ""
