@@ -122,7 +122,7 @@ func TestInsertSessionPersistsCreating(t *testing.T) {
 
 	s := testSession(t)
 	s.Origin = "discord:dm:origin"
-	if err := store.InsertSession(context.Background(), db, s); err != nil {
+	if _, err := store.InsertSession(context.Background(), db, s); err != nil {
 		t.Fatalf("InsertSession: %v", err)
 	}
 
@@ -189,7 +189,7 @@ func TestInsertSessionFailsLoudOnInvalidFields(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := testSession(t)
 			tc.mutate(t, &s)
-			if err := store.InsertSession(context.Background(), db, s); err == nil {
+			if _, err := store.InsertSession(context.Background(), db, s); err == nil {
 				t.Errorf("InsertSession accepted session with %s, want error", tc.name)
 			}
 		})
@@ -226,7 +226,7 @@ func TestInsertSessionCanonicalizesWorkerCwd(t *testing.T) {
 	w1.SessionID = "w1"
 	w1.Origin = "discord:dm:origin"
 	w1.Cwd = repo
-	if err := store.InsertSession(context.Background(), db, w1); err != nil {
+	if _, err := store.InsertSession(context.Background(), db, w1); err != nil {
 		t.Fatalf("first worker: %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestInsertSessionCanonicalizesWorkerCwd(t *testing.T) {
 		w.SessionID = fmt.Sprintf("w%d", i+2)
 		w.Origin = "discord:dm:origin"
 		w.Cwd = sp.cwd
-		if err := store.InsertSession(context.Background(), db, w); err == nil {
+		if _, err := store.InsertSession(context.Background(), db, w); err == nil {
 			t.Errorf("second live worker via %s %q accepted, want one_worker_per_repo violation", sp.name, sp.cwd)
 		}
 	}
@@ -254,7 +254,7 @@ func TestInsertSessionCanonicalizesWorkerCwd(t *testing.T) {
 	dm.ThreadKey = "discord:dm:9"
 	dm.SessionID = "s9"
 	dm.Cwd = link
-	if err := store.InsertSession(context.Background(), db, dm); err != nil {
+	if _, err := store.InsertSession(context.Background(), db, dm); err != nil {
 		t.Errorf("non-worker session sharing the repo: %v — exclusivity is workers-only", err)
 	}
 }
