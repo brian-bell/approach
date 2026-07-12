@@ -230,6 +230,78 @@ func TestStartNewEngineFailureLeavesCreating(t *testing.T) {
 	}
 }
 
+// blockingEngine parks in Start until its context ends — the wedged
+// first spawn the deadline bound exists for.
+type blockingEngine struct{}
+
+func (blockingEngine) Start(ctx context.Context, _ session.Spec) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestStartNewBoundsFirstTurnByDeadline: the first turn runs under a
+// context deadline derived from the row's activation_deadline — a hung
+// spawn must release the serialized thread queue instead of wedging it
+// past the recovery window, and the row stays creating for the §4.1
+// expiry retry. (The pinned deadline here is far in the wall-clock
+// past, so the derived context is already expired — the strongest form
+// of "the engine outlived its window".)
+func TestStartNewBoundsFirstTurnByDeadline(t *testing.T) {
+	db := mustOpen(t)
+	m := newManager(db, blockingEngine{}, 1700000000)
+	ctx := context.Background()
+
+	live, _, err := m.Ensure(ctx, "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.StartNew(ctx, live) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("StartNew returned nil from a spawn that never completed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StartNew did not return — a wedged first turn blocks its thread queue forever")
+	}
+
+	got, ok, err := store.ResolveLiveSession(ctx, db, "discord:dm:a")
+	if err != nil || !ok {
+		t.Fatalf("resolve after bounded StartNew: ok=%v err=%v", ok, err)
+	}
+	if got.Status != "creating" {
+		t.Errorf("session after deadline-bounded failure = %q, want creating (expiry retry owns it)", got.Status)
+	}
+}
+
+// TestStartNewRefusesLateActivation: a first turn that completes after
+// the activation deadline must not flip the row to active — Ensure is
+// entitled to have failed it, and a late activation would fight that.
+func TestStartNewRefusesLateActivation(t *testing.T) {
+	db := mustOpen(t)
+	eng := &fakeEngine{} // ignores ctx; "succeeds" no matter how late
+	ctx := context.Background()
+
+	live, _, err := newManager(db, eng, 1700000000).Ensure(ctx, "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	// Same session, but the clock has passed the deadline by the time
+	// the turn finishes.
+	late := newManager(db, eng, 1700000121)
+	if err := late.StartNew(ctx, live); err == nil {
+		t.Fatal("StartNew activated a session after its activation deadline")
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM sessions WHERE session_id = ?`, live.SessionID).Scan(&status); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "creating" {
+		t.Errorf("late first turn left status %q, want creating", status)
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {

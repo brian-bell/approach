@@ -142,13 +142,30 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 // one transient crash — decides when the thread gives up and retries
 // fresh, so the failure is returned for the caller's §4.6 handling
 // but the session keeps its window.
+//
+// The turn is BOUNDED by that same deadline: per-thread queues
+// serialize behind this call, so a wedged first spawn would otherwise
+// block its thread forever — no later event could even reach the
+// Ensure that fails and replaces the expired row. The context deadline
+// releases an engine that honors cancellation (force-kill of one that
+// doesn't is the x6n.2.9 child-management remit); the activation guard
+// below closes the other half — a turn that limps in after expiry must
+// not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
-	if err := m.engine.Start(ctx, Spec{
+	// Only the ENGINE runs under the deadline: the activation write
+	// below is a local store update that must not be starved by a turn
+	// that finished with seconds to spare.
+	turnCtx, cancel := context.WithDeadline(ctx, time.Unix(live.ActivationDeadline, 0))
+	defer cancel()
+	if err := m.engine.Start(turnCtx, Spec{
 		SessionID: live.SessionID,
 		ThreadKey: live.ThreadKey,
 		Cwd:       live.Cwd,
 	}); err != nil {
 		return fmt.Errorf("session: first turn for %s: %w", live.SessionID, err)
+	}
+	if m.now().Unix() >= live.ActivationDeadline {
+		return fmt.Errorf("session: first turn for %s finished after its activation deadline — left creating for the §4.1 expiry retry", live.SessionID)
 	}
 	if err := store.ActivateSession(ctx, m.db, live.SessionID); err != nil {
 		return fmt.Errorf("session: activate %s: %w", live.SessionID, err)
