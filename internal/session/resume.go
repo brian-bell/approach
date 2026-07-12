@@ -1,0 +1,82 @@
+package session
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+
+	"github.com/brian-bell/approach/internal/store"
+)
+
+// ErrCwdGone reports the §11 session-scope trap caught before it bit:
+// the session's recorded cwd no longer exists (or is no longer a
+// directory the daemon can stat). --resume lookups are scoped to the
+// project dir, so spawning anyway would fail silently inside the
+// engine; refusing here keeps the failure typed for the §4.6
+// degradation flow (x6n.2.8) — resume_failed + fact-seeded fresh
+// session + transparency note.
+var ErrCwdGone = errors.New("session cwd no longer exists")
+
+// Resume runs one turn of an ACTIVE session: claude -p --resume from
+// the recorded sessions.cwd (§4.1, §6). Mirrors StartNew's discipline —
+// the caller's snapshot only identifies the session; status and cwd
+// are re-read from the row, the cwd is asserted on disk before the
+// spawn (assert, don't assume — §11), and a dead context refuses
+// rather than spawns. Engine failures propagate untyped here; telling
+// transcript-gone from transient is x6n.2.8's classification. Bounding
+// a hung resume (timeout kill) is the x6n.2.9 child-management remit.
+func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
+	current, ok, err := store.ResolveLiveSession(ctx, m.db, live.ThreadKey)
+	if err != nil {
+		return fmt.Errorf("session: resume %s: %w", live.SessionID, err)
+	}
+	if !ok || current.SessionID != live.SessionID || current.Status != "active" {
+		return fmt.Errorf("session: resume %s refused — it is no longer %s's active session", live.SessionID, live.ThreadKey)
+	}
+	// The assert is a stat, not a trust: the row's cwd was canonical
+	// and real at insert, but repos move and worktrees get pruned. Any
+	// stat failure — not just IsNotExist — reads as gone: a cwd the
+	// daemon cannot verify is one it must not spawn from (fail closed).
+	info, err := os.Stat(current.Cwd)
+	if err != nil {
+		return fmt.Errorf("session: resume %s from %q: %v: %w", current.SessionID, current.Cwd, err, ErrCwdGone)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("session: resume %s: recorded cwd %q is not a directory: %w", current.SessionID, current.Cwd, ErrCwdGone)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("session: resume %s not started: %w", current.SessionID, err)
+	}
+	if err := m.engine.Resume(ctx, Spec{
+		SessionID: current.SessionID,
+		ThreadKey: current.ThreadKey,
+		Cwd:       current.Cwd,
+	}); err != nil {
+		return fmt.Errorf("session: resume %s: %w", current.SessionID, err)
+	}
+	return nil
+}
+
+// Turn is the unified per-event entry the queue handler calls: resolve
+// the thread's session and run the right flow for its lifecycle state
+// (§4.1). creating — fresh or a prior pin whose first turn failed
+// transiently — owes a FIRST turn against the same pinned id (no
+// transcript exists to resume; the expiry window, not the retry count,
+// bounds how long the thread keeps trying). active resumes.
+func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) error {
+	live, _, err := m.Ensure(ctx, threadKey, trustFloor, cwd)
+	if err != nil {
+		return fmt.Errorf("session: turn for %s: %w", threadKey, err)
+	}
+	switch live.Status {
+	case "creating":
+		return m.StartNew(ctx, live)
+	case "active":
+		return m.Resume(ctx, live)
+	default:
+		// ResolveLiveSession only returns the two live states; a third
+		// here means the store contract broke — refuse loudly.
+		return fmt.Errorf("session: turn for %s: live session %s in impossible state %q", threadKey, live.SessionID, live.Status)
+	}
+}

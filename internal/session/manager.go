@@ -20,10 +20,13 @@ import (
 
 // Engine is the session manager's view of Claude Code. Start runs a
 // session's FIRST turn — claude -p --session-id <pinned uuid> from
-// spec.Cwd — and returns when the turn completes. Resume (--resume) is
-// the x6n.2.6 flow and extends this seam there.
+// spec.Cwd; Resume runs a later turn — claude -p --resume <id> from
+// the same recorded cwd (§4.1). Both return when the turn completes.
+// The real child-process implementation (spawn, timeout kill,
+// --max-turns) is x6n.2.9.
 type Engine interface {
 	Start(ctx context.Context, spec Spec) error
+	Resume(ctx context.Context, spec Spec) error
 }
 
 // Spec carries what a spawn needs. The SessionID is the daemon's
