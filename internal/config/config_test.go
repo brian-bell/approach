@@ -248,6 +248,7 @@ func TestSessions_Bounds(t *testing.T) {
 		name, sessions, wantErr string
 	}{
 		{"negative idle_ttl", "[sessions]\nidle_ttl = \"-1h\"\n", "idle_ttl"},
+		{"sub-second idle_ttl", "[sessions]\nidle_ttl = \"500ms\"\n", "idle_ttl"},
 		{"zero turn_cap", "[sessions]\nturn_cap = 0\n", "turn_cap"},
 		{"negative turn_cap", "[sessions]\nturn_cap = -5\n", "turn_cap"},
 	}

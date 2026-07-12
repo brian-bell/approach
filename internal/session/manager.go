@@ -98,11 +98,17 @@ func NewManager(db *sql.DB, engine Engine, cfg Config) *Manager {
 	if window < time.Second {
 		window = defaultActivationWindow
 	}
-	// Like ActivationWindow: sub-second values truncate to zero whole
-	// seconds in the trigger math, which would rotate every session on
-	// its next event — a misconfiguration, not a cadence.
+	// Like ActivationWindow: sub-second values cannot be honored on
+	// whole-second timestamps. config.Parse rejects them at load time
+	// (fail loud); this clamp is the API-caller backstop, and a NONZERO
+	// value being replaced is warned about, never silent — a zero value
+	// simply means "unset, use the default".
 	idleTTL := cfg.IdleTTL
 	if idleTTL < time.Second {
+		if idleTTL > 0 {
+			logger.Warn("session idle TTL below 1s cannot be honored on whole-second timestamps — using the default",
+				"configured", idleTTL.String(), "default", defaultIdleTTL.String())
+		}
 		idleTTL = defaultIdleTTL
 	}
 	turnCap := cfg.TurnCap
