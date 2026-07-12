@@ -15,6 +15,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -84,6 +85,16 @@ type Adapter struct {
 	// handler itself to a single connection generation.
 	disconnected chan struct{}
 
+	// Handler join (§4.1): discordgo's Close stops the listener but
+	// never joins it, so a message decoded before the close can still
+	// be mid-handler when Run's loop exits — and the daemon closes the
+	// store right after Run returns. Every dispatch registers here
+	// under the gate; Run flips draining and waits before returning,
+	// so no handler can outlive Run and race a closing store.
+	handlerGate sync.Mutex
+	handlers    sync.WaitGroup
+	draining    bool
+
 	// Seams for the lifecycle tests: production values are the
 	// discordgo session's own methods, the session rebuild below, a
 	// context-aware sleep, and the wall clock.
@@ -92,6 +103,16 @@ type Adapter struct {
 	reset   func() error
 	sleep   func(context.Context, time.Duration) error
 	now     func() time.Time
+	// fetchChannel is the one REST fallback the boundary allows: a
+	// private channel the state cache cannot classify (the gateway's
+	// CHANNEL_CREATE-before-first-DM behavior is documented but not
+	// guaranteed forever) is fetched once and cached into state. It
+	// takes the DISPATCHING session, not the adapter's current one,
+	// and is set once in New, never in adopt: the handler goroutine
+	// reads it while Run's goroutine rebuilds sessions (resetSession),
+	// and discordgo's close path does not join handlers — a write on
+	// rebuild would be a data race against a straggling handler.
+	fetchChannel func(s *discordgo.Session, id string) (*discordgo.Channel, error)
 }
 
 // New builds the adapter around a discordgo session. The token is used
@@ -120,6 +141,9 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		disconnected: make(chan struct{}, 1),
 		sleep:        sleepCtx,
 		now:          time.Now,
+		fetchChannel: func(s *discordgo.Session, id string) (*discordgo.Channel, error) {
+			return s.Channel(id)
+		},
 	}
 	a.reset = a.resetSession
 	a.adopt(session)
@@ -181,6 +205,17 @@ func (a *Adapter) resetSession() error {
 // the daemon must surface it, not hammer the gateway with a token that
 // can never work.
 func (a *Adapter) Run(ctx context.Context) error {
+	// On every exit: join in-flight handlers before returning. The
+	// caller closes the store the moment Run returns (§4.1), and
+	// discordgo's Close does not wait for a dispatch already past the
+	// socket. After the join, stragglers are dropped at the gate — an
+	// unsupervised handler must never touch a closing store.
+	defer func() {
+		a.handlerGate.Lock()
+		a.draining = true
+		a.handlerGate.Unlock()
+		a.handlers.Wait()
+	}()
 	attempt := 0
 	needOpen := true
 	var connectedAt time.Time
@@ -319,16 +354,17 @@ func (a *Adapter) close() {
 	}
 }
 
-// onMessageCreate enforces the subscription boundary: DMs and threads
-// only (§3 C1). The guild-messages intent necessarily delivers every
-// visible guild channel, so plain guild channels are dropped here —
-// and a channel the state cache cannot classify reads as NOT a thread
-// (fail closed, §7: an unclassifiable channel must not widen the trust
-// surface). The bot's own messages are dropped too — relaying our
-// replies back in as inbound events is an echo loop. Everything else
-// passes through raw, other bots and authorless edge cases included:
-// whether they become events is the normalizer's policy call
-// (x6n.1.2), not the connection layer's.
+// onMessageCreate enforces the subscription boundary: 1:1 DMs and
+// threads only (§3 C1). The guild-messages intent necessarily delivers
+// every visible guild channel, so plain guild channels are dropped
+// here — and a channel that cannot be classified reads as NOT inside
+// the boundary (fail closed, §7: an unclassifiable channel must not
+// widen the trust surface). Group DMs are dropped by the same rule
+// (see isDirectMessage). The bot's own messages are dropped too —
+// relaying our replies back in as inbound events is an echo loop.
+// Everything else passes through raw, other bots and authorless edge
+// cases included: whether they become events is the normalizer's
+// policy call, not the connection layer's.
 func (a *Adapter) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if m.Author != nil && s.State != nil && s.State.User != nil && m.Author.ID == s.State.User.ID {
 		return
@@ -336,7 +372,58 @@ func (a *Adapter) onMessageCreate(s *discordgo.Session, m *discordgo.MessageCrea
 	if m.GuildID != "" && !a.isThread(s, m.ChannelID) {
 		return
 	}
+	if m.GuildID == "" && !a.isDirectMessage(s, m.ChannelID) {
+		return
+	}
+	// Register under the gate so Run's drain-join sees this dispatch:
+	// once draining is set no new handler may start — Run has (or is
+	// about to have) returned, and the store behind the handler is
+	// closing. The drop is loud: the gateway will not redeliver.
+	a.handlerGate.Lock()
+	if a.draining {
+		a.handlerGate.Unlock()
+		a.log.Warn("discord message dropped — adapter draining, the store behind the handler is closing",
+			"channel_id", m.ChannelID, "message_id", m.ID)
+		return
+	}
+	a.handlers.Add(1)
+	a.handlerGate.Unlock()
+	defer a.handlers.Done()
 	a.handle(m)
+}
+
+// isDirectMessage classifies a GuildID=="" channel as a 1:1 DM. Group
+// DMs share the empty GuildID but are multi-party: keyed as
+// discord:dm:<author> they would impersonate the author's PRIVATE
+// thread and every reply would leak to the other participants (§4.3),
+// so anything but ChannelTypeDM is dropped. The state cache normally
+// answers (the gateway sends CHANNEL_CREATE before a session's first
+// DM message); a miss falls back to ONE REST fetch, cached into state
+// so a live DM costs the round-trip once. A fetch that fails drops
+// the message — fail closed (§7) — and loudly, because a systemic
+// fetch failure here means DMs are silently dead.
+func (a *Adapter) isDirectMessage(s *discordgo.Session, channelID string) bool {
+	if s.State == nil {
+		return false
+	}
+	ch, err := s.State.Channel(channelID)
+	if err != nil {
+		ch, err = a.fetchChannel(s, channelID)
+		if err != nil {
+			a.log.Warn("dropping private message from unclassifiable channel — classification fetch failed",
+				"channel_id", channelID, "error", err.Error())
+			return false
+		}
+		if err := s.State.ChannelAdd(ch); err != nil {
+			a.log.Debug("could not cache classified private channel", "channel_id", channelID, "error", err.Error())
+		}
+	}
+	if ch.Type != discordgo.ChannelTypeDM {
+		a.log.Debug("dropping message from multi-party private channel — outside the DM+thread boundary (§3 C1)",
+			"channel_id", channelID)
+		return false
+	}
+	return true
 }
 
 // isThread classifies a guild channel via the state cache (populated
@@ -425,9 +512,11 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 // PlaceholderHandler records receipt at debug level and drops the
-// message — the M1 slice that normalizes inbound messages into §6
-// events (x6n.1.2) replaces it. Content is never logged: message text
-// is externally-authored data, and the journal is not the event store.
+// message. Production ingest is Normalize + the daemon's store-backed
+// handler; this stands in where a handler is structurally required
+// but must never persist — the daemon's pre-store adapter validation.
+// Content is never logged: message text is externally-authored data,
+// and the journal is not the event store.
 func PlaceholderHandler(logger *slog.Logger) MessageHandler {
 	return func(m *discordgo.MessageCreate) {
 		logger.Debug("discord message received — dropped, normalizer lands in x6n.1.2",
