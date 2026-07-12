@@ -352,6 +352,41 @@ func TestStartNewRefusesStaleSnapshot(t *testing.T) {
 	}
 }
 
+// TestStartNewUsesDurableFieldsNotSnapshot: a doctored snapshot (same
+// id, inflated deadline, foreign cwd) must not bypass the persisted
+// row's window or move the spawn out of the recorded directory — the
+// row, not the argument, is the truth (§6).
+func TestStartNewUsesDurableFieldsNotSnapshot(t *testing.T) {
+	db := mustOpen(t)
+	eng := &fakeEngine{}
+	ctx := context.Background()
+
+	live, _, err := newManager(db, eng, 1700000000).Ensure(ctx, "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	doctored := live
+	doctored.ActivationDeadline = 9700000000 // far future
+	doctored.Cwd = "/somewhere/else"
+
+	late := newManager(db, eng, 1700000121) // past the DURABLE deadline
+	if err := late.StartNew(ctx, doctored); err == nil {
+		t.Fatal("StartNew honored a snapshot deadline over the persisted one")
+	}
+	if len(eng.specs) != 0 {
+		t.Fatalf("engine spawned %d times past the durable deadline, want 0", len(eng.specs))
+	}
+
+	// Within the window, the spawn uses the ROW's cwd, not the snapshot's.
+	inWindow := newManager(db, eng, 1700000010)
+	if err := inWindow.StartNew(ctx, doctored); err != nil {
+		t.Fatalf("StartNew within window: %v", err)
+	}
+	if len(eng.specs) != 1 || eng.specs[0].Cwd != live.Cwd {
+		t.Errorf("engine cwd = %q, want the recorded %q", eng.specs[0].Cwd, live.Cwd)
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {

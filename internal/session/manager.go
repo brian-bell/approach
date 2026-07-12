@@ -171,19 +171,14 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 // below closes the other half — a turn that limps in after expiry must
 // not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
-	// Refuse before spawning, not just after: queue delays can eat the
-	// whole window between Ensure and here, and Engine has no contract
-	// to be side-effect-free on an already-cancelled context — the only
-	// spawn that provably does nothing is the one never started.
-	if m.now().Unix() >= live.ActivationDeadline {
-		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", live.SessionID)
-	}
-	// The caller's snapshot must still be the thread's creating row.
-	// Per-thread serialization should make a stale snapshot impossible,
-	// but Engine.Start is a side-effecting spawn — the one class of call
-	// that must not lean on caller discipline: a duplicate or
-	// already-replaced session would run a whole unintended agent turn
-	// before ActivateSession's guard could object.
+	// The caller's snapshot identifies WHICH session; every durable
+	// fact about it — status, deadline, cwd — is re-read from the row
+	// before the spawn. Engine.Start is a side-effecting call, the one
+	// class that must not lean on caller discipline: a stale snapshot
+	// (duplicate call, replaced session) or a doctored one (later
+	// deadline, different cwd) would otherwise run a whole unintended
+	// agent turn — or run it outside the session's canonical directory
+	// (§6) — before ActivateSession's guard could object.
 	current, ok, err := store.ResolveLiveSession(ctx, m.db, live.ThreadKey)
 	if err != nil {
 		return fmt.Errorf("session: first turn for %s: %w", live.SessionID, err)
@@ -191,23 +186,30 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	if !ok || current.SessionID != live.SessionID || current.Status != "creating" {
 		return fmt.Errorf("session: first turn for %s refused — it is no longer %s's creating session", live.SessionID, live.ThreadKey)
 	}
+	// Refuse before spawning, not just after: queue delays can eat the
+	// whole window between Ensure and here, and Engine has no contract
+	// to be side-effect-free on an already-cancelled context — the only
+	// spawn that provably does nothing is the one never started.
+	if m.now().Unix() >= current.ActivationDeadline {
+		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", current.SessionID)
+	}
 	// Only the ENGINE runs under the deadline: the activation write
 	// below is a local store update that must not be starved by a turn
 	// that finished with seconds to spare.
-	turnCtx, cancel := context.WithDeadline(ctx, time.Unix(live.ActivationDeadline, 0))
+	turnCtx, cancel := context.WithDeadline(ctx, time.Unix(current.ActivationDeadline, 0))
 	defer cancel()
 	if err := m.engine.Start(turnCtx, Spec{
-		SessionID: live.SessionID,
-		ThreadKey: live.ThreadKey,
-		Cwd:       live.Cwd,
+		SessionID: current.SessionID,
+		ThreadKey: current.ThreadKey,
+		Cwd:       current.Cwd,
 	}); err != nil {
-		return fmt.Errorf("session: first turn for %s: %w", live.SessionID, err)
+		return fmt.Errorf("session: first turn for %s: %w", current.SessionID, err)
 	}
-	if m.now().Unix() >= live.ActivationDeadline {
-		return fmt.Errorf("session: first turn for %s finished after its activation deadline — left creating for the §4.1 expiry retry", live.SessionID)
+	if m.now().Unix() >= current.ActivationDeadline {
+		return fmt.Errorf("session: first turn for %s finished after its activation deadline — left creating for the §4.1 expiry retry", current.SessionID)
 	}
-	if err := store.ActivateSession(ctx, m.db, live.SessionID); err != nil {
-		return fmt.Errorf("session: activate %s: %w", live.SessionID, err)
+	if err := store.ActivateSession(ctx, m.db, current.SessionID); err != nil {
+		return fmt.Errorf("session: activate %s: %w", current.SessionID, err)
 	}
 	return nil
 }
