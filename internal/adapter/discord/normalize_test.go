@@ -139,6 +139,54 @@ func TestNormalizeRefusals(t *testing.T) {
 	}
 }
 
+// TestNormalizeAttachments: platform attachments ride the event as
+// externally-authored DATA — url, filename, content type and size
+// pass through verbatim (never dereferenced at ingest; egress policy
+// is C9/C10 territory), and an entry with no URL is skipped: content
+// that cannot be fetched is noise, but its siblings and the message
+// survive.
+func TestNormalizeAttachments(t *testing.T) {
+	m := msg("9", "chan1", "", "123", "see attached")
+	m.Attachments = []*discordgo.MessageAttachment{
+		{URL: "https://cdn.discordapp.com/a.pdf", Filename: "a.pdf", ContentType: "application/pdf", Size: 12345},
+		{URL: "", Filename: "ghost.bin"}, // unfetchable — skipped
+		{URL: "https://cdn.discordapp.com/b.png", Filename: "../evil.png", ContentType: "image/png", Size: 99},
+	}
+	ev, err := Normalize(m)
+	if err != nil {
+		t.Fatalf("Normalize: %v", err)
+	}
+	if len(ev.Attachments) != 2 {
+		t.Fatalf("attachments = %d, want 2 (blank-URL entry skipped)", len(ev.Attachments))
+	}
+	a := ev.Attachments[0]
+	if a.URL != "https://cdn.discordapp.com/a.pdf" || a.Filename != "a.pdf" ||
+		a.ContentType != "application/pdf" || a.Size != 12345 {
+		t.Errorf("attachment[0] = %+v, want verbatim platform fields", a)
+	}
+	// Filename is display-only data and passes through verbatim, path
+	// separators included — sanitizing is the CONSUMER's job at point
+	// of use, and mangling here would hide what the sender actually
+	// supplied from the audit trail.
+	if ev.Attachments[1].Filename != "../evil.png" {
+		t.Errorf("attachment[1].Filename = %q, want the verbatim externally-authored name", ev.Attachments[1].Filename)
+	}
+}
+
+// TestNormalizeAttachmentOnlyMessage: an attachment with no text is a
+// valid message — refusing it would drop real traffic (screenshots).
+func TestNormalizeAttachmentOnlyMessage(t *testing.T) {
+	m := msg("10", "chan1", "", "123", "")
+	m.Attachments = []*discordgo.MessageAttachment{{URL: "https://cdn.discordapp.com/x.png", Filename: "x.png"}}
+	ev, err := Normalize(m)
+	if err != nil {
+		t.Fatalf("Normalize refused an attachment-only message: %v", err)
+	}
+	if len(ev.Attachments) != 1 || ev.Text != "" {
+		t.Errorf("event = text %q + %d attachments, want empty text + 1 attachment", ev.Text, len(ev.Attachments))
+	}
+}
+
 // TestNormalizeBotSender: other bots' messages ARE normalized — the
 // trust model contains them (unmapped sender ⇒ untrusted, §6) and the
 // adapter stays thin; whether an untrusted event earns a turn is

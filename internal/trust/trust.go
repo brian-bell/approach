@@ -113,6 +113,12 @@ const (
 	// local content — it must not taint, or draft→critique→approve→act
 	// dies (§7).
 	IngestCodexCritique
+	// IngestAttachment is a file attached to an inbound message. It
+	// taints at EVERY author level, owner included: file content is
+	// not authored by its sender in any verifiable way — a forwarded
+	// PDF is web content in a trench coat — and the §6 sessions sketch
+	// lists "attachment" as a taint source unconditionally.
+	IngestAttachment
 )
 
 // Taints reports whether ingesting this content gains the session the
@@ -127,7 +133,7 @@ func Taints(kind IngestKind, author Level) bool {
 		return normalize(author) != Owner
 	case IngestCodexCritique:
 		return false
-	default: // IngestWebFetch, IngestCodexWebRead, anything unknown
+	default: // IngestWebFetch, IngestCodexWebRead, IngestAttachment, anything unknown
 		return true
 	}
 }

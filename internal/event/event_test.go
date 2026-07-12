@@ -69,16 +69,18 @@ func TestEventJSONRoundTrip(t *testing.T) {
 	owner := "brian"
 	reply := "discord:msg:111"
 	ev := event.Event{
-		Channel:     "discord",
-		ThreadKey:   "discord:thread:42",
-		DedupKey:    "discord:msg:9871",
-		Sender:      "123",
-		OwnerID:     &owner,
-		Trust:       "owner",
-		Kind:        "message",
-		Text:        "hi",
-		Attachments: []event.Attachment{},
-		ReplyTo:     &reply,
+		Channel:   "discord",
+		ThreadKey: "discord:thread:42",
+		DedupKey:  "discord:msg:9871",
+		Sender:    "123",
+		OwnerID:   &owner,
+		Trust:     "owner",
+		Kind:      "message",
+		Text:      "hi",
+		Attachments: []event.Attachment{
+			{URL: "https://cdn.example/a.pdf", Filename: "a.pdf", ContentType: "application/pdf", Size: 12345},
+		},
+		ReplyTo: &reply,
 	}
 	raw, err := json.Marshal(ev)
 	if err != nil {

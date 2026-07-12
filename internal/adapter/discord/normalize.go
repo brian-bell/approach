@@ -64,5 +64,26 @@ func Normalize(m *discordgo.MessageCreate) (event.Event, error) {
 		reply := "discord:msg:" + ref.MessageID
 		ev.ReplyTo = &reply
 	}
+	// Attachments ride the event as externally-authored DATA (§7):
+	// every field is the platform's report passed through verbatim —
+	// URLs recorded, never dereferenced at ingest, and filenames kept
+	// exactly as the sender supplied them (the audit trail must show
+	// what arrived; sanitizing is the consumer's job at point of use).
+	// An entry with no URL is skipped: content that cannot be fetched
+	// is noise, but its siblings and the message survive. The taint
+	// consequence (trust.IngestAttachment — taints at every author
+	// level) is the router's to apply when it consumes a non-empty
+	// attachments array.
+	for _, att := range m.Attachments {
+		if att == nil || att.URL == "" {
+			continue
+		}
+		ev.Attachments = append(ev.Attachments, event.Attachment{
+			URL:         att.URL,
+			Filename:    att.Filename,
+			ContentType: att.ContentType,
+			Size:        int64(att.Size),
+		})
+	}
 	return ev, nil
 }

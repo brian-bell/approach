@@ -13,11 +13,20 @@ import "encoding/json"
 // type exists now so the wire shape ("attachments": []) is stable from
 // the first persisted payload — this column outlives adapter versions.
 type Attachment struct {
-	// URL is the platform-hosted location of the attachment content.
+	// URL is the platform-hosted location of the attachment content —
+	// recorded, never dereferenced at ingest (egress policy is
+	// C9/C10 territory, §7).
 	URL string `json:"url"`
 	// Filename is the platform-reported name — externally authored,
-	// display-only, never a filesystem path (§7).
+	// display-only, never a filesystem path (§7). It passes through
+	// verbatim (path separators included): sanitizing is the
+	// consumer's job at point of use, and mangling at ingest would
+	// hide what the sender actually supplied from the audit trail.
 	Filename string `json:"filename"`
+	// ContentType and Size are the platform's own report — policy
+	// hints, not verified facts about the bytes behind the URL.
+	ContentType string `json:"content_type"`
+	Size        int64  `json:"size"`
 }
 
 // Event is the §6 inbound contract. The trust field is load-bearing —

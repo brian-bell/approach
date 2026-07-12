@@ -221,6 +221,32 @@ func TestDiscordIngestWeakAuthClamps(t *testing.T) {
 	}
 }
 
+// TestDiscordIngestPersistsAttachments: an attachment survives the
+// write-on-receipt path intact — the payload is the §6 replay source,
+// and the router's taint decision (trust.IngestAttachment) keys off
+// this array being faithful.
+func TestDiscordIngestPersistsAttachments(t *testing.T) {
+	sdb := testStore(t)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+
+	m := inbound("1", "see attached")
+	m.Attachments = []*discordgo.MessageAttachment{
+		{URL: "https://cdn.discordapp.com/a.pdf", Filename: "a.pdf", ContentType: "application/pdf", Size: 12345},
+	}
+	handle(m)
+
+	_, payload := payloadOf(t, sdb)
+	atts, ok := payload["attachments"].([]any)
+	if !ok || len(atts) != 1 {
+		t.Fatalf("payload attachments = %v, want one entry", payload["attachments"])
+	}
+	att, _ := atts[0].(map[string]any)
+	if att["url"] != "https://cdn.discordapp.com/a.pdf" || att["filename"] != "a.pdf" ||
+		att["content_type"] != "application/pdf" || att["size"] != float64(12345) {
+		t.Errorf("attachment round-tripped as %v, want verbatim platform fields", att)
+	}
+}
+
 // TestDiscordIngestInsertFailureIsLoud: a store that cannot accept the
 // write (closed here — the nearest reachable stand-in for disk-full or
 // corruption) must surface an ERROR. The gateway does not redeliver;

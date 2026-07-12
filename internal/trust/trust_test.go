@@ -94,6 +94,13 @@ func TestTaints(t *testing.T) {
 		{"web fetch always", trust.IngestWebFetch, trust.Owner, true},
 		{"codex web read always", trust.IngestCodexWebRead, trust.Owner, true},
 		{"read-only codex critique never", trust.IngestCodexCritique, trust.Untrusted, false},
+		// Attachments taint at EVERY author level, owner included: a
+		// file's content is not authored by its sender in any
+		// verifiable way — a forwarded PDF is web content in a trench
+		// coat (§7; the §6 sessions sketch lists "attachment" as a
+		// taint source unconditionally).
+		{"owner's attachment still taints", trust.IngestAttachment, trust.Owner, true},
+		{"stranger's attachment taints", trust.IngestAttachment, trust.Untrusted, true},
 		// The zero value is not a kind: a path that forgot to classify
 		// itself must taint, even claiming owner authorship.
 		{"uninitialized kind fails safe", trust.IngestKind(0), trust.Owner, true},
