@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
 	"github.com/brian-bell/approach/internal/store"
@@ -120,6 +121,18 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		return 1
 	}
 
+	// Adapter validation sits with config loading, BEFORE the store
+	// opens: a refused startup must refuse before this process migrates
+	// the schema or runs the identity full-sync — same rule as a bad
+	// approach.toml.
+	if err := validateDiscordAdapter(cfg, logger); err != nil {
+		logger.Error("discord adapter", "error", err.Error())
+		// A configured credential that cannot be read is a refusal a
+		// restart cannot fix (deploy the file, then start) — same
+		// posture as ErrSchemaTooNew.
+		return exitUnrecoverable
+	}
+
 	db, err = store.Open(filepath.Join(*state, "approach.db"))
 	if err != nil {
 		logger.Error("open state store", "error", err.Error())
@@ -148,6 +161,44 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	}
 	logger.Info("drained, shutting down")
 	return 0
+}
+
+// validateDiscordAdapter proves the C1 Discord adapter COULD start —
+// credential readable, adapter constructible — without opening the
+// gateway. Deliberately not started yet: the gateway does not redeliver,
+// so a live connection whose handler cannot persist events would consume
+// messages into a debug log and lose them — the opposite of the §4.1
+// write-on-receipt contract. The normalizer slice (x6n.1.2) flips this
+// validation into a running adapter; failing loud on the credential NOW
+// keeps the deploy honest in the meantime.
+//
+// Absent config or channel → nothing to validate. A discord channel
+// without token_file → valid but LOUD: the channel may exist only to
+// enroll identities before the credential is deployed, but a dormant
+// channel must never look like a running one. A token_file that does
+// not yield a working adapter is an error — explicit config must work
+// (§6 posture, same rule as --config).
+func validateDiscordAdapter(cfg *config.Config, logger *slog.Logger) error {
+	if cfg == nil {
+		return nil
+	}
+	ch, ok := cfg.Channels["discord"]
+	if !ok {
+		return nil
+	}
+	if ch.TokenFile == "" {
+		logger.Warn("channels.discord has no token_file — adapter not started; the channel is enrolled but unreachable")
+		return nil
+	}
+	token, err := discord.ReadToken(ch.TokenFile)
+	if err != nil {
+		return err
+	}
+	if _, err := discord.New(token, discord.PlaceholderHandler(logger), logger); err != nil {
+		return err
+	}
+	logger.Info("discord adapter validated — gateway connection deferred until the event normalizer lands (x6n.1.2)")
+	return nil
 }
 
 // loadDaemonConfig loads approach.toml for the daemon. An explicit path
