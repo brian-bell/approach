@@ -133,14 +133,26 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 	if err != nil {
 		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: %w", threadKey, err)
 	}
-	now := m.now().Unix()
+	// The deadline is CEILED to a whole Unix second: the schema stores
+	// seconds, and flooring a sub-second creation instant would shave
+	// up to a second off the window — at the 1s minimum, a session
+	// pinned at :00.999 would expire a millisecond later. Rounding up
+	// guarantees the row never expires before ActivationWindow has
+	// actually elapsed (§4.1); a stray extra sub-second of patience is
+	// the harmless direction.
+	created := m.now()
+	expiry := created.Add(m.window)
+	deadline := expiry.Unix()
+	if expiry.After(time.Unix(deadline, 0)) {
+		deadline++
+	}
 	s := store.Session{
 		ThreadKey:          threadKey,
 		SessionID:          id,
 		Cwd:                cwd,
 		TrustFloor:         trustFloor,
-		CreatedAt:          now,
-		ActivationDeadline: now + int64(m.window.Seconds()),
+		CreatedAt:          created.Unix(),
+		ActivationDeadline: deadline,
 	}
 	// The insert is the LAST fallible step: once it commits, this
 	// method must report success — a read-back could fail (context

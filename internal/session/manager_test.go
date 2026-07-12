@@ -461,6 +461,29 @@ func TestStartNewActivatesThroughShutdown(t *testing.T) {
 	}
 }
 
+// TestPinCeilsSubSecondDeadline: a sub-second creation instant must
+// not shave the window — the persisted deadline rounds UP, so the row
+// cannot expire before ActivationWindow has elapsed.
+func TestPinCeilsSubSecondDeadline(t *testing.T) {
+	db := mustOpen(t)
+	m := session.NewManager(db, &fakeEngine{}, session.Config{
+		ActivationWindow: time.Second,
+		Logger:           discardLogger(),
+		// :00.999 — the worst-case sub-second remainder.
+		Now: func() time.Time { return time.Unix(1700000000, 999_000_000) },
+	})
+
+	live, _, err := m.Ensure(context.Background(), "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	// Floor would store 1700000001 (expiring 1ms after the pin); ceil
+	// stores 1700000002, preserving the full second.
+	if live.ActivationDeadline != 1700000002 {
+		t.Errorf("deadline = %d, want 1700000002 (ceiled past the sub-second remainder)", live.ActivationDeadline)
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {
