@@ -51,6 +51,12 @@ func (f *fakeEngine) Start(ctx context.Context, spec session.Spec) error {
 	return f.err
 }
 
+// Resume satisfies session.Engine; tests that exercise resume use
+// resumeEngine, so reaching this is itself a routing bug.
+func (f *fakeEngine) Resume(context.Context, session.Spec) error {
+	return errors.New("fakeEngine: unexpected Resume call")
+}
+
 // newManager builds a Manager over the given store with an injected
 // clock and a 2-minute activation window.
 func newManager(db *sql.DB, eng session.Engine, at int64) *session.Manager {
@@ -267,6 +273,10 @@ func (blockingEngine) Start(ctx context.Context, _ session.Spec) error {
 	return ctx.Err()
 }
 
+func (blockingEngine) Resume(context.Context, session.Spec) error {
+	return errors.New("blockingEngine: unexpected Resume call")
+}
+
 // TestStartNewBoundsFirstTurnByDeadline: the first turn runs under a
 // timeout of the window remaining — a hung spawn must release the
 // serialized thread queue instead of wedging it past the recovery
@@ -432,6 +442,10 @@ func (e *cancelThenSucceedEngine) Start(context.Context, session.Spec) error {
 	e.specs++
 	e.cancel()
 	return nil
+}
+
+func (e *cancelThenSucceedEngine) Resume(context.Context, session.Spec) error {
+	return errors.New("cancelThenSucceedEngine: unexpected Resume call")
 }
 
 // TestStartNewActivatesThroughShutdown: a first turn that SUCCEEDED
