@@ -14,6 +14,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"runtime/debug"
 	"sync"
@@ -49,9 +50,18 @@ type Queues struct {
 	mu      sync.Mutex
 	pending map[string][]store.QueuedEvent // per-thread FIFO, receipt (id) order
 	claimed map[string]bool                // threads with a live drain goroutine
-	ingest  map[string]*sync.Mutex         // per-thread persist+enqueue serialization
+	ingest  [ingestShards]sync.Mutex       // sharded persist+enqueue serialization
 	wg      sync.WaitGroup                 // one per live drain goroutine
 }
+
+// ingestShards bounds the persist+enqueue lock table. Thread keys are
+// externally sourced (any stranger's DM mints one), so a lock PER key
+// would grow resident memory for the daemon's lifetime — an avoidable
+// exhaustion surface. Sharding keeps the §4.1 ordering guarantee (one
+// thread always hashes to one lock) at a fixed size; the cost is two
+// distinct threads occasionally serializing their inserts, which
+// SQLite's single-writer lock forces anyway.
+const ingestShards = 64
 
 // New builds the queue index over db's events table. ctx bounds every
 // dispatch: once it is cancelled no NEW turn starts — in-flight
@@ -70,7 +80,6 @@ func New(ctx context.Context, db *sql.DB, opts Options) *Queues {
 		now:     now,
 		pending: make(map[string][]store.QueuedEvent),
 		claimed: make(map[string]bool),
-		ingest:  make(map[string]*sync.Mutex),
 	}
 }
 
@@ -105,19 +114,14 @@ func (q *Queues) Persist(ctx context.Context, ev store.Event) (inserted bool, er
 	return true, nil
 }
 
-// ingestLock returns the per-thread persist+enqueue mutex, creating it
-// on first use. Locks accumulate one per thread_key ever seen — bounded
-// by the thread population, and a lock is a few words; an eviction
-// scheme would risk two goroutines holding "the" lock for one thread.
+// ingestLock returns the persist+enqueue mutex for a thread key: its
+// shard by FNV-1a hash. Same key, same lock — the ordering invariant —
+// with a table whose size never depends on how many strangers opened
+// a thread.
 func (q *Queues) ingestLock(threadKey string) *sync.Mutex {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	l, ok := q.ingest[threadKey]
-	if !ok {
-		l = &sync.Mutex{}
-		q.ingest[threadKey] = l
-	}
-	return l
+	h := fnv.New32a()
+	h.Write([]byte(threadKey)) // never errors (hash.Hash contract)
+	return &q.ingest[h.Sum32()%ingestShards]
 }
 
 // Enqueue appends the event to its thread's FIFO and claims the thread
