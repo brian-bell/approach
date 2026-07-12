@@ -760,6 +760,7 @@ func TestMessageDispatch(t *testing.T) {
 	for _, ch := range []*discordgo.Channel{
 		{ID: "thread-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildPublicThread},
 		{ID: "text-1", GuildID: "guild-1", Type: discordgo.ChannelTypeGuildText},
+		{ID: "dm-1", Type: discordgo.ChannelTypeDM},
 	} {
 		if err := s.State.ChannelAdd(ch); err != nil {
 			t.Fatalf("state channel add %s: %v", ch.ID, err)

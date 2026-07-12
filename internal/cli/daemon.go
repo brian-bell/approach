@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
@@ -153,24 +154,101 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		return 1
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// The adapter is built only now — its ingest handler writes to the
+	// store, which had to open (and migrate, and seed) first. The
+	// credential was already proven readable by validateDiscordAdapter
+	// above, so a failure here is unexpected but still unrecoverable.
+	runner, err := newDiscordRunner(cfg, db, logger)
+	if err != nil {
+		logger.Error("discord adapter", "error", err.Error())
+		return exitUnrecoverable
+	}
+
+	signalCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := srv.Serve(ctx); err != nil {
-		logger.Error("admin socket", "error", err.Error())
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
+
+	// The adapter runs supervised: Run only returns on cancellation
+	// (drain/signal) or a terminal gateway refusal — retryable failures
+	// stay inside its own backoff loop. On a terminal refusal the whole
+	// daemon comes down with exitUnrecoverable: a restart cannot mint a
+	// working credential, and a daemon that keeps serving with a dead
+	// channel is quiet degradation (§8).
+	adapterDone := make(chan struct{})
+	var adapterErr error
+	if runner != nil {
+		go func() {
+			defer close(adapterDone)
+			if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				adapterErr = err // read only after <-adapterDone
+				cancel()         // unwind Serve — the failure must not wait for a drain
+			}
+		}()
+	} else {
+		close(adapterDone)
+	}
+
+	serveErr := srv.Serve(ctx)
+	// Serve has returned (drain, signal, or adapter-triggered cancel):
+	// stop the adapter and WAIT for it — the ingest path must be dead
+	// before the deferred db.Close runs, or a message received during
+	// shutdown races a closing store (§4.1).
+	cancel()
+	<-adapterDone
+	if adapterErr != nil {
+		logger.Error("discord adapter terminated", "error", adapterErr.Error())
+		return exitUnrecoverable
+	}
+	if serveErr != nil {
+		logger.Error("admin socket", "error", serveErr.Error())
 		return 1
 	}
 	logger.Info("drained, shutting down")
 	return 0
 }
 
+// adapterRunner is the daemon's view of a channel adapter: one
+// blocking Run under the daemon context. An interface so lifecycle
+// tests can supervise a fake without a gateway.
+type adapterRunner interface {
+	Run(context.Context) error
+}
+
+// newDiscordRunner builds the production discord adapter around the
+// write-on-receipt ingest handler (§4.1). A package-level seam so the
+// daemon lifecycle tests can inject a fake runner; production code
+// never reassigns it. nil-runner (with nil error) means "nothing to
+// run": no config, no discord channel, or a dormant channel without a
+// token_file — validateDiscordAdapter already warned about that
+// loudly before the store opened.
+var newDiscordRunner = func(cfg *config.Config, db *sql.DB, logger *slog.Logger) (adapterRunner, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	ch, ok := cfg.Channels["discord"]
+	if !ok || ch.TokenFile == "" {
+		return nil, nil
+	}
+	token, err := discord.ReadToken(ch.TokenFile)
+	if err != nil {
+		return nil, err
+	}
+	a, err := discord.New(token, discordIngest(db, ch.Auth, logger, time.Now), logger)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
 // validateDiscordAdapter proves the C1 Discord adapter COULD start —
 // credential readable, adapter constructible — without opening the
-// gateway. Deliberately not started yet: the gateway does not redeliver,
-// so a live connection whose handler cannot persist events would consume
-// messages into a debug log and lose them — the opposite of the §4.1
-// write-on-receipt contract. The normalizer slice (x6n.1.2) flips this
-// validation into a running adapter; failing loud on the credential NOW
-// keeps the deploy honest in the meantime.
+// gateway. The real adapter starts later (newDiscordRunner), after the
+// store opens: its handler persists events, and the gateway must never
+// be live before the insert path is (§4.1 — a connection whose handler
+// cannot persist would consume messages the gateway won't redeliver).
+// This early check exists because a refused startup must refuse BEFORE
+// this process migrates the schema or runs the identity full-sync.
 //
 // Absent config or channel → nothing to validate. A discord channel
 // without token_file → valid but LOUD: the channel may exist only to
@@ -197,7 +275,7 @@ func validateDiscordAdapter(cfg *config.Config, logger *slog.Logger) error {
 	if _, err := discord.New(token, discord.PlaceholderHandler(logger), logger); err != nil {
 		return err
 	}
-	logger.Info("discord adapter validated — gateway connection deferred until the event normalizer lands (x6n.1.2)")
+	logger.Info("discord adapter validated — gateway starts once the state store is open")
 	return nil
 }
 
