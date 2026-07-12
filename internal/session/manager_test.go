@@ -326,6 +326,32 @@ func TestStartNewRefusesLateActivation(t *testing.T) {
 	}
 }
 
+// TestStartNewRefusesStaleSnapshot: StartNew must not spawn for a
+// session that is no longer the thread's creating row — a duplicate
+// call (or one racing a replacement) would run a whole unintended
+// agent turn before the activation guard could object.
+func TestStartNewRefusesStaleSnapshot(t *testing.T) {
+	db := mustOpen(t)
+	eng := &fakeEngine{}
+	m := newManager(db, eng, 1700000000)
+	ctx := context.Background()
+
+	live, _, err := m.Ensure(ctx, "discord:dm:a", "owner", t.TempDir())
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if err := m.StartNew(ctx, live); err != nil {
+		t.Fatalf("first StartNew: %v", err)
+	}
+	// Same snapshot again: the row is active now, not creating.
+	if err := m.StartNew(ctx, live); err == nil {
+		t.Fatal("duplicate StartNew spawned a second first turn")
+	}
+	if len(eng.specs) != 1 {
+		t.Errorf("engine started %d times, want 1 — the stale snapshot must be refused before the spawn", len(eng.specs))
+	}
+}
+
 // TestEnsurePinsUniqueIDs: every pin is a fresh UUID — collisions
 // across threads would cross-wire transcripts.
 func TestEnsurePinsUniqueIDs(t *testing.T) {

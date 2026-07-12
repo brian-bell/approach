@@ -178,6 +178,19 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	if m.now().Unix() >= live.ActivationDeadline {
 		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", live.SessionID)
 	}
+	// The caller's snapshot must still be the thread's creating row.
+	// Per-thread serialization should make a stale snapshot impossible,
+	// but Engine.Start is a side-effecting spawn — the one class of call
+	// that must not lean on caller discipline: a duplicate or
+	// already-replaced session would run a whole unintended agent turn
+	// before ActivateSession's guard could object.
+	current, ok, err := store.ResolveLiveSession(ctx, m.db, live.ThreadKey)
+	if err != nil {
+		return fmt.Errorf("session: first turn for %s: %w", live.SessionID, err)
+	}
+	if !ok || current.SessionID != live.SessionID || current.Status != "creating" {
+		return fmt.Errorf("session: first turn for %s refused — it is no longer %s's creating session", live.SessionID, live.ThreadKey)
+	}
 	// Only the ENGINE runs under the deadline: the activation write
 	// below is a local store update that must not be starved by a turn
 	// that finished with seconds to spare.
