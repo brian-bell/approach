@@ -23,9 +23,12 @@ type LiveSession struct {
 	SessionID          string
 	Status             string // creating | active — the only live states
 	Cwd                string // canonicalized at insert; the spawn dir (§6)
+	Origin             string // task:* workers: spawning thread (§4.5); "" otherwise
 	TrustFloor         string
 	CreatedAt          int64
 	ActivationDeadline int64 // meaningful while creating (§4.1)
+	LastSeen           int64 // last completed turn; 0 = never touched (§6)
+	Turns              int64 // completed turns; the turn-cap input (§3)
 }
 
 // ResolveLiveSession finds the thread's live session. At most one row
@@ -37,13 +40,14 @@ type LiveSession struct {
 // crash the insert instead).
 func ResolveLiveSession(ctx context.Context, db *sql.DB, threadKey string) (LiveSession, bool, error) {
 	var s LiveSession
-	var deadline sql.NullInt64
+	var deadline, lastSeen, turns sql.NullInt64
+	var origin sql.NullString
 	err := db.QueryRowContext(ctx,
-		`SELECT thread_key, session_id, status, cwd, trust_floor, created_at, activation_deadline
+		`SELECT thread_key, session_id, status, cwd, origin, trust_floor, created_at, activation_deadline, last_seen, turns
 		 FROM sessions
 		 WHERE thread_key = ? AND status IN ('creating', 'active')`,
 		threadKey,
-	).Scan(&s.ThreadKey, &s.SessionID, &s.Status, &s.Cwd, &s.TrustFloor, &s.CreatedAt, &deadline)
+	).Scan(&s.ThreadKey, &s.SessionID, &s.Status, &s.Cwd, &origin, &s.TrustFloor, &s.CreatedAt, &deadline, &lastSeen, &turns)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LiveSession{}, false, nil
 	}
@@ -51,6 +55,9 @@ func ResolveLiveSession(ctx context.Context, db *sql.DB, threadKey string) (Live
 		return LiveSession{}, false, fmt.Errorf("store: resolve live session %s: %w", threadKey, err)
 	}
 	s.ActivationDeadline = deadline.Int64
+	s.LastSeen = lastSeen.Int64
+	s.Turns = turns.Int64
+	s.Origin = origin.String
 	return s, true, nil
 }
 

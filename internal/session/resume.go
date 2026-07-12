@@ -55,6 +55,7 @@ func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
 	}); err != nil {
 		return fmt.Errorf("session: resume %s: %w", current.SessionID, err)
 	}
+	m.touch(ctx, current.SessionID)
 	return nil
 }
 
@@ -68,6 +69,17 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) e
 	live, _, err := m.Ensure(ctx, threadKey, trustFloor, cwd)
 	if err != nil {
 		return fmt.Errorf("session: turn for %s: %w", threadKey, err)
+	}
+	// Cap checks come BEFORE the turn (§3): a session at its turn cap
+	// or past its idle TTL rotates first, and this event lands on the
+	// fresh successor — never one more turn on the retired transcript.
+	if live.Status == "active" {
+		if cause := m.rotationCause(live); cause != "" {
+			live, err = m.rotate(ctx, live, cause)
+			if err != nil {
+				return fmt.Errorf("session: turn for %s: %w", threadKey, err)
+			}
+		}
 	}
 	switch live.Status {
 	case "creating":

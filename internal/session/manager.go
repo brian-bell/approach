@@ -45,9 +45,19 @@ type Spec struct {
 // after mutating the store or mints rows the schema rejects.
 type Config struct {
 	ActivationWindow time.Duration // < 1s (incl. zero) → defaultActivationWindow
+	IdleTTL          time.Duration // < 1s (incl. zero) → defaultIdleTTL; rotation trigger (§3)
+	TurnCap          int64         // < 1 → defaultTurnCap; rotation trigger (§3)
 	Logger           *slog.Logger  // nil → slog.Default()
 	Now              func() time.Time
 }
+
+// defaultIdleTTL and defaultTurnCap mirror the config package's
+// [sessions] defaults (§3) — a zero-value Config rotates on the same
+// caps an unconfigured approach.toml would.
+const (
+	defaultIdleTTL = 4 * time.Hour
+	defaultTurnCap = 50
+)
 
 // defaultActivationWindow is how long a creating session may wait for
 // its first turn before the thread retries fresh (§4.1). Two minutes:
@@ -65,11 +75,13 @@ const defaultActivationWindow = 2 * time.Minute
 // Ensures for one thread cannot happen; the one_live_session index
 // backstops even that, §6).
 type Manager struct {
-	db     *sql.DB
-	engine Engine
-	logger *slog.Logger
-	now    func() time.Time
-	window time.Duration
+	db      *sql.DB
+	engine  Engine
+	logger  *slog.Logger
+	now     func() time.Time
+	window  time.Duration
+	idleTTL time.Duration
+	turnCap int64
 }
 
 // NewManager builds a Manager over the store and engine seams.
@@ -86,12 +98,31 @@ func NewManager(db *sql.DB, engine Engine, cfg Config) *Manager {
 	if window < time.Second {
 		window = defaultActivationWindow
 	}
+	// Like ActivationWindow: sub-second values cannot be honored on
+	// whole-second timestamps. config.Parse rejects them at load time
+	// (fail loud); this clamp is the API-caller backstop, and a NONZERO
+	// value being replaced is warned about, never silent — a zero value
+	// simply means "unset, use the default".
+	idleTTL := cfg.IdleTTL
+	if idleTTL < time.Second {
+		if idleTTL > 0 {
+			logger.Warn("session idle TTL below 1s cannot be honored on whole-second timestamps — using the default",
+				"configured", idleTTL.String(), "default", defaultIdleTTL.String())
+		}
+		idleTTL = defaultIdleTTL
+	}
+	turnCap := cfg.TurnCap
+	if turnCap < 1 {
+		turnCap = defaultTurnCap
+	}
 	return &Manager{
-		db:     db,
-		engine: engine,
-		logger: logger,
-		now:    now,
-		window: window,
+		db:      db,
+		engine:  engine,
+		logger:  logger,
+		now:     now,
+		window:  window,
+		idleTTL: idleTTL,
+		turnCap: turnCap,
 	}
 }
 
@@ -132,30 +163,9 @@ func (m *Manager) Ensure(ctx context.Context, threadKey, trustFloor, cwd string)
 // creating (the schema default), activation deadline stamped in the
 // same insert so a crash can never separate them.
 func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (store.LiveSession, bool, error) {
-	id, err := newSessionID()
+	s, err := m.mint(threadKey, trustFloor, cwd, "")
 	if err != nil {
 		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: %w", threadKey, err)
-	}
-	// The deadline is CEILED to a whole Unix second: the schema stores
-	// seconds, and flooring a sub-second creation instant would shave
-	// up to a second off the window — at the 1s minimum, a session
-	// pinned at :00.999 would expire a millisecond later. Rounding up
-	// guarantees the row never expires before ActivationWindow has
-	// actually elapsed (§4.1); a stray extra sub-second of patience is
-	// the harmless direction.
-	created := m.now()
-	expiry := created.Add(m.window)
-	deadline := expiry.Unix()
-	if expiry.After(time.Unix(deadline, 0)) {
-		deadline++
-	}
-	s := store.Session{
-		ThreadKey:          threadKey,
-		SessionID:          id,
-		Cwd:                cwd,
-		TrustFloor:         trustFloor,
-		CreatedAt:          created.Unix(),
-		ActivationDeadline: deadline,
 	}
 	// The insert is the LAST fallible step: once it commits, this
 	// method must report success — a read-back could fail (context
@@ -167,16 +177,58 @@ func (m *Manager) pin(ctx context.Context, threadKey, trustFloor, cwd string) (s
 	if err != nil {
 		return store.LiveSession{}, false, fmt.Errorf("session: pin %s: %w", threadKey, err)
 	}
-	m.logger.Info("pinned new session", "thread_key", threadKey, "session_id", id)
+	m.logger.Info("pinned new session", "thread_key", threadKey, "session_id", s.SessionID)
 	return store.LiveSession{
 		ThreadKey:          threadKey,
-		SessionID:          id,
+		SessionID:          s.SessionID,
 		Status:             "creating",
 		Cwd:                canonical,
 		TrustFloor:         trustFloor,
 		CreatedAt:          s.CreatedAt,
 		ActivationDeadline: s.ActivationDeadline,
 	}, true, nil
+}
+
+// mint builds a fresh creating-session row: daemon-minted v4 UUID and
+// a ceiled activation deadline. The deadline is CEILED to a whole Unix
+// second: the schema stores seconds, and flooring a sub-second
+// creation instant would shave up to a second off the window — at the
+// 1s minimum, a session pinned at :00.999 would expire a millisecond
+// later. Rounding up guarantees the row never expires before
+// ActivationWindow has actually elapsed (§4.1).
+func (m *Manager) mint(threadKey, trustFloor, cwd, origin string) (store.Session, error) {
+	id, err := newSessionID()
+	if err != nil {
+		return store.Session{}, err
+	}
+	created := m.now()
+	expiry := created.Add(m.window)
+	deadline := expiry.Unix()
+	if expiry.After(time.Unix(deadline, 0)) {
+		deadline++
+	}
+	return store.Session{
+		ThreadKey:          threadKey,
+		SessionID:          id,
+		Cwd:                cwd,
+		Origin:             origin,
+		TrustFloor:         trustFloor,
+		CreatedAt:          created.Unix(),
+		ActivationDeadline: deadline,
+	}, nil
+}
+
+// touch records one completed turn's bookkeeping (§6) — the idle-TTL
+// and turn-cap inputs. It runs under WithoutCancel (the turn HAPPENED;
+// shutdown must not lose its count) and a failure is a loud log, not a
+// turn failure: erroring a turn whose engine work succeeded would
+// invite a replay of completed side effects (§4.6), which is strictly
+// worse than a session outliving its caps by one turn.
+func (m *Manager) touch(ctx context.Context, sessionID string) {
+	if err := store.TouchSession(context.WithoutCancel(ctx), m.db, sessionID, m.now().Unix()); err != nil {
+		m.logger.Error("turn bookkeeping failed — rotation caps may lag this session",
+			"session_id", sessionID, "error", err.Error())
+	}
 }
 
 // StartNew runs the first engine turn for a freshly-pinned session and
@@ -258,6 +310,7 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	if err := store.ActivateSession(context.WithoutCancel(ctx), m.db, current.SessionID); err != nil {
 		return fmt.Errorf("session: activate %s: %w", current.SessionID, err)
 	}
+	m.touch(ctx, current.SessionID)
 	return nil
 }
 

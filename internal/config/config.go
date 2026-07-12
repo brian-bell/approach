@@ -287,8 +287,12 @@ func (c *Config) validateChannels(fail failFunc) {
 }
 
 func (c *Config) validateSessions(fail failFunc) {
-	if c.Sessions.IdleTTL <= 0 {
-		fail("sessions.idle_ttl must be positive, got %v", c.Sessions.IdleTTL.Duration())
+	// The floor is 1s, not merely positive: session timestamps are
+	// whole Unix seconds (§6), so a sub-second TTL cannot be honored —
+	// and silently rounding an explicit "500ms" to anything else would
+	// swap the operator's retention policy without a word (fail loud).
+	if c.Sessions.IdleTTL < Duration(time.Second) {
+		fail("sessions.idle_ttl must be at least 1s (timestamps are whole seconds), got %v", c.Sessions.IdleTTL.Duration())
 	}
 	if c.Sessions.TurnCap < 1 {
 		fail("sessions.turn_cap must be >= 1, got %d", c.Sessions.TurnCap)
