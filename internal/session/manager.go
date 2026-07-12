@@ -190,7 +190,12 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	// whole window between Ensure and here, and Engine has no contract
 	// to be side-effect-free on an already-cancelled context — the only
 	// spawn that provably does nothing is the one never started.
-	if m.now().Unix() >= current.ActivationDeadline {
+	// One clock read serves both the guard and the timeout below: a
+	// second read could cross the deadline in between, and a zero
+	// timeout is not a refusal — engines may do work under a cancelled
+	// context.
+	nowUnix := m.now().Unix()
+	if nowUnix >= current.ActivationDeadline {
 		return fmt.Errorf("session: first turn for %s not started — activation deadline already passed, row left for the §4.1 expiry retry", current.SessionID)
 	}
 	// Only the ENGINE runs under the deadline: the activation write
@@ -200,7 +205,7 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	// against the wall clock — so the enforcement clock is the same
 	// injectable one every other decision in this package uses
 	// (positive by the pre-check above).
-	remaining := time.Duration(current.ActivationDeadline-m.now().Unix()) * time.Second
+	remaining := time.Duration(current.ActivationDeadline-nowUnix) * time.Second
 	turnCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	if err := m.engine.Start(turnCtx, Spec{
