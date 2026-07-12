@@ -21,8 +21,10 @@ import (
 //     collapses on it (§4.1).
 //   - sender: the native user id — exactly what the identities table
 //     keys off (§6). Label/owner resolution is the x6n.1.3 slice.
-//   - trust: untrusted, unconditionally, until the identities lookup
-//     lands (x6n.1.3) — ambiguity is untrusted, never blank (§6).
+//   - trust: untrusted, unconditionally — the fail-closed BASELINE the
+//     ingest handler upgrades from after the §6 identities lookup;
+//     this function has no store access, deliberately (ambiguity is
+//     untrusted, never blank).
 //     Bot-authored messages normalize like any other sender: the
 //     trust model contains them, and whether an untrusted event earns
 //     a turn is router policy, not adapter policy.

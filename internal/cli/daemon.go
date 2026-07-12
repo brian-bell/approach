@@ -234,7 +234,7 @@ var newDiscordRunner = func(cfg *config.Config, db *sql.DB, logger *slog.Logger)
 	if err != nil {
 		return nil, err
 	}
-	a, err := discord.New(token, discordIngest(db, logger, time.Now), logger)
+	a, err := discord.New(token, discordIngest(db, ch.Auth, logger, time.Now), logger)
 	if err != nil {
 		return nil, err
 	}

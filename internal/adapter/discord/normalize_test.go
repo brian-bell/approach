@@ -47,8 +47,9 @@ func TestNormalizeDM(t *testing.T) {
 	if ev.Text != "hello" {
 		t.Errorf("text = %q, want hello", ev.Text)
 	}
-	// Trust stamping via identities lookup is x6n.1.3; until then every
-	// event is untrusted — ambiguity is untrusted, never blank (§6).
+	// Normalize's trust is the fail-closed baseline the ingest handler
+	// upgrades after the identities lookup — from here it is always
+	// untrusted, never blank (§6).
 	if ev.Trust != "untrusted" {
 		t.Errorf("trust = %q, want untrusted (fail closed until the identities lookup lands)", ev.Trust)
 	}

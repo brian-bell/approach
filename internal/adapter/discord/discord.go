@@ -3,8 +3,9 @@
 // separate bridge process (§10). This layer owns connect, reconnect
 // backoff, and the DM + thread subscription; every inbound message is
 // handed raw to an injected handler. Normalization into the §6 event
-// contract and trust stamping are the next slices (x6n.1.2, x6n.1.3) —
-// this package deliberately imports nothing from store or trust.
+// contract lives beside it (Normalize); trust stamping and persistence
+// belong to the handler the daemon injects — this package deliberately
+// imports nothing from store or trust.
 package discord
 
 import (

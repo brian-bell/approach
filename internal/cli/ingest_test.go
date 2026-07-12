@@ -2,7 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -39,7 +41,7 @@ func inbound(id, content string) *discordgo.MessageCreate {
 func TestDiscordIngestPersistsEvent(t *testing.T) {
 	sdb := testStore(t)
 	now := time.Unix(1700000000, 0)
-	handle := discordIngest(sdb, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func() time.Time { return now })
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func() time.Time { return now })
 
 	handle(inbound("9871", "hello"))
 
@@ -64,7 +66,7 @@ func TestDiscordIngestPersistsEvent(t *testing.T) {
 func TestDiscordIngestDuplicateCollapses(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 
 	handle(inbound("1", "once"))
 	handle(inbound("1", "once"))
@@ -87,7 +89,7 @@ func TestDiscordIngestDuplicateCollapses(t *testing.T) {
 func TestDiscordIngestRefusedMessageIsLoudDrop(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 
 	m := inbound("1", "x")
 	m.Author = nil
@@ -105,6 +107,120 @@ func TestDiscordIngestRefusedMessageIsLoudDrop(t *testing.T) {
 	}
 }
 
+// seedTestIdentities enrolls one owner and one known sender, the §6
+// lookup fixtures for the stamping tests.
+func seedTestIdentities(t *testing.T, db *sql.DB) {
+	t.Helper()
+	err := store.SeedIdentities(context.Background(), db, []store.Identity{
+		{Channel: "discord", NativeID: "owner-1", Trust: "owner", OwnerID: "brian", Label: "Brian"},
+		{Channel: "discord", NativeID: "known-1", Trust: "known", Label: "Friend"},
+	})
+	if err != nil {
+		t.Fatalf("seed identities: %v", err)
+	}
+}
+
+func inboundFrom(authorID string) *discordgo.MessageCreate {
+	m := inbound("1", "hi")
+	m.Author.ID = authorID
+	return m
+}
+
+// payloadOf reads back the single event row's payload.
+func payloadOf(t *testing.T, db *sql.DB) (trustCol string, payload map[string]any) {
+	t.Helper()
+	var raw string
+	if err := db.QueryRow(`SELECT trust, payload FROM events`).Scan(&trustCol, &raw); err != nil {
+		t.Fatalf("read back event: %v", err)
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatalf("payload is not JSON: %v", err)
+	}
+	return trustCol, payload
+}
+
+// TestDiscordIngestStampsOwner: an enrolled owner's message carries
+// trust=owner and the canonical owner_id in the payload — the §6
+// identities lookup, stamped at ingest so the queue replays with the
+// trust the adapter saw, never re-derived later.
+func TestDiscordIngestStampsOwner(t *testing.T) {
+	sdb := testStore(t)
+	seedTestIdentities(t, sdb)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+
+	handle(inboundFrom("owner-1"))
+
+	trustCol, payload := payloadOf(t, sdb)
+	if trustCol != "owner" {
+		t.Errorf("trust column = %q, want owner", trustCol)
+	}
+	if payload["trust"] != "owner" || payload["owner_id"] != "brian" {
+		t.Errorf("payload trust/owner_id = %v/%v, want owner/brian (§4.4 approval matching needs this)", payload["trust"], payload["owner_id"])
+	}
+}
+
+// TestDiscordIngestStampsKnown: a known sender stamps known, and never
+// carries an owner_id — only owner rows hold the approval principal.
+func TestDiscordIngestStampsKnown(t *testing.T) {
+	sdb := testStore(t)
+	seedTestIdentities(t, sdb)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+
+	handle(inboundFrom("known-1"))
+
+	trustCol, payload := payloadOf(t, sdb)
+	if trustCol != "known" {
+		t.Errorf("trust column = %q, want known", trustCol)
+	}
+	if payload["owner_id"] != nil {
+		t.Errorf("payload owner_id = %v, want null for a known sender", payload["owner_id"])
+	}
+}
+
+// TestDiscordIngestUnmappedSenderIsUntrusted is the §6 deny-by-default
+// drill: no identities row means untrusted — a valid verdict, not an
+// error, and never a dropped message.
+func TestDiscordIngestUnmappedSenderIsUntrusted(t *testing.T) {
+	sdb := testStore(t)
+	seedTestIdentities(t, sdb)
+	var log bytes.Buffer
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+
+	handle(inboundFrom("stranger-9"))
+
+	trustCol, payload := payloadOf(t, sdb)
+	if trustCol != "untrusted" {
+		t.Errorf("trust column = %q, want untrusted (unmapped sender, §6)", trustCol)
+	}
+	if payload["owner_id"] != nil {
+		t.Errorf("payload owner_id = %v, want null", payload["owner_id"])
+	}
+	if bytes.Contains(log.Bytes(), []byte("ERROR")) {
+		t.Errorf("an unmapped sender is not an error:\n%s", log.String())
+	}
+}
+
+// TestDiscordIngestWeakAuthClamps: even an enrolled OWNER row cannot
+// stamp owner through a weak-auth channel — the clamp is re-enforced
+// at ingest (§7: the identities table can drift past config
+// validation), and a clamped stamp carries no owner_id: the approval
+// principal must never ride a spoofable surface (§4.4).
+func TestDiscordIngestWeakAuthClamps(t *testing.T) {
+	sdb := testStore(t)
+	seedTestIdentities(t, sdb)
+	handle := discordIngest(sdb, "weak", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+
+	handle(inboundFrom("owner-1"))
+
+	trustCol, payload := payloadOf(t, sdb)
+	if trustCol != "known" {
+		t.Errorf("trust column = %q, want known (owner clamped by weak auth)", trustCol)
+	}
+	if payload["owner_id"] != nil {
+		t.Errorf("payload owner_id = %v, want null on a clamped stamp", payload["owner_id"])
+	}
+}
+
 // TestDiscordIngestInsertFailureIsLoud: a store that cannot accept the
 // write (closed here — the nearest reachable stand-in for disk-full or
 // corruption) must surface an ERROR. The gateway does not redeliver;
@@ -112,7 +228,7 @@ func TestDiscordIngestRefusedMessageIsLoudDrop(t *testing.T) {
 func TestDiscordIngestInsertFailureIsLoud(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 	_ = sdb.Close()
 
 	handle(inbound("1", "attacker-authored s3cret"))
