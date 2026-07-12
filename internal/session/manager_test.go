@@ -37,14 +37,17 @@ func mustOpen(t *testing.T) *sql.DB {
 	return db
 }
 
-// fakeEngine records Start specs and returns scripted errors.
+// fakeEngine records Start specs (and each context's liveness at
+// entry) and returns scripted errors.
 type fakeEngine struct {
-	specs []session.Spec
-	err   error
+	specs   []session.Spec
+	ctxErrs []error // ctx.Err() observed at Start entry
+	err     error
 }
 
-func (f *fakeEngine) Start(_ context.Context, spec session.Spec) error {
+func (f *fakeEngine) Start(ctx context.Context, spec session.Spec) error {
 	f.specs = append(f.specs, spec)
+	f.ctxErrs = append(f.ctxErrs, ctx.Err())
 	return f.err
 }
 
@@ -213,6 +216,11 @@ func TestStartNewActivatesOnSuccess(t *testing.T) {
 	if spec.Cwd != live.Cwd {
 		t.Errorf("engine got cwd %q, want the recorded %q (§6)", spec.Cwd, live.Cwd)
 	}
+	// The turn context must be LIVE at spawn: the window bound follows
+	// the injected clock, so a context-honoring engine actually runs.
+	if eng.ctxErrs[0] != nil {
+		t.Errorf("engine received an already-dead context (%v) inside the activation window", eng.ctxErrs[0])
+	}
 
 	got, ok, err := store.ResolveLiveSession(ctx, db, "discord:dm:a")
 	if err != nil || !ok {
@@ -260,15 +268,18 @@ func (blockingEngine) Start(ctx context.Context, _ session.Spec) error {
 }
 
 // TestStartNewBoundsFirstTurnByDeadline: the first turn runs under a
-// context deadline derived from the row's activation_deadline — a hung
-// spawn must release the serialized thread queue instead of wedging it
-// past the recovery window, and the row stays creating for the §4.1
-// expiry retry. (The pinned deadline here is far in the wall-clock
-// past, so the derived context is already expired — the strongest form
-// of "the engine outlived its window".)
+// timeout of the window remaining — a hung spawn must release the
+// serialized thread queue instead of wedging it past the recovery
+// window, and the row stays creating for the §4.1 expiry retry. The
+// window is 1s so the blocking engine's cancellation fires in real
+// time.
 func TestStartNewBoundsFirstTurnByDeadline(t *testing.T) {
 	db := mustOpen(t)
-	m := newManager(db, blockingEngine{}, 1700000000)
+	m := session.NewManager(db, blockingEngine{}, session.Config{
+		ActivationWindow: time.Second,
+		Logger:           discardLogger(),
+		Now:              func() time.Time { return time.Unix(1700000000, 0) },
+	})
 	ctx := context.Background()
 
 	live, _, err := m.Ensure(ctx, "discord:dm:a", "owner", t.TempDir())

@@ -195,8 +195,13 @@ func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
 	}
 	// Only the ENGINE runs under the deadline: the activation write
 	// below is a local store update that must not be starved by a turn
-	// that finished with seconds to spare.
-	turnCtx, cancel := context.WithDeadline(ctx, time.Unix(current.ActivationDeadline, 0))
+	// that finished with seconds to spare. The bound is a TIMEOUT of
+	// the window remaining on m.now()'s clock — not WithDeadline
+	// against the wall clock — so the enforcement clock is the same
+	// injectable one every other decision in this package uses
+	// (positive by the pre-check above).
+	remaining := time.Duration(current.ActivationDeadline-m.now().Unix()) * time.Second
+	turnCtx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
 	if err := m.engine.Start(turnCtx, Spec{
 		SessionID: current.SessionID,
