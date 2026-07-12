@@ -112,6 +112,33 @@ func TestRotateSessionGuards(t *testing.T) {
 	}
 }
 
+// TestRotateSessionRefusesCrossThreadSuccessor: the successor must
+// belong to the retired session's thread — otherwise the transaction
+// would leave thread A with no live session and link its history into
+// thread B's conversation.
+func TestRotateSessionRefusesCrossThreadSuccessor(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	cwd := t.TempDir()
+	oldID := liveSeed(t, db, cwd, true) // active on discord:dm:a
+
+	crossThread := store.Session{
+		ThreadKey:          "discord:dm:b",
+		SessionID:          "22222222-2222-4222-8222-222222222222",
+		Cwd:                cwd,
+		TrustFloor:         "owner",
+		CreatedAt:          1700005000,
+		ActivationDeadline: 1700005120,
+	}
+	if _, err := store.RotateSession(ctx, db, oldID, crossThread); !errors.Is(err, store.ErrNotActive) {
+		t.Fatalf("cross-thread rotation = %v, want ErrNotActive", err)
+	}
+	live, ok, err := store.ResolveLiveSession(ctx, db, "discord:dm:a")
+	if err != nil || !ok || live.SessionID != oldID || live.Status != "active" {
+		t.Errorf("after refused cross-thread rotation: ok=%v %+v, want the original still active", ok, live)
+	}
+}
+
 // TestRotateSessionRollsBackAtomically: if the successor insert fails
 // (unresolvable cwd), the old session must still be active — a
 // half-rotation would leave the thread with no live session at all.

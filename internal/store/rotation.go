@@ -33,9 +33,14 @@ func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 	// it restores the old session's live status.
 	defer func() { _ = tx.Rollback() }()
 
+	// The guard binds all three facts in one statement: the old row
+	// exists, is active, and belongs to the SUCCESSOR'S thread. Without
+	// the thread_key clause a caller could retire thread A's session
+	// while inserting thread B's successor — committing a state where A
+	// has no live session and its history links into B's conversation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE sessions SET status = 'rotated' WHERE session_id = ? AND status = 'active'`,
-		oldSessionID,
+		`UPDATE sessions SET status = 'rotated' WHERE session_id = ? AND status = 'active' AND thread_key = ?`,
+		oldSessionID, successor.ThreadKey,
 	)
 	if err != nil {
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
@@ -45,7 +50,8 @@ func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
 	}
 	if n == 0 {
-		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, ErrNotActive)
+		return "", fmt.Errorf("store: rotate session %s: no active session with that id on thread %s: %w",
+			oldSessionID, successor.ThreadKey, ErrNotActive)
 	}
 
 	cwd, err := insertSession(ctx, tx, successor)
