@@ -27,6 +27,11 @@ var ErrCwdGone = errors.New("session cwd no longer exists")
 // transcript-gone from transient is x6n.2.8's classification. Bounding
 // a hung resume (timeout kill) is the x6n.2.9 child-management remit.
 func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
+	return m.resume(ctx, live, "")
+}
+
+// resume is Resume plus the event prompt the turn answers.
+func (m *Manager) resume(ctx context.Context, live store.LiveSession, prompt string) error {
 	current, ok, err := store.ResolveLiveSession(ctx, m.db, live.ThreadKey)
 	if err != nil {
 		return fmt.Errorf("session: resume %s: %w", live.SessionID, err)
@@ -52,6 +57,7 @@ func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
 		SessionID: current.SessionID,
 		ThreadKey: current.ThreadKey,
 		Cwd:       current.Cwd,
+		Prompt:    prompt,
 	}); err != nil {
 		return fmt.Errorf("session: resume %s: %w", current.SessionID, err)
 	}
@@ -65,7 +71,7 @@ func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
 // transiently — owes a FIRST turn against the same pinned id (no
 // transcript exists to resume; the expiry window, not the retry count,
 // bounds how long the thread keeps trying). active resumes.
-func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) error {
+func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, prompt string) error {
 	live, _, err := m.Ensure(ctx, threadKey, trustFloor, cwd)
 	if err != nil {
 		return fmt.Errorf("session: turn for %s: %w", threadKey, err)
@@ -83,9 +89,9 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) e
 	}
 	switch live.Status {
 	case "creating":
-		return m.StartNew(ctx, live)
+		return m.startNew(ctx, live, "", prompt)
 	case "active":
-		err := m.Resume(ctx, live)
+		err := m.resume(ctx, live, prompt)
 		if err == nil || !isResumeFailure(err) {
 			return err
 		}
@@ -97,7 +103,7 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd string) e
 		if derr != nil {
 			return fmt.Errorf("session: turn for %s: resume failed (%v) and degradation also failed: %w", threadKey, err, derr)
 		}
-		return m.startNew(ctx, fresh, resumeFailureNote)
+		return m.startNew(ctx, fresh, resumeFailureNote, prompt)
 	default:
 		// ResolveLiveSession only returns the two live states; a third
 		// here means the store contract broke — refuse loudly.
