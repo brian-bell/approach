@@ -37,6 +37,12 @@ type Options struct {
 	// client verbatim as a refusal. Nil means the verb answers err:
 	// a daemon without the retry path wired must say so, not pretend.
 	OnRetry func(eventID int64) error
+	// OnDeadRequeue / OnDeadDiscard are the §4.6 manual drain —
+	// "dead-requeue <event-id>" re-queues a dead-lettered event,
+	// "dead-discard <event-id>" closes it with a record. Same nil and
+	// error contract as OnRetry.
+	OnDeadRequeue func(eventID int64) error
+	OnDeadDiscard func(eventID int64) error
 	// ReadTimeout bounds how long a connection may sit silent before
 	// it is cut off. Zero means a 5-second default.
 	ReadTimeout time.Duration
@@ -268,7 +274,15 @@ func (s *Server) handle(conn net.Conn) {
 	// Argumented verbs dispatch on the word before the first space;
 	// everything below the switch keeps the exact-match contract.
 	if arg, ok := strings.CutPrefix(verb, "retry "); ok || verb == "retry" {
-		s.handleRetry(conn, arg)
+		s.handleIDVerb(conn, "retry", arg, s.opts.OnRetry)
+		return
+	}
+	if arg, ok := strings.CutPrefix(verb, "dead-requeue "); ok || verb == "dead-requeue" {
+		s.handleIDVerb(conn, "dead-requeue", arg, s.opts.OnDeadRequeue)
+		return
+	}
+	if arg, ok := strings.CutPrefix(verb, "dead-discard "); ok || verb == "dead-discard" {
+		s.handleIDVerb(conn, "dead-discard", arg, s.opts.OnDeadDiscard)
 		return
 	}
 	switch verb {
@@ -300,23 +314,23 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-// handleRetry answers "retry <event-id>" (§4.6): parse loud, hand the
-// id to the daemon, relay the outcome. Parse failures never reach the
-// handler — a garbled id must not be "helpfully" coerced into
-// requeueing some other event.
-func (s *Server) handleRetry(conn net.Conn, arg string) {
-	if s.opts.OnRetry == nil {
-		fmt.Fprintln(conn, "err retry is not wired on this daemon")
+// handleIDVerb answers the argumented verbs (§4.6 retry and manual
+// drain): parse loud, hand the id to the daemon, relay the outcome.
+// Parse failures never reach the handler — a garbled id must not be
+// "helpfully" coerced into acting on some other event.
+func (s *Server) handleIDVerb(conn net.Conn, name, arg string, handler func(int64) error) {
+	if handler == nil {
+		fmt.Fprintf(conn, "err %s is not wired on this daemon\n", name)
 		return
 	}
 	id, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 64)
 	if err != nil || id <= 0 {
-		fmt.Fprintf(conn, "err retry wants a positive event id, got %q\n", arg)
+		fmt.Fprintf(conn, "err %s wants a positive event id, got %q\n", name, arg)
 		return
 	}
-	if err := s.opts.OnRetry(id); err != nil {
-		fmt.Fprintf(conn, "err retry %d: %v\n", id, err)
+	if err := handler(id); err != nil {
+		fmt.Fprintf(conn, "err %s %d: %v\n", name, id, err)
 		return
 	}
-	fmt.Fprintf(conn, "ok retry %d requeued\n", id)
+	fmt.Fprintf(conn, "ok %s %d\n", name, id)
 }

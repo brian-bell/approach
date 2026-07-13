@@ -468,3 +468,142 @@ func TestPumpSurfacesUnsurfacedInterruptedEvents(t *testing.T) {
 		t.Errorf("(status, acked) = (%q, %v), want ('sent', set)", status, acked)
 	}
 }
+
+// seedOwnerIdentity enrolls a discord owner so dead-letter notices
+// have a DM target to derive.
+func seedOwnerIdentity(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '999', 'owner', 'brian')`,
+	); err != nil {
+		t.Fatalf("seed owner identity: %v", err)
+	}
+}
+
+// stageDeadLetter walks an event to 'dead' with its dead_letters row.
+func stageDeadLetter(t *testing.T, db *sql.DB, dedup string) store.QueuedEvent {
+	t.Helper()
+	ctx := context.Background()
+	id, _, err := store.InsertEvent(ctx, db, store.Event{
+		DedupKey: dedup, ThreadKey: "discord:dm:123", Kind: "message", Trust: "owner",
+		Payload:  `{"dedup_key":"` + dedup + `","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`,
+		Received: 1700000000,
+	})
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if err := store.MarkEventProcessing(ctx, db, id, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
+	if err := store.DeadLetterEvent(ctx, db, id, "retries-exhausted", 1700000100); err != nil {
+		t.Fatalf("DeadLetterEvent: %v", err)
+	}
+	return store.QueuedEvent{ID: id, DedupKey: dedup, ThreadKey: "discord:dm:123"}
+}
+
+// TestSurfaceDeadLetter: the §4.6 entry notification — one owner-DM
+// through the outbox per DEATH, keyed dead:<dedup>:<entries> (fresh
+// notice per re-entry, same-death duplicates collapse), naming the
+// reason and the manual drain commands. Target derives from the
+// enrolled owner identity; no owner enrolled is an error the sweep
+// retries, never a silent skip.
+func TestSurfaceDeadLetter(t *testing.T) {
+	db := openStore(t)
+	ctx := context.Background()
+
+	ev := stageDeadLetter(t, db, "discord:msg:doomed")
+	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err == nil {
+		t.Fatal("SurfaceDeadLetter with no enrolled owner succeeded, want error — a notice with nowhere to go must say so")
+	}
+	seedOwnerIdentity(t, db)
+	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err != nil {
+		t.Fatalf("SurfaceDeadLetter: %v", err)
+	}
+
+	var key, target, payload string
+	if err := db.QueryRow(
+		`SELECT delivery_key, target, payload FROM deliveries`,
+	).Scan(&key, &target, &payload); err != nil {
+		t.Fatalf("read notice: %v", err)
+	}
+	if key != "dead:discord:msg:doomed:1" {
+		t.Errorf("delivery_key = %q, want dead:<dedup>:<entries>", key)
+	}
+	if target != "discord:dm:999" {
+		t.Errorf("target = %q, want the enrolled owner's DM", target)
+	}
+	if !strings.Contains(payload, "retries-exhausted") || !strings.Contains(payload, "dead requeue") {
+		t.Errorf("payload %q must name the reason and the drain commands", payload)
+	}
+
+	// Same death: collapse.
+	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err != nil {
+		t.Fatalf("duplicate SurfaceDeadLetter: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("found %d notices, want 1 — same-death surfaces collapse", n)
+	}
+
+	// Second death after a requeue: fresh notice.
+	if _, err := store.ResolveDeadLetterRequeue(ctx, db, ev.ID, 1700000200); err != nil {
+		t.Fatalf("requeue: %v", err)
+	}
+	if err := store.MarkEventProcessing(ctx, db, ev.ID, 1700000250); err != nil {
+		t.Fatalf("re-stamp: %v", err)
+	}
+	if err := store.DeadLetterEvent(ctx, db, ev.ID, "retries-exhausted", 1700000300); err != nil {
+		t.Fatalf("second death: %v", err)
+	}
+	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err != nil {
+		t.Fatalf("SurfaceDeadLetter (death 2): %v", err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("found %d notices after a second death, want 2 — a re-death must not be silenced", n)
+	}
+}
+
+// TestPumpSurfacesUnsurfacedDeadLetters: same self-repair as parks — a
+// death whose entry notice never landed is composed by the pump's
+// sweep, so no dead letter waits for a heartbeat that doesn't exist
+// yet to become visible.
+func TestPumpSurfacesUnsurfacedDeadLetters(t *testing.T) {
+	db := openStore(t)
+	seedOwnerIdentity(t, db)
+	stageDeadLetter(t, db, "discord:msg:silent")
+
+	sender := &fakeSender{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		delivery.Pump(ctx, db, map[string]delivery.Sender{"discord": sender},
+			slog.Default(), testClock(), make(chan struct{}), time.Hour)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && sender.count() == 0 {
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if n := sender.count(); n != 1 {
+		t.Fatalf("pump sent %d messages, want the swept dead-letter notice", n)
+	}
+	var status string
+	if err := db.QueryRow(
+		`SELECT status FROM deliveries WHERE delivery_key = 'dead:discord:msg:silent:1'`,
+	).Scan(&status); err != nil {
+		t.Fatalf("swept notice: %v", err)
+	}
+	if status != "sent" {
+		t.Errorf("status = %q, want 'sent'", status)
+	}
+}

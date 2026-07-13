@@ -28,6 +28,9 @@ const (
 	// Parked: the event is durably 'interrupted' — out-of-band, the
 	// thread keeps flowing, the §4.6 surfacing flows own it now.
 	Parked
+	// Dead: the event is durably dead-lettered — the machine gave up
+	// (§4.6) and the manual drain owns it now.
+	Dead
 )
 
 // Enqueuer re-admits an event to its thread's in-memory queue —
@@ -96,8 +99,7 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Enqueuer, ev store
 
 	if err := store.RequeueEventForRetry(ctx, db, ev.ID, now().Unix()); err != nil {
 		if errors.Is(err, store.ErrRetryBudgetExhausted) {
-			return park(ctx, db, ev, opts,
-				"retry budget exhausted — parked for a human (§4.6)")
+			return deadLetter(ctx, db, ev, opts)
 		}
 		if errors.Is(err, store.ErrSideEffectingAttempt) {
 			// The judgment above went stale — a straggling PreToolUse
@@ -129,6 +131,34 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Enqueuer, ev store
 	opts.Logger.Info("engine failure — clean turn requeued with backoff (§4.6)",
 		"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey, "attempt", spent, "backoff", delay.String())
 	return Retried, nil
+}
+
+// deadLetter is the terminal landing for an exhausted budget (§4.6):
+// event dead + dead_letters row atomically, owner-DM entry notice
+// through the outbox, pump woken. If the dead-letter write itself
+// fails the event FALLS BACK to a park — between states is the one
+// place an event must never be, and interrupted is still durable,
+// human-visible, and manually retriable.
+func deadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Options) (Outcome, error) {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	if err := store.DeadLetterEvent(ctx, db, ev.ID, "retries-exhausted", now().Unix()); err != nil {
+		opts.Logger.Error("dead-letter write failed — falling back to park so the event stays visible (§4.6)",
+			"dedup_key", ev.DedupKey, "error", err.Error())
+		return park(ctx, db, ev, opts,
+			"retry budget exhausted; dead-letter write failed — parked instead (§4.6)")
+	}
+	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err != nil {
+		opts.Logger.Error("dead-letter entry notice failed — the pump's sweep repairs it next pass (§4.6)",
+			"dedup_key", ev.DedupKey, "error", err.Error())
+	} else if opts.Notify != nil {
+		opts.Notify()
+	}
+	opts.Logger.Warn("retry budget exhausted — event dead-lettered; a human decides (§4.6)",
+		"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+	return Dead, nil
 }
 
 // safeToRetry is the §4.6 judgment: no attempts, or every attempt

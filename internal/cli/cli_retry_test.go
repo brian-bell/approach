@@ -22,3 +22,20 @@ func TestRetryUsage(t *testing.T) {
 		}
 	}
 }
+
+// TestDeadUsage: `approach dead <requeue|discard> <event-id>` — the
+// §4.6 manual drain's CLI face validates before touching the socket.
+func TestDeadUsage(t *testing.T) {
+	for _, args := range [][]string{
+		{"dead"},
+		{"dead", "requeue"},
+		{"dead", "discard", "notanumber"},
+		{"dead", "shred", "7"},
+		{"dead", "requeue", "0"},
+	} {
+		var out, errW strings.Builder
+		if code := cli.Run(args, &out, &errW); code != 2 {
+			t.Errorf("%v exit = %d, want 2 (usage)", args, code)
+		}
+	}
+}

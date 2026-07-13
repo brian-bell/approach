@@ -8,6 +8,51 @@ import (
 	"github.com/brian-bell/approach/internal/store"
 )
 
+// SurfaceDeadLetter writes the §4.6 entry notification for a death:
+// one owner-DM through the outbox per ENTRY, keyed
+// "dead:<dedup_key>:<entries>" — the death-generation counter, so a
+// re-entered death (requeued, died again) gets a fresh notice while
+// same-death surfaces collapse (counter-not-timestamp, same rule as
+// parks). Key AND payload derive from the dead_letters row inside the
+// INSERT itself; a resolved row composes nothing. Unbound event_id,
+// same rationale as the park notice.
+//
+// The target is the enrolled owner's DM, derived from the identities
+// table. The "discord:dm:<native_id>" spelling is the discord
+// adapter's thread-key contract (§6) — centralized here until a second
+// adapter forces a per-channel registry. No enrolled owner is an
+// ERROR, not a skip: the caller logs loud and the pump's sweep retries
+// — a death notice with nowhere to go must never quietly evaporate.
+func SurfaceDeadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent) error {
+	var nativeID string
+	err := db.QueryRowContext(ctx,
+		`SELECT native_id FROM identities
+		 WHERE channel = 'discord' AND trust = 'owner'
+		 ORDER BY native_id LIMIT 1`,
+	).Scan(&nativeID)
+	if err != nil {
+		return fmt.Errorf("delivery: surface dead letter %s: no enrolled discord owner to notify (§4.6): %w", ev.DedupKey, err)
+	}
+	target := "discord:dm:" + nativeID
+
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO deliveries (delivery_key, target, payload)
+		 SELECT 'dead:' || e.dedup_key || ':' || d.entries, ?,
+		        'An event could not be processed and was dead-lettered (event ' || e.dedup_key
+		          || ', reason: ' || d.reason || ') — the machine gave up; you decide (§4.6). '
+		          || 'Run ''approach dead requeue ' || d.event_id
+		          || ''' or ''approach dead discard ' || d.event_id || '''.'
+		 FROM dead_letters d JOIN events e ON e.id = d.event_id
+		 WHERE d.event_id = ? AND d.resolution IS NULL
+		 ON CONFLICT(delivery_key) DO NOTHING`,
+		target, ev.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("delivery: surface dead letter %s: %w", ev.DedupKey, err)
+	}
+	return nil
+}
+
 // SurfaceInterrupted writes the §4.6 park notice into the outbox: the
 // daemon posts to the originating thread what it was doing and offers
 // the retry. It composes and PERSISTS only — write-before-send means

@@ -111,6 +111,24 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 			queues.Readmit(ev)
 			return nil
 		},
+		// The §4.6 manual drain: one human decision per dead letter.
+		OnDeadRequeue: func(id int64) error {
+			if db == nil || queues == nil {
+				return fmt.Errorf("daemon still starting — store/router not ready")
+			}
+			ev, err := store.ResolveDeadLetterRequeue(context.Background(), db, id, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			queues.Readmit(ev)
+			return nil
+		},
+		OnDeadDiscard: func(id int64) error {
+			if db == nil {
+				return fmt.Errorf("daemon still starting — store not ready")
+			}
+			return store.ResolveDeadLetterDiscard(context.Background(), db, id)
+		},
 		Status: func() map[string]any {
 			fields := map[string]any{"version": version(), "pid": os.Getpid(), "pokes": pokes.Load()}
 			var schema int
@@ -482,6 +500,32 @@ func runRetry(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	return runAdminVerb("retry", fmt.Sprintf("retry %d", id), args[1:], stdout, stderr)
+}
+
+// runDead is `approach dead <requeue|discard> <event-id>` — the §4.6
+// manual drain, one decision per row. Same validate-before-socket
+// contract as retry.
+func runDead(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "approach dead: want 'requeue <event-id>' or 'discard <event-id>'")
+		return 2
+	}
+	var verb string
+	switch args[0] {
+	case "requeue":
+		verb = "dead-requeue"
+	case "discard":
+		verb = "dead-discard"
+	default:
+		fmt.Fprintf(stderr, "approach dead: unknown action %q — want requeue or discard\n", args[0])
+		return 2
+	}
+	id, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || id <= 0 {
+		fmt.Fprintf(stderr, "approach dead %s: %q is not a positive event id\n", args[0], args[1])
+		return 2
+	}
+	return runAdminVerb(verb, fmt.Sprintf("%s %d", verb, id), args[2:], stdout, stderr)
 }
 
 func runAdminVerb(verb, request string, args []string, stdout, stderr io.Writer) int {

@@ -462,3 +462,41 @@ func TestRetryVerb(t *testing.T) {
 		t.Errorf("reply = %q, want err — retry without a wired handler must be dormant AND loud", bareReply)
 	}
 }
+
+// TestDeadLetterVerbs: the §4.6 manual drain — "dead-requeue <id>" and
+// "dead-discard <id>" hand the id to their handlers with the same
+// parse-loud contract as retry.
+func TestDeadLetterVerbs(t *testing.T) {
+	var requeued, discarded []int64
+	path := startServer(t, admin.Options{
+		OnDeadRequeue: func(id int64) error { requeued = append(requeued, id); return nil },
+		OnDeadDiscard: func(id int64) error {
+			discarded = append(discarded, id)
+			if id == 404 {
+				return errors.New("no dead letter 404")
+			}
+			return nil
+		},
+	})
+
+	if reply := request(t, path, "dead-requeue 7"); !strings.HasPrefix(reply, "ok") {
+		t.Errorf("dead-requeue reply = %q, want ok", reply)
+	}
+	if reply := request(t, path, "dead-discard 8"); !strings.HasPrefix(reply, "ok") {
+		t.Errorf("dead-discard reply = %q, want ok", reply)
+	}
+	if len(requeued) != 1 || requeued[0] != 7 || len(discarded) != 1 || discarded[0] != 8 {
+		t.Errorf("handlers saw requeue=%v discard=%v, want [7] and [8]", requeued, discarded)
+	}
+	if reply := request(t, path, "dead-discard 404"); !strings.HasPrefix(reply, "err") {
+		t.Errorf("handler refusal reply = %q, want err", reply)
+	}
+	if reply := request(t, path, "dead-requeue nope"); !strings.HasPrefix(reply, "err") {
+		t.Errorf("garbled id reply = %q, want err", reply)
+	}
+
+	bare := startServer(t, admin.Options{})
+	if reply := request(t, bare, "dead-requeue 7"); !strings.HasPrefix(reply, "err") {
+		t.Errorf("unwired handler reply = %q, want err — dormant, loud", reply)
+	}
+}

@@ -138,6 +138,19 @@ func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) 
 		}
 		logger.Warn("parked event had no notice — composed by sweep (§4.6)", "dedup_key", ev.DedupKey)
 	}
+
+	deaths, err := store.UnsurfacedDeadLetters(ctx, db)
+	if err != nil {
+		logger.Error("unsurfaced-death sweep failed — dead letters may be silent until the next pass", "error", err.Error())
+		return
+	}
+	for _, ev := range deaths {
+		if err := SurfaceDeadLetter(ctx, db, ev); err != nil {
+			logger.Error("re-surfacing dead letter failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
+			continue
+		}
+		logger.Warn("dead letter had no entry notice — composed by sweep (§4.6)", "dedup_key", ev.DedupKey)
+	}
 }
 
 // channelOf extracts the channel segment of a §6 thread key — the

@@ -252,12 +252,17 @@ func TestHandleEngineFailureParksMixedKeyTurn(t *testing.T) {
 	}
 }
 
-// TestHandleEngineFailureParksExhaustedBudget: a clean turn whose
-// budget is spent parks — the machine has given up and a human
-// decides (§4.6; the dead_letters landing takes this branch over in
-// x6n.3.6).
-func TestHandleEngineFailureParksExhaustedBudget(t *testing.T) {
+// TestHandleEngineFailureDeadLettersExhaustedBudget: a clean turn
+// whose budget is spent is a TERMINAL failure — §4.6 lands it in
+// dead_letters (event 'dead', row recorded, owner-DM entry notice,
+// pump woken), where a human decides via the manual drain.
+func TestHandleEngineFailureDeadLettersExhaustedBudget(t *testing.T) {
 	db := openStore(t)
+	if _, err := db.Exec(
+		`INSERT INTO identities (channel, native_id, trust, owner_id) VALUES ('discord', '999', 'owner', 'brian')`,
+	); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
 	ev, _ := stageFailedTurn(t, db)
 	if _, err := db.Exec(`UPDATE events SET attempts = 2 WHERE id = ?`, ev.ID); err != nil {
 		t.Fatalf("spend budget: %v", err)
@@ -265,12 +270,32 @@ func TestHandleEngineFailureParksExhaustedBudget(t *testing.T) {
 	enq := &fakeEnqueuer{}
 	after := &syncAfter{}
 
-	if out := handle(t, db, ev, enq, after); out != recovery.Parked {
-		t.Errorf("outcome = %v, want Parked", out)
+	out, notified := handleN(t, db, ev, enq, after)
+	if out != recovery.Dead {
+		t.Errorf("outcome = %v, want Dead", out)
+	}
+	if notified != 1 {
+		t.Errorf("Notify fired %d times, want 1 — the entry notice must post now", notified)
 	}
 	status, _ := eventState(t, db, ev.ID)
-	if status != "interrupted" {
-		t.Errorf("status = %q, want 'interrupted'", status)
+	if status != "dead" {
+		t.Errorf("status = %q, want 'dead'", status)
+	}
+	var reason string
+	if err := db.QueryRow(`SELECT reason FROM dead_letters WHERE event_id = ?`, ev.ID).Scan(&reason); err != nil {
+		t.Fatalf("dead_letters row: %v", err)
+	}
+	if reason != "retries-exhausted" {
+		t.Errorf("reason = %q, want 'retries-exhausted'", reason)
+	}
+	var target string
+	if err := db.QueryRow(
+		`SELECT target FROM deliveries WHERE delivery_key LIKE 'dead:%'`,
+	).Scan(&target); err != nil {
+		t.Fatalf("entry notice: %v", err)
+	}
+	if target != "discord:dm:999" {
+		t.Errorf("notice target = %q, want the owner DM", target)
 	}
 	if len(enq.enqueued) != 0 {
 		t.Errorf("enqueued = %+v, want none", enq.enqueued)

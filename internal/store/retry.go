@@ -118,6 +118,40 @@ func UnsurfacedInterruptedEvents(ctx context.Context, db *sql.DB) ([]QueuedEvent
 	return out, nil
 }
 
+// UnsurfacedDeadLetters finds deaths nobody was told about: unresolved
+// dead_letters rows with no "dead:<dedup_key>:<entries>" outbox row —
+// the loss mode when the entry notice fails (no enrolled owner yet, a
+// transient write error) or the daemon dies first. Same self-repair
+// contract as UnsurfacedInterruptedEvents.
+func UnsurfacedDeadLetters(ctx context.Context, db *sql.DB) ([]QueuedEvent, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT e.id, e.dedup_key, e.thread_key, e.kind, e.trust, e.payload, e.status, e.received
+		 FROM dead_letters d JOIN events e ON e.id = d.event_id
+		 WHERE d.resolution IS NULL
+		   AND NOT EXISTS (SELECT 1 FROM deliveries dv
+		                   WHERE dv.delivery_key = 'dead:' || e.dedup_key || ':' || d.entries)
+		 ORDER BY e.id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: scan unsurfaced dead letters: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []QueuedEvent
+	for rows.Next() {
+		var ev QueuedEvent
+		if err := rows.Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
+			&ev.Payload, &ev.Status, &ev.Received); err != nil {
+			return nil, fmt.Errorf("store: scan unsurfaced dead letters: %w", err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan unsurfaced dead letters: %w", err)
+	}
+	return out, nil
+}
+
 // RequeueInterruptedEvent is the §4.6 human retry: a parked
 // (interrupted) event returns to 'received' — owed a turn again, at
 // its thread's current tail — and the full row comes back so the
