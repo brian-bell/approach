@@ -310,6 +310,59 @@ func eventStatus(t *testing.T, db *sql.DB, id int64) string {
 	return s
 }
 
+// TestResendableDeliveries: the §4.6 restart resend scan — every row
+// still owed a send (unacked, non-failed), in id (compose) order, so
+// one thread's messages re-send in the order they were composed. This
+// query is the single runtime definition of "owed a send" and must
+// match the deliveries_resend index predicate exactly: acked rows are
+// delivered history, failed rows left for the dead-letter flows.
+func TestResendableDeliveries(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	pending := testDelivery()
+	pending.DeliveryKey = "reply:pending"
+	pendingID := insertTestDelivery(t, db, pending)
+
+	ackedRow := testDelivery()
+	ackedRow.DeliveryKey = "reply:acked"
+	ackedID := insertTestDelivery(t, db, ackedRow)
+	if err := store.AckDelivery(ctx, db, ackedID, 1700000500); err != nil {
+		t.Fatalf("AckDelivery: %v", err)
+	}
+
+	failedRow := testDelivery()
+	failedRow.DeliveryKey = "reply:failed"
+	failedID := insertTestDelivery(t, db, failedRow)
+	if err := store.MarkDeliveryFailed(ctx, db, failedID); err != nil {
+		t.Fatalf("MarkDeliveryFailed: %v", err)
+	}
+
+	attempted := testDelivery()
+	attempted.DeliveryKey = "reply:attempted"
+	attemptedID := insertTestDelivery(t, db, attempted)
+	if err := store.MarkDeliveryAttempt(ctx, db, attemptedID, 1700000600); err != nil {
+		t.Fatalf("MarkDeliveryAttempt: %v", err)
+	}
+
+	rows, err := store.ResendableDeliveries(ctx, db)
+	if err != nil {
+		t.Fatalf("ResendableDeliveries: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("got %d resendable rows, want 2 (pending + attempted; never acked or failed)", len(rows))
+	}
+	if rows[0].ID != pendingID || rows[1].ID != attemptedID {
+		t.Errorf("resend order = (%d, %d), want compose order (%d, %d)", rows[0].ID, rows[1].ID, pendingID, attemptedID)
+	}
+	if rows[0].DeliveryKey != pending.DeliveryKey || rows[0].Target != pending.Target || rows[0].Payload != pending.Payload {
+		t.Errorf("row 0 did not round-trip: got (%q, %q, %q)", rows[0].DeliveryKey, rows[0].Target, rows[0].Payload)
+	}
+	if rows[1].Attempts != 1 {
+		t.Errorf("attempted row Attempts = %d, want 1 — the §4.6 budget accounting rides this field", rows[1].Attempts)
+	}
+}
+
 // TestMarkDeliveryAttempt: each send attempt is journalled before its
 // outcome is known (§4.6 retry accounting reads attempts/last_attempt)
 // — and only rows still owed a send may attempt: stamping an acked or

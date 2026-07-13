@@ -90,6 +90,60 @@ func InsertDelivery(ctx context.Context, db *sql.DB, d Delivery) (id int64, inse
 	return id, true, nil
 }
 
+// ResendableDelivery is one row of the §4.6 restart resend scan:
+// everything a re-send needs, read in one query. EventID is 0 when the
+// row has no originating event (§4.2 notifies); Attempts rides along
+// because the §4.6 budget accounting reads it.
+type ResendableDelivery struct {
+	ID          int64
+	DeliveryKey string
+	EventID     int64
+	Target      string
+	Payload     string
+	Attempts    int64
+}
+
+// ResendableDeliveries is the restart resend scan (§4.6): every row
+// still owed a send — unacked and not terminally failed — in id order,
+// which is compose order, so one thread's messages re-send in the
+// order they were written. This query is the single runtime definition
+// of "owed a send" and deliberately matches the deliveries_resend
+// partial index predicate (0006) — one definition, in schema and here.
+// Acked rows are delivered history; failed rows belong to the
+// dead-letter flows, and re-sending one would resurrect a give-up the
+// owner may already have been told about.
+func ResendableDeliveries(ctx context.Context, db *sql.DB) ([]ResendableDelivery, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, delivery_key, event_id, target, payload, attempts
+		 FROM deliveries
+		 WHERE acked IS NULL AND status <> 'failed'
+		 ORDER BY id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: scan resendable deliveries: %w", err)
+	}
+	// Read-only query: a Close error after full iteration has nothing
+	// to add — rows.Err() below already surfaces any read failure.
+	defer func() { _ = rows.Close() }()
+
+	var out []ResendableDelivery
+	for rows.Next() {
+		var d ResendableDelivery
+		var eventID sql.NullInt64
+		if err := rows.Scan(&d.ID, &d.DeliveryKey, &eventID, &d.Target, &d.Payload, &d.Attempts); err != nil {
+			return nil, fmt.Errorf("store: scan resendable deliveries: %w", err)
+		}
+		d.EventID = eventID.Int64 // zero value when NULL — 0 means "no event", same as Delivery
+		out = append(out, d)
+	}
+	// A half-read scan treated as whole would silently drop the tail's
+	// re-sends — iteration errors are scan failures, not short results.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan resendable deliveries: %w", err)
+	}
+	return out, nil
+}
+
 // MarkDeliveryAttempt journals one send attempt before its outcome is
 // known — the §4.6 retry accounting reads attempts/last_attempt, so
 // the stamp must precede the send the same way the processing stamp

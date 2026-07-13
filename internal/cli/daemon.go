@@ -21,6 +21,7 @@ import (
 	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
+	"github.com/brian-bell/approach/internal/delivery"
 	"github.com/brian-bell/approach/internal/engine"
 	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
@@ -33,6 +34,11 @@ import (
 // restart-looping every RestartSec. Keep in sync with
 // deploy/systemd/approach.service.
 const exitUnrecoverable = 3
+
+// The production adapter must satisfy the outbound surface the §4.6
+// restart resend needs — a runtime type assertion alone would demote
+// a signature drift from compile error to silently-skipped resend.
+var _ delivery.Sender = (*discord.Adapter)(nil)
 
 // defaultStateDir is where the daemon keeps its socket and store:
 // $APPROACH_HOME/state, defaulting to ~/approach/state (§6).
@@ -215,6 +221,23 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		close(adapterDone)
 	}
 
+	// The §4.6 restart resend: rows the previous life composed but
+	// never got acked re-send from their persisted payloads. It runs
+	// concurrent with fresh ingest — at-least-once tolerates the
+	// interleaving, and per-target order is the resender's own
+	// invariant. An adapter without an outbound surface must be LOUD:
+	// silence would read as "nothing owed" when the outbox disagrees.
+	resendDone := make(chan struct{})
+	if sender, ok := runner.(delivery.Sender); ok {
+		go func() {
+			defer close(resendDone)
+			delivery.ResendUnacked(ctx, db, map[string]delivery.Sender{"discord": sender}, logger, time.Now)
+		}()
+	} else {
+		close(resendDone)
+		logger.Warn("no outbound sender — restart resend skipped; owed deliveries stay durable (§4.6)")
+	}
+
 	serveErr := srv.Serve(ctx)
 	// Serve has returned (drain, signal, or adapter-triggered cancel):
 	// stop the adapter and WAIT for it — the ingest path must be dead
@@ -224,6 +247,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// in-flight turn must finish its writes before the store closes.
 	cancel()
 	<-adapterDone
+	<-resendDone
 	queues.Wait()
 	if adapterErr != nil {
 		logger.Error("discord adapter terminated", "error", adapterErr.Error())
