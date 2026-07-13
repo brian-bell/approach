@@ -157,6 +157,160 @@ func TestTurnDoesNotDegradeOnTransientError(t *testing.T) {
 	}
 }
 
+// TestRotationOverMissingCwdDegrades: an active session due for
+// rotation whose recorded cwd has vanished must NOT loop a failing
+// rotation forever (the successor would inherit the dead cwd and the
+// insert's canonicalization refuses it — every later event repeating
+// the same failure is a wedged thread). The transcript is unreachable
+// anyway (--resume is cwd-scoped), so this is the §4.6 resume-failure
+// shape: degrade to a successor at the CALLER's cwd, note carried.
+func TestRotationOverMissingCwdDegrades(t *testing.T) {
+	db := mustOpen(t)
+	clock := int64(1700000000)
+	eng := &resumeEngine{}
+	m := rotationManager(db, eng, &clock) // IdleTTL 1h
+	oldCwd := t.TempDir()
+
+	old := activeThread(t, m, db, oldCwd)
+	if err := os.RemoveAll(old.Cwd); err != nil {
+		t.Fatalf("remove recorded cwd: %v", err)
+	}
+
+	clock += 3601 // past the idle TTL — rotation is due
+	newCwd := t.TempDir()
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", newCwd, "hi"); err != nil {
+		t.Fatalf("Turn over a rotation-due session with a dead cwd: %v (must degrade, never wedge)", err)
+	}
+
+	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
+	if err != nil || !ok {
+		t.Fatalf("resolve successor: ok=%v err=%v", ok, err)
+	}
+	if live.SessionID == old.SessionID || live.Status != "active" || live.Cwd == old.Cwd {
+		t.Errorf("successor = %+v, want fresh, active, and at the caller's cwd", live)
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM sessions WHERE session_id = ?`, old.SessionID).Scan(&status); err != nil {
+		t.Fatalf("read back old: %v", err)
+	}
+	if status != "resume_failed" {
+		t.Errorf("old session status = %q, want resume_failed (the transcript is cwd-scoped and unreachable)", status)
+	}
+	// The degradation note rides the successor's first turn.
+	last := eng.specs[len(eng.specs)-1]
+	if last.TransparencyNote == "" {
+		t.Error("degraded-successor first turn carries no transparency note")
+	}
+}
+
+// TestRotateNowRefusesMissingCwd: the /new primitive has no caller cwd
+// to degrade to — a dead recorded cwd refuses with the typed error so
+// the handler can route to degradation instead of committing a
+// rotation whose successor cannot exist.
+func TestRotateNowRefusesMissingCwd(t *testing.T) {
+	db := mustOpen(t)
+	clock := int64(1700000000)
+	eng := &resumeEngine{}
+	m := rotationManager(db, eng, &clock)
+	cwd := t.TempDir()
+
+	old := activeThread(t, m, db, cwd)
+	if err := os.RemoveAll(old.Cwd); err != nil {
+		t.Fatalf("remove recorded cwd: %v", err)
+	}
+	if _, err := m.RotateNow(context.Background(), "discord:dm:a"); !errors.Is(err, session.ErrCwdGone) {
+		t.Errorf("RotateNow over a dead cwd = %v, want ErrCwdGone", err)
+	}
+	// The refused rotation left the old row alone — no half-state.
+	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
+	if err != nil || !ok || live.SessionID != old.SessionID || live.Status != "active" {
+		t.Errorf("after refused RotateNow: ok=%v %+v, want the original still active", ok, live)
+	}
+}
+
+// TestDegradationNoteSurvivesRetry: if the degradation successor's
+// FIRST turn fails transiently, the row stays creating — and the
+// retry must still carry the §4.6 note: the user's first successful
+// reply after transcript loss says so, no matter how many transient
+// failures intervened. The state is recovered from the resume_failed
+// predecessor link, not from in-memory context a crash could lose.
+func TestDegradationNoteSurvivesRetry(t *testing.T) {
+	db := mustOpen(t)
+	eng := &resumeEngine{resumeErr: session.ErrResumeFailed}
+	clock := int64(1700000000)
+	m := rotationManager(db, eng, &clock)
+	cwd := t.TempDir()
+
+	activeThread(t, m, db, cwd)
+
+	// Resume fails permanently; the degradation successor's first turn
+	// ALSO fails, transiently.
+	eng.err = errors.New("transient spawn failure")
+	clock += 10
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err == nil {
+		t.Fatal("Turn swallowed the successor's transient first-turn failure")
+	}
+
+	// Next event: engine recovered. The retry is an ordinary
+	// creating-row first turn — but it must still carry the note.
+	eng.err = nil
+	eng.resumeErr = nil
+	clock += 10
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err != nil {
+		t.Fatalf("Turn (retry): %v", err)
+	}
+	last := eng.specs[len(eng.specs)-1]
+	if last.TransparencyNote == "" {
+		t.Error("retried degradation first turn lost the transparency note (§4.6)")
+	}
+	// And a session that was never degraded still carries none.
+	if eng.specs[0].TransparencyNote != "" {
+		t.Errorf("ordinary first turn carried a note: %q", eng.specs[0].TransparencyNote)
+	}
+}
+
+// TestDegradationNoteSurvivesExpiry: the successor's first turns keep
+// failing until its activation window closes; Ensure retires it as
+// failed and mints a linked retry. The note must survive THAT chain
+// too — resume_failed → failed → creating still owes the §4.6 line.
+func TestDegradationNoteSurvivesExpiry(t *testing.T) {
+	db := mustOpen(t)
+	eng := &resumeEngine{resumeErr: session.ErrResumeFailed}
+	clock := int64(1700000000)
+	m := rotationManager(db, eng, &clock)
+	cwd := t.TempDir()
+
+	activeThread(t, m, db, cwd)
+
+	// Degradation happens; the successor's first turn fails transiently.
+	eng.err = errors.New("transient spawn failure")
+	clock += 10
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err == nil {
+		t.Fatal("Turn swallowed the successor's transient first-turn failure")
+	}
+
+	// The engine stays down past the successor's activation window, so
+	// the next event expires it and mints a linked retry — which also
+	// fails once.
+	clock += 121
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err == nil {
+		t.Fatal("Turn swallowed the expiry retry's failure")
+	}
+
+	// Engine recovers: the eventual first successful reply must still
+	// say history was lost.
+	eng.err = nil
+	eng.resumeErr = nil
+	clock += 10
+	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "hi"); err != nil {
+		t.Fatalf("Turn (recovered): %v", err)
+	}
+	last := eng.specs[len(eng.specs)-1]
+	if last.TransparencyNote == "" {
+		t.Error("transparency note lost across the expiry chain (resume_failed → failed → creating)")
+	}
+}
+
 // TestResumeFailSessionStore: the store primitive mirrors rotation —
 // one transaction, old kept as resume_failed with the successor link,
 // thread-bound guard.

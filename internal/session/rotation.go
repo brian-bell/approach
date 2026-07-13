@@ -85,5 +85,12 @@ func (m *Manager) RotateNow(ctx context.Context, threadKey string) (store.LiveSe
 	if live.Status != "active" {
 		return store.LiveSession{}, fmt.Errorf("session: rotate-now %s: session %s: %w", threadKey, live.SessionID, store.ErrNotActive)
 	}
+	// A dead recorded cwd cannot rotate in place (the successor would
+	// inherit it and the insert would refuse) — and /new carries no
+	// caller cwd to degrade to, so refuse TYPED: the handler routes
+	// ErrCwdGone into the §4.6 degradation with the event's cwd.
+	if err := assertCwd(live.SessionID, live.Cwd); err != nil {
+		return store.LiveSession{}, fmt.Errorf("session: rotate-now %s: %w", threadKey, err)
+	}
 	return m.rotate(ctx, live, "new")
 }

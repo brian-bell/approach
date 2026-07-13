@@ -31,6 +31,22 @@ func isResumeFailure(err error) bool {
 	return errors.Is(err, ErrCwdGone) || errors.Is(err, ErrResumeFailed)
 }
 
+// degradationNote returns the §4.6 transparency note when sessionID
+// was minted as a resume-failure successor (a resume_failed
+// predecessor links to it), "" otherwise. Read from the durable link
+// so the note survives transient first-turn failures and daemon
+// restarts between degradation and the first successful reply.
+func (m *Manager) degradationNote(ctx context.Context, sessionID string) (string, error) {
+	degraded, err := store.SessionDegraded(ctx, m.db, sessionID)
+	if err != nil {
+		return "", err
+	}
+	if degraded {
+		return resumeFailureNote, nil
+	}
+	return "", nil
+}
+
 // degradeResumeFailed is the §4.6 resume-failure path: the old row is
 // kept as resume_failed (a rotation cause — forensics, not deletion),
 // a fresh session is minted in the same transaction, and the caller

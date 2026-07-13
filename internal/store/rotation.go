@@ -19,7 +19,7 @@ var ErrNotActive = errors.New("session is not active")
 // demoted, successor missing) or two (both live under
 // one_live_session, which the schema refuses anyway).
 func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
-	return retireSession(ctx, db, oldSessionID, successor, "rotated")
+	return retireSession(ctx, db, oldSessionID, successor, "active", "rotated", ErrNotActive)
 }
 
 // ResumeFailSession is the §4.6 degradation twin of RotateSession: the
@@ -27,18 +27,30 @@ func RotateSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 // forensics — with the same successor link and creating successor, in
 // the same all-or-nothing shape.
 func ResumeFailSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
-	return retireSession(ctx, db, oldSessionID, successor, "resume_failed")
+	return retireSession(ctx, db, oldSessionID, successor, "active", "resume_failed", ErrNotActive)
 }
 
-// retireSession retires a thread's active session into retiredStatus
-// and mints its successor, atomically.
+// ExpireSession is the §4.1 activation-expiry retry as ONE linked
+// transaction: the creating row that never activated becomes failed,
+// its successor is born creating, and rotated_to records the lineage.
+// The link is load-bearing, not cosmetic — the §4.6 transparency note
+// is recovered by walking predecessor links, and an unlinked expiry
+// retry would silently drop it when a degradation successor's first
+// turns fail until the window closes.
+func ExpireSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session) (canonicalCwdStored string, err error) {
+	return retireSession(ctx, db, oldSessionID, successor, "creating", "failed", ErrNotCreating)
+}
+
+// retireSession retires a thread's live session (guarded to be in
+// fromStatus) into retiredStatus and mints its successor, atomically;
+// guardErr is the typed refusal when the guard misses.
 //
 // Step order is forced by the schema's immediate constraints:
 // demoting the old row FIRST frees one_live_session for the successor
 // insert; the rotated_to link is written LAST because its foreign key
 // needs the successor row to exist. All three inside one transaction,
 // so every intermediate state is invisible.
-func retireSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session, retiredStatus string) (string, error) {
+func retireSession(ctx context.Context, db *sql.DB, oldSessionID string, successor Session, fromStatus, retiredStatus string, guardErr error) (string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
@@ -53,8 +65,8 @@ func retireSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 	// while inserting thread B's successor — committing a state where A
 	// has no live session and its history links into B's conversation.
 	res, err := tx.ExecContext(ctx,
-		`UPDATE sessions SET status = ? WHERE session_id = ? AND status = 'active' AND thread_key = ?`,
-		retiredStatus, oldSessionID, successor.ThreadKey,
+		`UPDATE sessions SET status = ? WHERE session_id = ? AND status = ? AND thread_key = ?`,
+		retiredStatus, oldSessionID, fromStatus, successor.ThreadKey,
 	)
 	if err != nil {
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
@@ -64,8 +76,8 @@ func retireSession(ctx context.Context, db *sql.DB, oldSessionID string, success
 		return "", fmt.Errorf("store: rotate session %s: %w", oldSessionID, err)
 	}
 	if n == 0 {
-		return "", fmt.Errorf("store: rotate session %s: no active session with that id on thread %s: %w",
-			oldSessionID, successor.ThreadKey, ErrNotActive)
+		return "", fmt.Errorf("store: rotate session %s: no %s session with that id on thread %s: %w",
+			oldSessionID, fromStatus, successor.ThreadKey, guardErr)
 	}
 
 	cwd, err := insertSession(ctx, tx, successor)

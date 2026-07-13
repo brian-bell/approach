@@ -39,16 +39,8 @@ func (m *Manager) resume(ctx context.Context, live store.LiveSession, prompt str
 	if !ok || current.SessionID != live.SessionID || current.Status != "active" {
 		return fmt.Errorf("session: resume %s refused — it is no longer %s's active session", live.SessionID, live.ThreadKey)
 	}
-	// The assert is a stat, not a trust: the row's cwd was canonical
-	// and real at insert, but repos move and worktrees get pruned. Any
-	// stat failure — not just IsNotExist — reads as gone: a cwd the
-	// daemon cannot verify is one it must not spawn from (fail closed).
-	info, err := os.Stat(current.Cwd)
-	if err != nil {
-		return fmt.Errorf("session: resume %s from %q: %v: %w", current.SessionID, current.Cwd, err, ErrCwdGone)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("session: resume %s: recorded cwd %q is not a directory: %w", current.SessionID, current.Cwd, ErrCwdGone)
+	if err := assertCwd(current.SessionID, current.Cwd); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("session: resume %s not started: %w", current.SessionID, err)
@@ -62,6 +54,24 @@ func (m *Manager) resume(ctx context.Context, live store.LiveSession, prompt str
 		return fmt.Errorf("session: resume %s: %w", current.SessionID, err)
 	}
 	m.touch(ctx, current.SessionID)
+	return nil
+}
+
+// assertCwd is the §11 pre-spawn assert: the recorded cwd must still
+// exist as a directory. It is a stat, not a trust — the row's cwd was
+// canonical and real at insert, but repos move and worktrees get
+// pruned. Any stat failure — not just IsNotExist — reads as ErrCwdGone:
+// a cwd the daemon cannot verify is one it must not spawn from (fail
+// closed). Shared by resume, rotation, and /new so "cwd is gone" has
+// exactly one definition.
+func assertCwd(sessionID, cwd string) error {
+	info, err := os.Stat(cwd)
+	if err != nil {
+		return fmt.Errorf("session: %s cwd %q: %v: %w", sessionID, cwd, err, ErrCwdGone)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("session: %s recorded cwd %q is not a directory: %w", sessionID, cwd, ErrCwdGone)
+	}
 	return nil
 }
 
@@ -81,6 +91,20 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, prompt s
 	// fresh successor — never one more turn on the retired transcript.
 	if live.Status == "active" {
 		if cause := m.rotationCause(live); cause != "" {
+			// A rotation-due session whose recorded cwd has died cannot
+			// rotate in place: the successor would inherit the dead cwd
+			// and the insert's canonicalization would refuse it — every
+			// later event repeating that failure is a wedged thread.
+			// The transcript is unreachable anyway (--resume is
+			// cwd-scoped), so this is the §4.6 resume-failure shape:
+			// degrade to a successor at the caller's cwd.
+			if cwdErr := assertCwd(live.SessionID, live.Cwd); cwdErr != nil {
+				fresh, derr := m.degradeResumeFailed(ctx, live, cwd)
+				if derr != nil {
+					return fmt.Errorf("session: turn for %s: rotation-due cwd gone (%v) and degradation also failed: %w", threadKey, cwdErr, derr)
+				}
+				return m.startNew(ctx, fresh, resumeFailureNote, prompt)
+			}
 			live, err = m.rotate(ctx, live, cause)
 			if err != nil {
 				return fmt.Errorf("session: turn for %s: %w", threadKey, err)
@@ -89,7 +113,15 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, prompt s
 	}
 	switch live.Status {
 	case "creating":
-		return m.startNew(ctx, live, "", prompt)
+		// A creating row may be a §4.6 degradation successor whose
+		// first turn failed transiently on an earlier event — the note
+		// must survive that retry, so it is recovered from the durable
+		// resume_failed predecessor link, never from in-memory context.
+		note, nerr := m.degradationNote(ctx, live.SessionID)
+		if nerr != nil {
+			return fmt.Errorf("session: turn for %s: %w", threadKey, nerr)
+		}
+		return m.startNew(ctx, live, note, prompt)
 	case "active":
 		err := m.resume(ctx, live, prompt)
 		if err == nil || !isResumeFailure(err) {

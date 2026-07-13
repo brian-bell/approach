@@ -185,13 +185,18 @@ func TestEnsureRetriesExpiredCreating(t *testing.T) {
 		t.Error("expired creating session was reused, want a fresh UUID (§4.1 retried fresh)")
 	}
 
-	// The old row is failed, kept, and no longer live.
+	// The old row is failed, kept, no longer live — and LINKED to its
+	// retry: the §4.6 note recovery walks this chain.
 	var status string
-	if err := db.QueryRow(`SELECT status FROM sessions WHERE session_id = ?`, first.SessionID).Scan(&status); err != nil {
+	var rotatedTo sql.NullString
+	if err := db.QueryRow(`SELECT status, rotated_to FROM sessions WHERE session_id = ?`, first.SessionID).Scan(&status, &rotatedTo); err != nil {
 		t.Fatalf("read back expired session: %v", err)
 	}
 	if status != "failed" {
 		t.Errorf("expired creating session status = %q, want failed", status)
+	}
+	if !rotatedTo.Valid || rotatedTo.String != second.SessionID {
+		t.Errorf("expired session rotated_to = %+v, want the retry link %q", rotatedTo, second.SessionID)
 	}
 }
 

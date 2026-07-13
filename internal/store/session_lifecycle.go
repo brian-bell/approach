@@ -61,6 +61,38 @@ func ResolveLiveSession(ctx context.Context, db *sql.DB, threadKey string) (Live
 	return s, true, nil
 }
 
+// SessionDegraded reports whether sessionID was minted as a §4.6
+// resume-failure successor: a resume_failed predecessor links to it
+// via rotated_to. The turn path reads this to keep the transparency
+// note across transient first-turn failures — durable state, not
+// in-memory context a crash could lose. A query failure is an error,
+// never "not degraded": silently dropping the note is the honesty
+// failure §4.6's one-liner exists to prevent.
+func SessionDegraded(ctx context.Context, db *sql.DB, sessionID string) (bool, error) {
+	// The walk continues backwards through FAILED intermediates only:
+	// a degradation successor whose own first turns failed until its
+	// activation window closed is replaced by a linked expiry retry
+	// (ExpireSession), and the note must survive that chain. A rotated
+	// predecessor ends the walk — ordinary rotation owes no note. The
+	// UNION (not UNION ALL) dedupes rows, so even corrupt cyclic links
+	// terminate instead of spinning the recursion.
+	var degraded bool
+	if err := db.QueryRowContext(ctx,
+		`WITH RECURSIVE chain(id, status) AS (
+		     SELECT session_id, status FROM sessions WHERE rotated_to = ?
+		   UNION
+		     SELECT s.session_id, s.status FROM sessions s
+		     JOIN chain c ON s.rotated_to = c.id
+		     WHERE c.status = 'failed'
+		 )
+		 SELECT EXISTS(SELECT 1 FROM chain WHERE status = 'resume_failed')`,
+		sessionID,
+	).Scan(&degraded); err != nil {
+		return false, fmt.Errorf("store: degraded-predecessor lookup for %s: %w", sessionID, err)
+	}
+	return degraded, nil
+}
+
 // ActivateSession is the §4.1 creating → active transition, taken when
 // the pinned session's first engine turn succeeds. Guarded: any state
 // but creating returns ErrNotCreating — activating a row a deadline

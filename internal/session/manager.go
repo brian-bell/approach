@@ -155,16 +155,37 @@ func (m *Manager) Ensure(ctx context.Context, threadKey, trustFloor, cwd string)
 		if live.Status == "active" || m.now().Unix() < live.ActivationDeadline {
 			return live, false, nil
 		}
-		// Creating past deadline: the engine never came up. Fail it and
-		// fall through to a fresh pin. The guard makes a lost race loud
-		// instead of clobbering an activation that landed after the
-		// resolve above — impossible under per-thread serialization,
-		// but this is a security-adjacent invariant, so belt-and-braces.
-		if err := store.FailSession(ctx, m.db, live.SessionID); err != nil {
+		// Creating past deadline: the engine never came up. Retire it
+		// as failed and mint the retry in ONE linked transaction
+		// (ExpireSession): the rotated_to link is what lets a later
+		// turn recover the §4.6 transparency note through a chain of
+		// expired degradation successors, and the guard makes a lost
+		// race loud instead of clobbering an activation that landed
+		// after the resolve above — impossible under per-thread
+		// serialization, but this is a security-adjacent invariant,
+		// so belt-and-braces. Origin carries over: a task:* worker's
+		// retry must keep its spawning thread (§4.5) — and the schema
+		// rejects a worker row without one.
+		successor, err := m.mint(threadKey, trustFloor, cwd, live.Origin)
+		if err != nil {
+			return store.LiveSession{}, false, fmt.Errorf("session: expire creating %s: %w", live.SessionID, err)
+		}
+		canonical, err := store.ExpireSession(ctx, m.db, live.SessionID, successor)
+		if err != nil {
 			return store.LiveSession{}, false, fmt.Errorf("session: expire creating %s: %w", live.SessionID, err)
 		}
 		m.logger.Warn("creating session passed its activation deadline — failed, retrying fresh (§4.1)",
-			"thread_key", threadKey, "session_id", live.SessionID)
+			"thread_key", threadKey, "session_id", live.SessionID, "retry_session_id", successor.SessionID)
+		return store.LiveSession{
+			ThreadKey:          successor.ThreadKey,
+			SessionID:          successor.SessionID,
+			Status:             "creating",
+			Cwd:                canonical,
+			Origin:             successor.Origin,
+			TrustFloor:         successor.TrustFloor,
+			CreatedAt:          successor.CreatedAt,
+			ActivationDeadline: successor.ActivationDeadline,
+		}, true, nil
 	}
 	return m.pin(ctx, threadKey, trustFloor, cwd)
 }
