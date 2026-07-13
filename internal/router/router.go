@@ -112,14 +112,15 @@ func (q *Queues) Persist(ctx context.Context, ev store.Event) (inserted bool, er
 		return inserted, err
 	}
 	q.Enqueue(store.QueuedEvent{
-		ID:        id,
-		DedupKey:  ev.DedupKey,
-		ThreadKey: ev.ThreadKey,
-		Kind:      ev.Kind,
-		Trust:     ev.Trust,
-		Payload:   ev.Payload,
-		Status:    "received",
-		Received:  ev.Received,
+		ID:          id,
+		DedupKey:    ev.DedupKey,
+		ThreadKey:   ev.ThreadKey,
+		Kind:        ev.Kind,
+		Trust:       ev.Trust,
+		Payload:     ev.Payload,
+		Status:      "received",
+		Received:    ev.Received,
+		Correlation: ev.Correlation,
 	})
 	return true, nil
 }

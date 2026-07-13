@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 
@@ -251,5 +252,108 @@ func TestInsertEventDuplicateFirstWriteWins(t *testing.T) {
 	}
 	if received != ev.Received {
 		t.Errorf("received = %d after redelivery, want original %d", received, ev.Received)
+	}
+}
+
+// TestInsertEventCorrelation: the §6 correlation link — a follow-up
+// event the daemon mints (an approval round-trip, §4.4) carries its
+// origin's dedup_key; absent means NULL, and a link pointing at itself
+// is refused (an event cannot be its own origin and follow-up).
+func TestInsertEventCorrelation(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	origin := testEvent()
+	if _, _, err := store.InsertEvent(ctx, db, origin); err != nil {
+		t.Fatalf("InsertEvent(origin): %v", err)
+	}
+
+	followUp := store.Event{
+		DedupKey:    "approval:42",
+		ThreadKey:   origin.ThreadKey,
+		Kind:        "approval",
+		Trust:       "owner",
+		Payload:     `{"dedup_key":"approval:42","thread_key":"discord:dm:123","kind":"approval","trust":"owner"}`,
+		Received:    1700000100,
+		Correlation: origin.DedupKey,
+	}
+	if _, _, err := store.InsertEvent(ctx, db, followUp); err != nil {
+		t.Fatalf("InsertEvent(follow-up): %v", err)
+	}
+
+	var got sql.NullString
+	if err := db.QueryRow(
+		`SELECT correlation FROM events WHERE dedup_key = 'approval:42'`,
+	).Scan(&got); err != nil {
+		t.Fatalf("read correlation: %v", err)
+	}
+	if !got.Valid || got.String != origin.DedupKey {
+		t.Errorf("correlation = %v, want %q", got, origin.DedupKey)
+	}
+	var originCorr sql.NullString
+	if err := db.QueryRow(
+		`SELECT correlation FROM events WHERE dedup_key = ?`, origin.DedupKey,
+	).Scan(&originCorr); err != nil {
+		t.Fatalf("read origin correlation: %v", err)
+	}
+	if originCorr.Valid {
+		t.Errorf("origin correlation = %q, want NULL — absent means no link", originCorr.String)
+	}
+
+	selfRef := testEvent()
+	selfRef.DedupKey = "discord:msg:self"
+	selfRef.Payload = `{"dedup_key":"discord:msg:self","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`
+	selfRef.Correlation = "discord:msg:self"
+	if _, _, err := store.InsertEvent(ctx, db, selfRef); err == nil {
+		t.Error("InsertEvent accepted a self-correlation, want error — an event cannot be its own origin")
+	}
+}
+
+// TestCorrelatedEvents: the round-trip/forensics lookup — exactly the
+// rows stamped with the link, in id order; an unknown link answers
+// empty, never an error.
+func TestCorrelatedEvents(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	origin := testEvent()
+	if _, _, err := store.InsertEvent(ctx, db, origin); err != nil {
+		t.Fatalf("InsertEvent(origin): %v", err)
+	}
+	for i, kind := range []string{"approval", "message"} {
+		ev := store.Event{
+			DedupKey:  fmt.Sprintf("follow:%d", i),
+			ThreadKey: origin.ThreadKey, Kind: kind, Trust: "owner",
+			Payload:  fmt.Sprintf(`{"dedup_key":"follow:%d","thread_key":"discord:dm:123","kind":"%s","trust":"owner"}`, i, kind),
+			Received: 1700000100 + int64(i), Correlation: origin.DedupKey,
+		}
+		if _, _, err := store.InsertEvent(ctx, db, ev); err != nil {
+			t.Fatalf("InsertEvent(follow %d): %v", i, err)
+		}
+	}
+	unrelated := testEvent()
+	unrelated.DedupKey = "discord:msg:unrelated"
+	unrelated.Payload = `{"dedup_key":"discord:msg:unrelated","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`
+	if _, _, err := store.InsertEvent(ctx, db, unrelated); err != nil {
+		t.Fatalf("InsertEvent(unrelated): %v", err)
+	}
+
+	rows, err := store.CorrelatedEvents(ctx, db, origin.DedupKey)
+	if err != nil {
+		t.Fatalf("CorrelatedEvents: %v", err)
+	}
+	if len(rows) != 2 || rows[0].DedupKey != "follow:0" || rows[1].DedupKey != "follow:1" {
+		t.Errorf("rows = %+v, want the two follow-ups in id order", rows)
+	}
+	if rows[0].Correlation != origin.DedupKey {
+		t.Errorf("row correlation = %q, want %q carried on the QueuedEvent view", rows[0].Correlation, origin.DedupKey)
+	}
+
+	none, err := store.CorrelatedEvents(ctx, db, "no:such:origin")
+	if err != nil {
+		t.Fatalf("CorrelatedEvents(none): %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("got %d rows for an unknown link, want 0", len(none))
 	}
 }

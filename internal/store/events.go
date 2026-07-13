@@ -18,6 +18,13 @@ type Event struct {
 	Trust     string // stamped at ingest (§6); includes daemon-only system levels
 	Payload   string // full normalized event JSON
 	Received  int64  // unix seconds at receipt — the adapter owns the clock
+	// Correlation links a follow-up event the DAEMON mints (an
+	// approval round-trip, §4.4; retry forensics, §4.6) to its origin
+	// event's dedup_key — a durable identity, unlike row ids. "" means
+	// no link (stored NULL). Deliberately outside the payload-
+	// agreement validation: adapters never stamp it, and a link
+	// arriving in inbound content must never be trusted as one.
+	Correlation string
 }
 
 // InsertEvent is the single write-on-receipt chokepoint (§4.1): persist
@@ -46,11 +53,18 @@ func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (id int64, inserted 
 	if err := ev.validate(); err != nil {
 		return 0, false, fmt.Errorf("store: insert event: %w", err)
 	}
+	// "" means "no link" and must land as NULL — an empty-string
+	// correlation would group every unlinked event into one bogus
+	// round-trip.
+	var correlation any
+	if ev.Correlation != "" {
+		correlation = ev.Correlation
+	}
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO events (dedup_key, thread_key, kind, trust, payload, received)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO events (dedup_key, thread_key, kind, trust, payload, received, correlation)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(dedup_key) DO NOTHING`,
-		ev.DedupKey, ev.ThreadKey, ev.Kind, ev.Trust, ev.Payload, ev.Received,
+		ev.DedupKey, ev.ThreadKey, ev.Kind, ev.Trust, ev.Payload, ev.Received, correlation,
 	)
 	if err != nil {
 		return 0, false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
@@ -67,6 +81,42 @@ func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (id int64, inserted 
 		return 0, false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
 	}
 	return id, true, nil
+}
+
+// CorrelatedEvents is the round-trip/forensics lookup (§6): every
+// event stamped with this origin link, in id (receipt) order. An
+// unknown link answers empty — absence of follow-ups is a normal
+// state, not an error. Unindexed on purpose: correlation reads are
+// per-approval or forensic, never the hot path; if M2's approval flow
+// proves otherwise an index is one migration away.
+func CorrelatedEvents(ctx context.Context, db *sql.DB, correlation string) ([]QueuedEvent, error) {
+	if correlation == "" {
+		return nil, fmt.Errorf("store: correlated events: empty link — NULL rows are unlinked, not a group (§6)")
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received, correlation
+		 FROM events WHERE correlation = ? ORDER BY id`,
+		correlation,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: correlated events %s: %w", correlation, err)
+	}
+	// Read-only query: a Close error after full iteration has nothing
+	// to add — rows.Err() below already surfaces any read failure.
+	defer func() { _ = rows.Close() }()
+
+	var out []QueuedEvent
+	for rows.Next() {
+		ev, err := scanQueuedEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: correlated events %s: %w", correlation, err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: correlated events %s: %w", correlation, err)
+	}
+	return out, nil
 }
 
 // ParkEvent durably parks a queue row as interrupted (§4.6): the turn
@@ -107,6 +157,8 @@ func (ev Event) validate() error {
 		return fmt.Errorf("empty trust — ingest must stamp a level, ambiguity is untrusted, not blank (§6)")
 	case ev.Received <= 0:
 		return fmt.Errorf("received = %d, want a positive unix timestamp", ev.Received)
+	case ev.Correlation == ev.DedupKey:
+		return fmt.Errorf("correlation equals dedup_key %q — an event cannot be its own origin (§6)", ev.DedupKey)
 	}
 	return ev.validatePayload()
 }

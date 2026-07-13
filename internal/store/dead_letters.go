@@ -183,12 +183,11 @@ func ResolveDeadLetterRequeue(ctx context.Context, db *sql.DB, eventID int64, no
 		return QueuedEvent{}, fmt.Errorf("store: requeue dead letter %d: event is not 'dead' — the record and the event disagree, refusing to guess", eventID)
 	}
 
-	var ev QueuedEvent
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received
+	ev, err := scanQueuedEvent(tx.QueryRowContext(ctx,
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received, correlation
 		 FROM events WHERE id = ?`, eventID,
-	).Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
-		&ev.Payload, &ev.Status, &ev.Received); err != nil {
+	))
+	if err != nil {
 		return QueuedEvent{}, fmt.Errorf("store: requeue dead letter %d: read back: %w", eventID, err)
 	}
 	if err := tx.Commit(); err != nil {

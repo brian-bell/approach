@@ -88,7 +88,7 @@ func RequeueEventForRetry(ctx context.Context, db *sql.DB, id int64, now int64) 
 // makes re-surfacing idempotent.
 func UnsurfacedInterruptedEvents(ctx context.Context, db *sql.DB) ([]QueuedEvent, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received, correlation
 		 FROM events e
 		 WHERE e.status = 'interrupted'
 		   AND NOT EXISTS (SELECT 1 FROM deliveries d
@@ -105,9 +105,8 @@ func UnsurfacedInterruptedEvents(ctx context.Context, db *sql.DB) ([]QueuedEvent
 
 	var out []QueuedEvent
 	for rows.Next() {
-		var ev QueuedEvent
-		if err := rows.Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
-			&ev.Payload, &ev.Status, &ev.Received); err != nil {
+		ev, err := scanQueuedEvent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("store: scan unsurfaced interrupted events: %w", err)
 		}
 		out = append(out, ev)
@@ -125,7 +124,7 @@ func UnsurfacedInterruptedEvents(ctx context.Context, db *sql.DB) ([]QueuedEvent
 // contract as UnsurfacedInterruptedEvents.
 func UnsurfacedDeadLetters(ctx context.Context, db *sql.DB) ([]QueuedEvent, error) {
 	rows, err := db.QueryContext(ctx,
-		`SELECT e.id, e.dedup_key, e.thread_key, e.kind, e.trust, e.payload, e.status, e.received
+		`SELECT e.id, e.dedup_key, e.thread_key, e.kind, e.trust, e.payload, e.status, e.received, e.correlation
 		 FROM dead_letters d JOIN events e ON e.id = d.event_id
 		 WHERE d.resolution IS NULL
 		   AND NOT EXISTS (SELECT 1 FROM deliveries dv
@@ -139,9 +138,8 @@ func UnsurfacedDeadLetters(ctx context.Context, db *sql.DB) ([]QueuedEvent, erro
 
 	var out []QueuedEvent
 	for rows.Next() {
-		var ev QueuedEvent
-		if err := rows.Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
-			&ev.Payload, &ev.Status, &ev.Received); err != nil {
+		ev, err := scanQueuedEvent(rows)
+		if err != nil {
 			return nil, fmt.Errorf("store: scan unsurfaced dead letters: %w", err)
 		}
 		out = append(out, ev)
@@ -195,12 +193,11 @@ func RequeueInterruptedEvent(ctx context.Context, db *sql.DB, id int64, now int6
 		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: status is %q, not 'interrupted' — only a parked event takes the human retry", id, status)
 	}
 
-	var ev QueuedEvent
-	if err := tx.QueryRowContext(ctx,
-		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received
+	ev, err := scanQueuedEvent(tx.QueryRowContext(ctx,
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received, correlation
 		 FROM events WHERE id = ?`, id,
-	).Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
-		&ev.Payload, &ev.Status, &ev.Received); err != nil {
+	))
+	if err != nil {
 		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: read back: %w", id, err)
 	}
 	if err := tx.Commit(); err != nil {
