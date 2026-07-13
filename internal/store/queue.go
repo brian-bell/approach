@@ -22,6 +22,32 @@ type QueuedEvent struct {
 	Received  int64
 }
 
+// MarkEventProcessing is the pre-turn durability stamp (§4.1): the
+// row leaves 'received' BEFORE the handler runs, so a daemon that
+// dies mid-turn finds it 'processing' on restart and parks it as
+// interrupted (§4.6) — never re-dispatches it as never-started work,
+// which would replay a half-finished turn's side effects. Guarded:
+// only a received row may start a turn; zero rows affected means the
+// event was already claimed or advanced, and the caller must not run
+// the handler.
+func MarkEventProcessing(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'processing', updated = ? WHERE id = ? AND status = 'received'`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark event %d processing: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark event %d processing: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: mark event %d processing: not in received state", id)
+	}
+	return nil
+}
+
 // UnprocessedEvents is the restart rebuild scan (§4.1): every row still
 // owed a turn — status received or processing — in id order, which is
 // receipt order. The in-memory per-thread queues are ONLY an index over

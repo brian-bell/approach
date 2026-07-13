@@ -16,8 +16,9 @@ import (
 // TestDaemonStartupRebuildParksCrashInterrupted drives the §4.1/§4.6
 // restart path through the real daemon: a row left 'processing' by a
 // crash parks as interrupted at startup — never auto-rerun — while a
-// queued 'received' row survives untouched (the M1 scaffold dispatches
-// it without advancing its lifecycle).
+// queued 'received' row is dispatched with the pre-turn processing
+// stamp (the M1 scaffold performs no completion, so it stays
+// 'processing' for the NEXT restart to park).
 func TestDaemonStartupRebuildParksCrashInterrupted(t *testing.T) {
 	dir, err := os.MkdirTemp("", "cli")
 	if err != nil {
@@ -87,7 +88,7 @@ func TestDaemonStartupRebuildParksCrashInterrupted(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	for dedup, want := range map[string]string{
 		"discord:msg:1": "interrupted", // crash mid-turn → parked (§4.6)
-		"discord:msg:2": "received",    // still queued; M1 scaffold never advances it
+		"discord:msg:2": "processing",  // dispatched with the pre-turn stamp; completion is epic 1.3
 	} {
 		var got string
 		if err := db.QueryRow(`SELECT status FROM events WHERE dedup_key = ?`, dedup).Scan(&got); err != nil {

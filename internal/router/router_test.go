@@ -87,10 +87,11 @@ func TestFIFOWithinThread(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	db := mustOpen(t)
 	var inFlight, maxInFlight atomic.Int64
 	var mu sync.Mutex
 	var got []string
-	q := router.New(ctx, nil, router.Options{
+	q := router.New(ctx, db, router.Options{
 		Handler: func(_ context.Context, ev store.QueuedEvent) {
 			n := inFlight.Add(1)
 			if m := maxInFlight.Load(); n > m {
@@ -107,7 +108,9 @@ func TestFIFOWithinThread(t *testing.T) {
 
 	const n = 20
 	for i := int64(1); i <= n; i++ {
-		q.Enqueue(qe(i, "discord:dm:a"))
+		if _, err := q.Persist(ctx, storeEvent(i, "discord:dm:a")); err != nil {
+			t.Fatalf("Persist %d: %v", i, err)
+		}
 	}
 	q.Wait()
 
@@ -130,8 +133,9 @@ func TestThreadsRunConcurrently(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	db := mustOpen(t)
 	bDone := make(chan struct{})
-	q := router.New(ctx, nil, router.Options{
+	q := router.New(ctx, db, router.Options{
 		Handler: func(_ context.Context, ev store.QueuedEvent) {
 			switch ev.ThreadKey {
 			case "discord:dm:a":
@@ -150,8 +154,12 @@ func TestThreadsRunConcurrently(t *testing.T) {
 		Logger: discardLogger(),
 	})
 
-	q.Enqueue(qe(1, "discord:dm:a"))
-	q.Enqueue(qe(2, "discord:dm:b"))
+	if _, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	if _, err := q.Persist(ctx, storeEvent(2, "discord:dm:b")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
 	q.Wait()
 }
 
@@ -225,11 +233,12 @@ func TestEnqueueDuringProcessing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	db := mustOpen(t)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var mu sync.Mutex
 	var got []string
-	q := router.New(ctx, nil, router.Options{
+	q := router.New(ctx, db, router.Options{
 		Handler: func(_ context.Context, ev store.QueuedEvent) {
 			if ev.ID == 1 {
 				close(started)
@@ -242,9 +251,13 @@ func TestEnqueueDuringProcessing(t *testing.T) {
 		Logger: discardLogger(),
 	})
 
-	q.Enqueue(qe(1, "discord:dm:a"))
+	if _, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
 	<-started // thread a is mid-turn
-	q.Enqueue(qe(2, "discord:dm:a"))
+	if _, err := q.Persist(ctx, storeEvent(2, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
 	close(release)
 	q.Wait()
 
@@ -380,16 +393,73 @@ func TestHandlerPanicParksEventAndContinues(t *testing.T) {
 	}
 }
 
+// TestDispatchStampsProcessingBeforeHandler: the §4.1/§4.6 crash
+// window — the durable row must read 'processing' BEFORE the handler
+// runs, so a daemon that dies mid-turn parks the event on restart
+// instead of replaying a half-finished turn's side effects.
+func TestDispatchStampsProcessingBeforeHandler(t *testing.T) {
+	db := mustOpen(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var statusDuringTurn string
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			// What would restart recovery see if we crashed RIGHT NOW?
+			if err := db.QueryRow(`SELECT status FROM events WHERE id = ?`, ev.ID).Scan(&statusDuringTurn); err != nil {
+				t.Errorf("read status mid-turn: %v", err)
+			}
+			calls.Add(1)
+		},
+		Logger: discardLogger(),
+	})
+	if _, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	waitFor(t, func() bool { return calls.Load() == 1 }, "dispatch")
+	q.Wait()
+
+	if statusDuringTurn != "processing" {
+		t.Errorf("row status during the turn = %q, want processing — a crash here would REPLAY the turn on restart (§4.6)", statusDuringTurn)
+	}
+
+	// The simulated crash: this handler never completed the row, so a
+	// fresh router's Rebuild must park it, never re-dispatch it.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	var replays atomic.Int64
+	q2 := router.New(ctx2, db, router.Options{
+		Handler: func(context.Context, store.QueuedEvent) { replays.Add(1) },
+		Logger:  discardLogger(),
+	})
+	if err := q2.Rebuild(context.Background()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	q2.Wait()
+	if replays.Load() != 0 {
+		t.Errorf("crash-interrupted turn re-dispatched %d times on restart, want 0", replays.Load())
+	}
+	var status string
+	if err := db.QueryRow(`SELECT status FROM events WHERE dedup_key = 'discord:msg:1'`).Scan(&status); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if status != "interrupted" {
+		t.Errorf("status after restart = %q, want interrupted", status)
+	}
+}
+
 // TestCancelStopsDispatch: after shutdown begins, queued-but-unstarted
 // events stay in the table for the next restart's Rebuild — the router
 // must not start new turns against a store that is about to close.
 func TestCancelStopsDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	db := mustOpen(t)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var handled atomic.Int64
-	q := router.New(ctx, nil, router.Options{
+	q := router.New(ctx, db, router.Options{
 		Handler: func(_ context.Context, ev store.QueuedEvent) {
 			if ev.ID == 1 {
 				close(started)
@@ -400,10 +470,14 @@ func TestCancelStopsDispatch(t *testing.T) {
 		Logger: discardLogger(),
 	})
 
-	q.Enqueue(qe(1, "discord:dm:a"))
+	if _, err := q.Persist(ctx, storeEvent(1, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
 	<-started
-	q.Enqueue(qe(2, "discord:dm:a")) // queued behind the in-flight turn
-	cancel()                         // drain begins while event 1 is mid-turn
+	if _, err := q.Persist(ctx, storeEvent(2, "discord:dm:a")); err != nil {
+		t.Fatalf("Persist: %v", err)
+	}
+	cancel() // drain begins while event 1 is mid-turn
 	close(release)
 	q.Wait()
 

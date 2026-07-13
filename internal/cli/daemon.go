@@ -289,11 +289,12 @@ func verifyEnginePin(cfg *config.Config, logger *slog.Logger) error {
 }
 
 // placeholderTurn is the M1 scaffold handler: the queue claims,
-// serializes, and survives restarts NOW, but the turn flows that
-// resolve a session and run the engine land with x6n.2.5/2.6/2.9 —
-// so dispatch deliberately leaves the row 'received' (durable, re-
-// indexed on every restart, visible in the table) rather than faking
-// a lifecycle transition no engine performed.
+// serializes, stamps 'processing', and survives restarts NOW, but the
+// completion transitions land with the epic 1.3 turn wiring — so a
+// scaffold-dispatched row stays 'processing' and the NEXT restart
+// parks it as interrupted (§4.6), where the delivery flows will
+// surface it. Honest on purpose: a no-op turn did consume the event,
+// and faking 'completed' would hide that no engine ever ran.
 func placeholderTurn(logger *slog.Logger) router.Handler {
 	return func(_ context.Context, ev store.QueuedEvent) {
 		logger.Debug("turn dispatch not yet wired — event stays durably queued (x6n.2.5)",

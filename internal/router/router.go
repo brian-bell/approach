@@ -224,6 +224,23 @@ func (q *Queues) drain(threadKey string) {
 // flows find it. The thread's queue itself continues — one bad turn
 // must not silence a thread.
 func (q *Queues) dispatch(ev store.QueuedEvent) {
+	// Quiet refusal on shutdown: the row is durable and still
+	// 'received'; the next boot's Rebuild re-indexes it.
+	if q.ctx.Err() != nil {
+		return
+	}
+	// The processing stamp precedes the handler (§4.1, §4.6): from
+	// this write until the turn's completion transition, a crash reads
+	// as interrupted — the only honest state for a turn whose side
+	// effects are unknowable. If the stamp cannot be written the turn
+	// must NOT run: an unstamped turn is exactly the replay hazard,
+	// and the untouched row simply waits for a later restart
+	// (at-least-once, provably side-effect-free so far).
+	if err := store.MarkEventProcessing(q.ctx, q.db, ev.ID, q.now().Unix()); err != nil {
+		q.logger.Error("pre-turn processing stamp failed — turn not started, event stays durably queued",
+			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey, "error", err.Error())
+		return
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			q.logger.Error("turn handler panicked — parking event as interrupted (§4.6)",
