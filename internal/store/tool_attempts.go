@@ -16,8 +16,14 @@ type ToolAttempt struct {
 	EventID        int64  // the queued event whose turn made the call; 0 = none (stored NULL)
 	Tool           string // canonical tool name
 	ArgsDigest     string // digest of normalized args — display strings are not identity (§4.4)
-	IdempotencyKey string // "" = none (stored NULL) — absence is load-bearing: no key, no §4.6 retry
-	StartedAt      int64  // unix seconds at PreToolUse
+	IdempotencyKey string // "" = none (stored NULL) — absence is load-bearing: no key, no §4.6 retry.
+	// A verb that stamps a key PROMISES the key is deterministic
+	// w.r.t. the turn's inputs (and honored by the downstream
+	// service): a retried turn re-derives the SAME key, so the repeat
+	// dedupes instead of doubling. A randomly minted key would make
+	// the §4.6 retry exception a lie — enforcement lives with the
+	// daemon verbs that stamp keys (M2+), not this journal.
+	StartedAt int64 // unix seconds at PreToolUse
 	// State and ended_at are read-side fields, populated by queries.
 	State   string
 	EndedAt int64
@@ -34,9 +40,14 @@ type ToolAttempt struct {
 // session and event must share a thread_key — §4.6 reads attempts PER
 // EVENT, so a side effect filed under another thread's turn makes the
 // real turn look side-effect-free (unsafe auto-retry) and interrupts
-// an innocent one. The check rides the INSERT statement itself; a
-// separate pre-check could pass just before a racing write changes
-// what it proved.
+// an innocent one. The event must also still be 'processing':
+// PreToolUse only fires during a live turn, so a write landing after
+// recovery already requeued or parked the event is a straggler from a
+// killed child — accepting it would re-open the race the requeue's
+// atomic journal re-check (RequeueEventForRetry) closes from its
+// side. Both checks ride the INSERT statement itself; a separate
+// pre-check could pass just before a racing write changes what it
+// proved.
 func InsertToolAttempt(ctx context.Context, db *sql.DB, a ToolAttempt) (id int64, err error) {
 	if err := a.validate(); err != nil {
 		return 0, fmt.Errorf("store: insert tool attempt: %w", err)
@@ -57,7 +68,7 @@ func InsertToolAttempt(ctx context.Context, db *sql.DB, a ToolAttempt) (id int64
 		 SELECT ?, ?, ?, ?, ?, ?
 		 WHERE ? IS NULL
 		    OR EXISTS (SELECT 1 FROM sessions s JOIN events e ON e.thread_key = s.thread_key
-		               WHERE s.session_id = ? AND e.id = ?)`,
+		               WHERE s.session_id = ? AND e.id = ? AND e.status = 'processing')`,
 		a.SessionID, eventID, a.Tool, a.ArgsDigest, idemKey, a.StartedAt,
 		eventID, a.SessionID, eventID,
 	)
@@ -69,7 +80,7 @@ func InsertToolAttempt(ctx context.Context, db *sql.DB, a ToolAttempt) (id int64
 		return 0, fmt.Errorf("store: insert tool attempt %s: %w", a.Tool, err)
 	}
 	if n == 0 {
-		return 0, fmt.Errorf("store: insert tool attempt %s: session %s and event %d do not share a thread — provenance must resolve to one turn (§4.6)", a.Tool, a.SessionID, a.EventID)
+		return 0, fmt.Errorf("store: insert tool attempt %s: session %s and event %d do not resolve to one live turn — thread mismatch or the event is no longer mid-turn (§4.6)", a.Tool, a.SessionID, a.EventID)
 	}
 	id, err = res.LastInsertId()
 	if err != nil {

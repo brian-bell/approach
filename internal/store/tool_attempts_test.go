@@ -168,6 +168,9 @@ func TestInsertToolAttemptForeignKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
+	if err := store.MarkEventProcessing(ctx, db, evID, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
 	bound := testAttempt(sessionID)
 	bound.EventID = evID
 	bound.IdempotencyKey = "send:msg:42"
@@ -184,6 +187,35 @@ func TestInsertToolAttemptForeignKeys(t *testing.T) {
 	}
 	if gotEvent != evID || gotKey != bound.IdempotencyKey {
 		t.Errorf("(event_id, idempotency_key) = (%d, %q), want (%d, %q)", gotEvent, gotKey, evID, bound.IdempotencyKey)
+	}
+}
+
+// TestInsertToolAttemptRefusesEventNotMidTurn: a bound event must
+// still be 'processing' — PreToolUse only fires during a live turn, so
+// a journal write landing after recovery already requeued or parked
+// the event is a straggler from a killed child, and accepting it would
+// re-open the §4.6 race the requeue's atomic re-check just closed.
+func TestInsertToolAttemptRefusesEventNotMidTurn(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	sessionID := seedSession(t, db)
+	ctx := context.Background()
+
+	evID, _, err := store.InsertEvent(ctx, db, testEvent())
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	// Deliberately NOT stamped 'processing'.
+	a := testAttempt(sessionID)
+	a.EventID = evID
+	if _, err := store.InsertToolAttempt(ctx, db, a); err == nil {
+		t.Error("InsertToolAttempt accepted a bound event outside 'processing', want error — no turn is running for it")
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM tool_attempts`).Scan(&n); err != nil {
+		t.Fatalf("count attempts: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("found %d rows, want 0", n)
 	}
 }
 
@@ -302,12 +334,18 @@ func TestAttemptsForEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
+	if err := store.MarkEventProcessing(ctx, db, evID, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
 	other := testEvent()
 	other.DedupKey = "discord:msg:other"
 	other.Payload = `{"dedup_key":"discord:msg:other","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`
 	otherID, _, err := store.InsertEvent(ctx, db, other)
 	if err != nil {
 		t.Fatalf("InsertEvent(other): %v", err)
+	}
+	if err := store.MarkEventProcessing(ctx, db, otherID, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing(other): %v", err)
 	}
 
 	first := testAttempt(sessionID)
