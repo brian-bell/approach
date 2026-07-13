@@ -15,6 +15,7 @@ import (
 
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
+	"github.com/brian-bell/approach/internal/router"
 )
 
 // fakeRunner stands in for the discord adapter's Run loop. Internal
@@ -37,7 +38,7 @@ func (f *fakeRunner) Run(ctx context.Context) error {
 func stubRunner(t *testing.T, r adapterRunner) {
 	t.Helper()
 	prev := newDiscordRunner
-	newDiscordRunner = func(*config.Config, *sql.DB, *slog.Logger) (adapterRunner, error) {
+	newDiscordRunner = func(*config.Config, *sql.DB, *router.Queues, *slog.Logger) (adapterRunner, error) {
 		return r, nil
 	}
 	t.Cleanup(func() { newDiscordRunner = prev })

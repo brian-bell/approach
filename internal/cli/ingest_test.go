@@ -10,9 +10,28 @@ import (
 	"testing"
 	"time"
 
+	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
 	"github.com/bwmarrin/discordgo"
 )
+
+// testQueue builds a real router queue over the test store with a
+// no-op turn handler: ingest tests assert the durable row (the §4.1
+// contract), and the placeholder dispatch leaves rows untouched exactly
+// like the daemon's M1 scaffold does.
+func testQueue(t *testing.T, db *sql.DB) *router.Queues {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	q := router.New(ctx, db, router.Options{
+		Handler: func(context.Context, store.QueuedEvent) {},
+		Logger:  slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	})
+	t.Cleanup(func() {
+		cancel()
+		q.Wait()
+	})
+	return q
+}
 
 func testStore(t *testing.T) *sql.DB {
 	t.Helper()
@@ -41,7 +60,7 @@ func inbound(id, content string) *discordgo.MessageCreate {
 func TestDiscordIngestPersistsEvent(t *testing.T) {
 	sdb := testStore(t)
 	now := time.Unix(1700000000, 0)
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func() time.Time { return now })
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), func() time.Time { return now })
 
 	handle(inbound("9871", "hello"))
 
@@ -66,7 +85,7 @@ func TestDiscordIngestPersistsEvent(t *testing.T) {
 func TestDiscordIngestDuplicateCollapses(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 
 	handle(inbound("1", "once"))
 	handle(inbound("1", "once"))
@@ -89,7 +108,7 @@ func TestDiscordIngestDuplicateCollapses(t *testing.T) {
 func TestDiscordIngestRefusedMessageIsLoudDrop(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 
 	m := inbound("1", "x")
 	m.Author = nil
@@ -146,7 +165,7 @@ func payloadOf(t *testing.T, db *sql.DB) (trustCol string, payload map[string]an
 func TestDiscordIngestStampsOwner(t *testing.T) {
 	sdb := testStore(t)
 	seedTestIdentities(t, sdb)
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
 
 	handle(inboundFrom("owner-1"))
 
@@ -164,7 +183,7 @@ func TestDiscordIngestStampsOwner(t *testing.T) {
 func TestDiscordIngestStampsKnown(t *testing.T) {
 	sdb := testStore(t)
 	seedTestIdentities(t, sdb)
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
 
 	handle(inboundFrom("known-1"))
 
@@ -184,7 +203,7 @@ func TestDiscordIngestUnmappedSenderIsUntrusted(t *testing.T) {
 	sdb := testStore(t)
 	seedTestIdentities(t, sdb)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 
 	handle(inboundFrom("stranger-9"))
 
@@ -208,7 +227,7 @@ func TestDiscordIngestUnmappedSenderIsUntrusted(t *testing.T) {
 func TestDiscordIngestWeakAuthClamps(t *testing.T) {
 	sdb := testStore(t)
 	seedTestIdentities(t, sdb)
-	handle := discordIngest(sdb, "weak", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "weak", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
 
 	handle(inboundFrom("owner-1"))
 
@@ -227,7 +246,7 @@ func TestDiscordIngestWeakAuthClamps(t *testing.T) {
 // this array being faithful.
 func TestDiscordIngestPersistsAttachments(t *testing.T) {
 	sdb := testStore(t)
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), time.Now)
 
 	m := inbound("1", "see attached")
 	m.Attachments = []*discordgo.MessageAttachment{
@@ -254,7 +273,7 @@ func TestDiscordIngestPersistsAttachments(t *testing.T) {
 func TestDiscordIngestInsertFailureIsLoud(t *testing.T) {
 	sdb := testStore(t)
 	var log bytes.Buffer
-	handle := discordIngest(sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
+	handle := discordIngest(testQueue(t, sdb), sdb, "strong", slog.New(slog.NewTextHandler(&log, nil)), time.Now)
 	_ = sdb.Close()
 
 	handle(inbound("1", "attacker-authored s3cret"))

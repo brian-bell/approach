@@ -14,6 +14,14 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+// eventQueue is the ingest half of the §4.1 router: durably persist the
+// event, then index it for dispatch — atomically per thread. An
+// interface so ingest tests can observe the seam; production passes
+// *router.Queues.
+type eventQueue interface {
+	Persist(ctx context.Context, ev store.Event) (inserted bool, err error)
+}
+
 // discordIngest is the write-on-receipt path (§4.1): normalize the
 // inbound message into the §6 contract, stamp trust from the
 // identities lookup, and persist BEFORE any processing — the gateway
@@ -28,7 +36,13 @@ import (
 // re-applied as a clamp at stamping time (§7: the identities table
 // can drift past config validation). The clock is injected: receipt
 // time is the adapter's to stamp (§6), and the tests own it.
-func discordIngest(db *sql.DB, auth string, logger *slog.Logger, now func() time.Time) discord.MessageHandler {
+//
+// q is the router's ingest chokepoint: Persist writes the row AND
+// indexes it under the per-thread lock, so receipt order is dispatch
+// order even when the gateway delivers concurrently (§4.1). db rides
+// alongside only for the identities lookup — the event write itself
+// must go through q, never around it.
+func discordIngest(q eventQueue, db *sql.DB, auth string, logger *slog.Logger, now func() time.Time) discord.MessageHandler {
 	return func(m *discordgo.MessageCreate) {
 		ev, err := discord.Normalize(m)
 		if err != nil {
@@ -43,7 +57,7 @@ func discordIngest(db *sql.DB, auth string, logger *slog.Logger, now func() time
 			logger.Error("discord event payload marshal failed", "dedup_key", ev.DedupKey, "error", err.Error())
 			return
 		}
-		inserted, err := store.InsertEvent(context.Background(), db, store.Event{
+		inserted, err := q.Persist(context.Background(), store.Event{
 			DedupKey:  ev.DedupKey,
 			ThreadKey: ev.ThreadKey,
 			Kind:      ev.Kind,

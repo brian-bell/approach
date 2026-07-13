@@ -36,9 +36,15 @@ type Event struct {
 // double-process, because only one row exists to claim. The conflict
 // target is exactly dedup_key, so every OTHER constraint (CHECK, NOT
 // NULL) still fails loud.
-func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (inserted bool, err error) {
+//
+// The returned id is the new row's id — receipt order itself (§4.1),
+// which the router's per-thread FIFO keys on. It is meaningful only
+// when inserted is true: a collapsed duplicate returns 0, never the
+// original row's id, so a buggy caller cannot re-enqueue an event the
+// queue already carries.
+func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (id int64, inserted bool, err error) {
 	if err := ev.validate(); err != nil {
-		return false, fmt.Errorf("store: insert event: %w", err)
+		return 0, false, fmt.Errorf("store: insert event: %w", err)
 	}
 	res, err := db.ExecContext(ctx,
 		`INSERT INTO events (dedup_key, thread_key, kind, trust, payload, received)
@@ -47,13 +53,39 @@ func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (inserted bool, err 
 		ev.DedupKey, ev.ThreadKey, ev.Kind, ev.Trust, ev.Payload, ev.Received,
 	)
 	if err != nil {
-		return false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
+		return 0, false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
+		return 0, false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
 	}
-	return n > 0, nil
+	if n == 0 {
+		return 0, false, nil
+	}
+	id, err = res.LastInsertId()
+	if err != nil {
+		return 0, false, fmt.Errorf("store: insert event %s: %w", ev.DedupKey, err)
+	}
+	return id, true, nil
+}
+
+// ParkEvent durably parks a queue row as interrupted (§4.6): the turn
+// failed in a way whose side effects are unknowable (handler panic,
+// crash-adjacent), so it must neither auto-retry nor silently vanish
+// from the live queue — interrupted is out-of-band, human-visible
+// state. The guard clause only advances rows still owed a turn: a
+// handler that already moved the row (completed, dead) wins, and
+// re-parking finished history would resurrect it as visible failure.
+func ParkEvent(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	_, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'interrupted', updated = ?
+		 WHERE id = ? AND status IN ('received', 'processing')`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: park event %d: %w", id, err)
+	}
+	return nil
 }
 
 // validate refuses an event the queue could not honestly carry. Enum

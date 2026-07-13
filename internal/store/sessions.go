@@ -39,22 +39,39 @@ type Session struct {
 // later and quieter. Constraint violations (one_live_session,
 // one_worker_per_repo, sessions_by_id) surface loud — transactional
 // rotation belongs to the rotation flow, not here.
-func InsertSession(ctx context.Context, db *sql.DB, s Session) error {
+//
+// The stored canonical cwd is returned so a caller can reconstruct the
+// row it just wrote without a read-back — a post-insert read is a
+// second failure point that would report a COMMITTED pin as failed
+// (the row exists, live, but the caller thinks it doesn't).
+func InsertSession(ctx context.Context, db *sql.DB, s Session) (canonicalCwdStored string, err error) {
+	return insertSession(ctx, db, s)
+}
+
+// execer is the slice of database/sql shared by *sql.DB and *sql.Tx —
+// insertSession runs standalone (InsertSession) and inside the
+// rotation transaction (RotateSession) through it, so validation and
+// canonicalization can never drift between the two paths.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func insertSession(ctx context.Context, ex execer, s Session) (string, error) {
 	if err := s.validate(); err != nil {
-		return fmt.Errorf("store: insert session: %w", err)
+		return "", fmt.Errorf("store: insert session: %w", err)
 	}
 	cwd, err := canonicalCwd(s.Cwd)
 	if err != nil {
-		return fmt.Errorf("store: insert session %s: %w", s.SessionID, err)
+		return "", fmt.Errorf("store: insert session %s: %w", s.SessionID, err)
 	}
-	if _, err := db.ExecContext(ctx,
+	if _, err := ex.ExecContext(ctx,
 		`INSERT INTO sessions (thread_key, session_id, cwd, origin, trust_floor, created_at, activation_deadline)
 		 VALUES (?, ?, ?, NULLIF(?, ''), ?, ?, ?)`,
 		s.ThreadKey, s.SessionID, cwd, s.Origin, s.TrustFloor, s.CreatedAt, s.ActivationDeadline,
 	); err != nil {
-		return fmt.Errorf("store: insert session %s: %w", s.SessionID, err)
+		return "", fmt.Errorf("store: insert session %s: %w", s.SessionID, err)
 	}
-	return nil
+	return cwd, nil
 }
 
 // canonicalCwd resolves one true spelling for a session's working

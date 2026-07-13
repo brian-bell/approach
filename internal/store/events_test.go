@@ -55,7 +55,7 @@ func TestInsertEventPersistsOnReceipt(t *testing.T) {
 	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
 
 	ev := testEvent()
-	inserted, err := store.InsertEvent(context.Background(), db, ev)
+	_, inserted, err := store.InsertEvent(context.Background(), db, ev)
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
@@ -96,12 +96,12 @@ func TestInsertEventClosedEnums(t *testing.T) {
 
 	bad := testEvent()
 	bad.Kind = "carrier-pigeon"
-	if _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
+	if _, _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
 		t.Error("kind 'carrier-pigeon' accepted, want CHECK violation")
 	}
 	bad = testEvent()
 	bad.Trust = "root" // not even 'system' spelling drift may pass
-	if _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
+	if _, _, err := store.InsertEvent(context.Background(), db, bad); err == nil {
 		t.Error("trust 'root' accepted, want CHECK violation")
 	}
 	var n int
@@ -148,7 +148,7 @@ func TestInsertEventFailsLoudOnInvalidFields(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ev := testEvent()
 			tc.mutate(&ev)
-			inserted, err := store.InsertEvent(context.Background(), db, ev)
+			_, inserted, err := store.InsertEvent(context.Background(), db, ev)
 			if err == nil {
 				t.Errorf("InsertEvent accepted event with %s, want error", tc.name)
 			}
@@ -174,7 +174,7 @@ func TestInsertEventDuplicateIsNoOp(t *testing.T) {
 	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
 
 	ev := testEvent()
-	inserted, err := store.InsertEvent(context.Background(), db, ev)
+	_, inserted, err := store.InsertEvent(context.Background(), db, ev)
 	if err != nil {
 		t.Fatalf("first InsertEvent: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestInsertEventDuplicateIsNoOp(t *testing.T) {
 	}
 	dup := ev
 	dup.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"message","trust":"owner","text":"redelivered"}`
-	inserted, err = store.InsertEvent(context.Background(), db, dup)
+	_, inserted, err = store.InsertEvent(context.Background(), db, dup)
 	if err != nil {
 		t.Errorf("duplicate InsertEvent errored: %v, want no-op", err)
 	}
@@ -197,7 +197,7 @@ func TestInsertEventDuplicateIsNoOp(t *testing.T) {
 	crossKind := ev
 	crossKind.Kind = "webhook"
 	crossKind.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"webhook","trust":"owner"}`
-	inserted, err = store.InsertEvent(context.Background(), db, crossKind)
+	_, inserted, err = store.InsertEvent(context.Background(), db, crossKind)
 	if err != nil {
 		t.Errorf("cross-kind duplicate InsertEvent errored: %v, want no-op", err)
 	}
@@ -222,7 +222,7 @@ func TestInsertEventDuplicateFirstWriteWins(t *testing.T) {
 	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
 
 	ev := testEvent()
-	if _, err := store.InsertEvent(context.Background(), db, ev); err != nil {
+	if _, _, err := store.InsertEvent(context.Background(), db, ev); err != nil {
 		t.Fatalf("first InsertEvent: %v", err)
 	}
 	if _, err := db.Exec(`UPDATE events SET status = 'processing' WHERE dedup_key = ?`, ev.DedupKey); err != nil {
@@ -232,7 +232,7 @@ func TestInsertEventDuplicateFirstWriteWins(t *testing.T) {
 	dup := ev
 	dup.Payload = `{"dedup_key":"discord:msg:9871","thread_key":"discord:dm:123","kind":"message","trust":"owner","text":"redelivered"}`
 	dup.Received = ev.Received + 60
-	if _, err := store.InsertEvent(context.Background(), db, dup); err != nil {
+	if _, _, err := store.InsertEvent(context.Background(), db, dup); err != nil {
 		t.Fatalf("duplicate InsertEvent: %v", err)
 	}
 
