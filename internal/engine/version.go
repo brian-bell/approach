@@ -45,7 +45,7 @@ func VerifyVersion(ctx context.Context, bin, pinned string) error {
 	cmd.Stdout = out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return termGroup(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Run()

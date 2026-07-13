@@ -226,6 +226,52 @@ func TestRebuildDispatchesUnprocessed(t *testing.T) {
 	}
 }
 
+// TestRebuildParksBeforeAnyDispatch: crash recovery completes before
+// any new turn starts — a handler running while Rebuild is still
+// parking crash-interrupted rows would interleave new work with
+// recovery's rewrites, and a park FAILURE mid-scan would return a
+// startup refusal while that handler races the store teardown. The
+// received row here sorts BEFORE the processing row by id, so a
+// single-pass rebuild would dispatch it first; the two-phase rebuild
+// must have parked the later row before this handler observes it.
+func TestRebuildParksBeforeAnyDispatch(t *testing.T) {
+	db := mustOpen(t)
+	bg := context.Background()
+
+	for i, tk := range []string{"discord:dm:a", "discord:dm:b"} {
+		if _, _, err := store.InsertEvent(bg, db, storeEvent(int64(i+1), tk)); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+	}
+	// id 2 (the LATER row) was mid-turn at the crash.
+	if _, err := db.Exec(`UPDATE events SET status = 'processing' WHERE dedup_key = 'discord:msg:2'`); err != nil {
+		t.Fatalf("mark msg 2 processing: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	var crashRowStatus string
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, ev store.QueuedEvent) {
+			if err := db.QueryRow(`SELECT status FROM events WHERE dedup_key = 'discord:msg:2'`).Scan(&crashRowStatus); err != nil {
+				t.Errorf("read crash row mid-turn: %v", err)
+			}
+			calls.Add(1)
+		},
+		Logger: discardLogger(),
+	})
+	if err := q.Rebuild(bg); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	waitFor(t, func() bool { return calls.Load() == 1 }, "dispatch")
+	q.Wait()
+
+	if crashRowStatus != "interrupted" {
+		t.Errorf("a turn ran while a crash-interrupted row was still %q — recovery must complete before any dispatch", crashRowStatus)
+	}
+}
+
 // TestEnqueueDuringProcessing: an event arriving while its thread is
 // mid-turn appends behind the in-flight one — never dropped, never
 // reordered.

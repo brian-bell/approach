@@ -10,8 +10,10 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -127,7 +129,7 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 	// its transcript; WaitDelay hard-kills a leader that ignores it,
 	// and the group SIGKILL sweep below catches ignoring grandchildren.
 	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+		return termGroup(cmd.Process.Pid)
 	}
 	cmd.WaitDelay = waitDelay
 
@@ -154,6 +156,19 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 		return fmt.Errorf("engine: %s: %s: %w", sessionID, excerpt(stderr.String()), session.ErrResumeFailed)
 	}
 	return fmt.Errorf("engine: turn for %s: %v: %s", sessionID, err, excerpt(stderr.String()))
+}
+
+// termGroup TERMs a spawn's process group, translating ESRCH into
+// os.ErrProcessDone: cancellation can race a clean exit, and the
+// exec.Cmd.Cancel contract records the command as FAILED if Cancel
+// returns any other error after a successful run — a completed turn
+// must never be misfiled as a failure by its own teardown.
+func termGroup(pid int) error {
+	err := syscall.Kill(-pid, syscall.SIGTERM)
+	if errors.Is(err, syscall.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return err
 }
 
 // promptText assembles stdin: the §4.6 transparency note (when a

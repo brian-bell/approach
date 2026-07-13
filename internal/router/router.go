@@ -166,16 +166,27 @@ func (q *Queues) Rebuild(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("router: rebuild queues: %w", err)
 	}
+	// Two phases, strictly ordered: EVERY crash-interrupted row parks
+	// before ANY handler can start. Enqueue spawns drain goroutines
+	// immediately, so interleaving the two would (a) run new turns
+	// while recovery is still rewriting history, and (b) on a park
+	// failure, return this startup refusal while an already-spawned
+	// handler races the daemon's store teardown — Rebuild's error path
+	// must leave nothing running.
 	for _, ev := range rows {
-		if ev.Status == "processing" {
-			if err := store.ParkEvent(ctx, q.db, ev.ID, q.now().Unix()); err != nil {
-				return fmt.Errorf("router: rebuild queues: park crash-interrupted event: %w", err)
-			}
-			q.logger.Warn("crash-interrupted event parked as interrupted — never auto-rerun (§4.6)",
-				"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+		if ev.Status != "processing" {
 			continue
 		}
-		q.Enqueue(ev)
+		if err := store.ParkEvent(ctx, q.db, ev.ID, q.now().Unix()); err != nil {
+			return fmt.Errorf("router: rebuild queues: park crash-interrupted event: %w", err)
+		}
+		q.logger.Warn("crash-interrupted event parked as interrupted — never auto-rerun (§4.6)",
+			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+	}
+	for _, ev := range rows {
+		if ev.Status == "received" {
+			q.Enqueue(ev)
+		}
 	}
 	return nil
 }
