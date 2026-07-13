@@ -139,6 +139,52 @@ func TestRequeueEventForRetryRefusesJournalledSideEffect(t *testing.T) {
 	}
 }
 
+// TestRequeueInterruptedEvent: the §4.6 human retry — an interrupted
+// event returns to 'received', durably owed a turn again, at the
+// thread's current tail. attempts is untouched: a human's "retry" is
+// not the auto budget, and charging it would let two crash-parks
+// exhaust the budget before any engine failure happened.
+func TestRequeueInterruptedEvent(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+	id := insertProcessingEvent(t, db)
+	if err := store.ParkEvent(ctx, db, id, 1700000100); err != nil {
+		t.Fatalf("ParkEvent: %v", err)
+	}
+
+	ev, err := store.RequeueInterruptedEvent(ctx, db, id, 1700000200)
+	if err != nil {
+		t.Fatalf("RequeueInterruptedEvent: %v", err)
+	}
+	if ev.ID != id || ev.DedupKey != testEvent().DedupKey || ev.ThreadKey != testEvent().ThreadKey || ev.Status != "received" {
+		t.Errorf("returned event = %+v — must be the full row, status 'received', ready to enqueue", ev)
+	}
+	status, attempts := eventRetryState(t, db, id)
+	if status != "received" || attempts != 0 {
+		t.Errorf("(status, attempts) = (%q, %d), want ('received', 0)", status, attempts)
+	}
+}
+
+// TestRequeueInterruptedEventGuards: only a parked event retries this
+// way — anything else is a caller bug (or a stale command against a
+// row the queue already owns again) and must fail loud, never
+// double-enqueue.
+func TestRequeueInterruptedEventGuards(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	id, _, err := store.InsertEvent(ctx, db, testEvent())
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if _, err := store.RequeueInterruptedEvent(ctx, db, id, 1700000200); err == nil {
+		t.Error("RequeueInterruptedEvent accepted a 'received' row, want error")
+	}
+	if _, err := store.RequeueInterruptedEvent(ctx, db, id+999, 1700000200); err == nil {
+		t.Error("RequeueInterruptedEvent accepted an unknown id, want error")
+	}
+}
+
 // TestRequeueEventForRetryWrongState: only a failed TURN retries, and
 // turns run from 'processing' — requeueing a row in any other state is
 // a caller bug that must fail loud, not silently reshuffle the queue.

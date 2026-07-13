@@ -17,6 +17,8 @@ commands:
   poke [--socket <path>]     wake a running daemon
   status [--socket <path>]   report a running daemon's status
   drain [--socket <path>]    gracefully stop a running daemon
+  retry <event-id> [--socket <path>]
+                             re-queue an interrupted event (§4.6)
   config check <path>        validate an approach.toml file
   version                    print the approach version
 `
@@ -37,7 +39,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "daemon":
 		return runDaemon(args[1:], stdout, stderr)
 	case "poke", "status", "drain":
-		return runAdminVerb(args[0], args[1:], stdout, stderr)
+		return runAdminVerb(args[0], args[0], args[1:], stdout, stderr)
+	case "retry":
+		return runRetry(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "approach: unknown command %q\n%s", args[0], usage)
 		return 2

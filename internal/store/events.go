@@ -77,8 +77,12 @@ func InsertEvent(ctx context.Context, db *sql.DB, ev Event) (id int64, inserted 
 // handler that already moved the row (completed, dead) wins, and
 // re-parking finished history would resurrect it as visible failure.
 func ParkEvent(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	// parks increments per park: each park is a distinct episode, and
+	// the §4.6 notice key (interrupted:<dedup_key>:<parks>) must never
+	// let an earlier episode's notice suppress a later one — seconds
+	// collide, a monotonic counter cannot.
 	_, err := db.ExecContext(ctx,
-		`UPDATE events SET status = 'interrupted', updated = ?
+		`UPDATE events SET status = 'interrupted', updated = ?, parks = parks + 1
 		 WHERE id = ? AND status IN ('received', 'processing')`,
 		now, id,
 	)

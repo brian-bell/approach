@@ -96,16 +96,24 @@ func eventState(t *testing.T, db *sql.DB, id int64) (status string, attempts int
 }
 
 func handle(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeEnqueuer, after *syncAfter) recovery.Outcome {
+	out, notified := handleN(t, db, ev, enq, after)
+	_ = notified
+	return out
+}
+
+func handleN(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeEnqueuer, after *syncAfter) (recovery.Outcome, int) {
 	t.Helper()
+	notified := 0
 	out, err := recovery.HandleEngineFailure(context.Background(), db, enq, ev, recovery.Options{
 		Logger: slog.Default(),
 		Now:    func() time.Time { return time.Unix(1700000100, 0) },
 		After:  after.after,
+		Notify: func() { notified++ },
 	})
 	if err != nil {
 		t.Fatalf("HandleEngineFailure: %v", err)
 	}
-	return out
+	return out, notified
 }
 
 // TestHandleEngineFailureRetriesCleanTurn: zero journalled attempts is
@@ -172,8 +180,12 @@ func TestHandleEngineFailureParksAmbiguousTurn(t *testing.T) {
 			enq := &fakeEnqueuer{}
 			after := &syncAfter{}
 
-			if out := handle(t, db, ev, enq, after); out != recovery.Parked {
+			out, notified := handleN(t, db, ev, enq, after)
+			if out != recovery.Parked {
 				t.Errorf("outcome = %v, want Parked", out)
+			}
+			if notified != 1 {
+				t.Errorf("Notify fired %d times, want 1 — the pump must wake for the notice NOW, not on the ticker", notified)
 			}
 			status, attempts := eventState(t, db, ev.ID)
 			if status != "interrupted" || attempts != 0 {
@@ -182,7 +194,23 @@ func TestHandleEngineFailureParksAmbiguousTurn(t *testing.T) {
 			if len(enq.enqueued) != 0 {
 				t.Errorf("enqueued = %+v, want none", enq.enqueued)
 			}
+			assertSurfaced(t, db, ev)
 		})
+	}
+}
+
+// assertSurfaced checks the §4.6 park notice landed in the outbox,
+// aimed at the originating thread.
+func assertSurfaced(t *testing.T, db *sql.DB, ev store.QueuedEvent) {
+	t.Helper()
+	var target string
+	if err := db.QueryRow(
+		`SELECT target FROM deliveries WHERE delivery_key LIKE ?`, "interrupted:"+ev.DedupKey+":%",
+	).Scan(&target); err != nil {
+		t.Fatalf("§4.6 surface row missing for %s: %v — a park no one hears about is a silent drop", ev.DedupKey, err)
+	}
+	if target != ev.ThreadKey {
+		t.Errorf("surface target = %q, want the originating thread %q", target, ev.ThreadKey)
 	}
 }
 

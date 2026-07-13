@@ -78,3 +78,99 @@ func RequeueEventForRetry(ctx context.Context, db *sql.DB, id int64, now int64) 
 	}
 	return nil
 }
+
+// UnsurfacedInterruptedEvents finds parks nobody was told about:
+// interrupted events with no "interrupted:<dedup_key>" outbox row —
+// the loss mode when the notice write fails after the park commits, or
+// the daemon dies between the two. Interrupted rows are outside every
+// queue rescan by design (never auto-rerun, §4.6), so this sweep is
+// their only path back to visibility; the deterministic notice key
+// makes re-surfacing idempotent.
+func UnsurfacedInterruptedEvents(ctx context.Context, db *sql.DB) ([]QueuedEvent, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received
+		 FROM events e
+		 WHERE e.status = 'interrupted'
+		   AND NOT EXISTS (SELECT 1 FROM deliveries d
+		                   WHERE d.delivery_key = 'interrupted:' || e.dedup_key
+		                                          || ':' || e.parks)
+		 ORDER BY id`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: scan unsurfaced interrupted events: %w", err)
+	}
+	// Read-only query: a Close error after full iteration has nothing
+	// to add — rows.Err() below already surfaces any read failure.
+	defer func() { _ = rows.Close() }()
+
+	var out []QueuedEvent
+	for rows.Next() {
+		var ev QueuedEvent
+		if err := rows.Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
+			&ev.Payload, &ev.Status, &ev.Received); err != nil {
+			return nil, fmt.Errorf("store: scan unsurfaced interrupted events: %w", err)
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: scan unsurfaced interrupted events: %w", err)
+	}
+	return out, nil
+}
+
+// RequeueInterruptedEvent is the §4.6 human retry: a parked
+// (interrupted) event returns to 'received' — owed a turn again, at
+// its thread's current tail — and the full row comes back so the
+// caller can enqueue it. attempts is deliberately untouched: a human's
+// "retry" is not the auto budget, and charging it would let two crash
+// parks exhaust the budget before any engine failure happened.
+//
+// Guarded to 'interrupted' only: a stale retry command against a row
+// the queue already owns again must fail loud, never double-enqueue.
+// The write is the transaction's first statement; the row read below
+// happens under the same write lock, so what the caller enqueues is
+// exactly what the transition produced.
+func RequeueInterruptedEvent(ctx context.Context, db *sql.DB, id int64, now int64) (QueuedEvent, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: %w", id, err)
+	}
+	// Rollback after a successful Commit is a documented no-op — this
+	// only sweeps the error paths.
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE events SET status = 'received', updated = ?
+		 WHERE id = ? AND status = 'interrupted'`,
+		now, id,
+	)
+	if err != nil {
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: %w", id, err)
+	}
+	if n == 0 {
+		var status string
+		if err := tx.QueryRowContext(ctx,
+			`SELECT status FROM events WHERE id = ?`, id,
+		).Scan(&status); err != nil {
+			return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: row missing: %w", id, err)
+		}
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: status is %q, not 'interrupted' — only a parked event takes the human retry", id, status)
+	}
+
+	var ev QueuedEvent
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id, dedup_key, thread_key, kind, trust, payload, status, received
+		 FROM events WHERE id = ?`, id,
+	).Scan(&ev.ID, &ev.DedupKey, &ev.ThreadKey, &ev.Kind, &ev.Trust,
+		&ev.Payload, &ev.Status, &ev.Received); err != nil {
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: read back: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return QueuedEvent{}, fmt.Errorf("store: requeue interrupted event %d: %w", id, err)
+	}
+	return ev, nil
+}

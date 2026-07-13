@@ -36,6 +36,14 @@ type Options struct {
 	Handler Handler
 	Logger  *slog.Logger
 	Now     func() time.Time
+	// OnPark, when set, is told about each crash-interrupted event
+	// Rebuild parks — the seam where the daemon surfaces the §4.6
+	// notice to the originating thread. It runs AFTER the park
+	// committed; an error degrades to a logged loss, never a failed
+	// Rebuild (the park is durable, and refusing to boot over a failed
+	// notification would invert §4.6 — the dead-letter flow owns a
+	// surface that stays failed).
+	OnPark func(context.Context, store.QueuedEvent) error
 }
 
 // Queues is the per-thread dispatch index. Zero value is not usable —
@@ -46,6 +54,7 @@ type Queues struct {
 	handler Handler
 	logger  *slog.Logger
 	now     func() time.Time
+	onPark  func(context.Context, store.QueuedEvent) error
 
 	mu      sync.Mutex
 	pending map[string][]store.QueuedEvent // per-thread FIFO, receipt (id) order
@@ -78,6 +87,7 @@ func New(ctx context.Context, db *sql.DB, opts Options) *Queues {
 		handler: opts.Handler,
 		logger:  opts.Logger,
 		now:     now,
+		onPark:  opts.OnPark,
 		pending: make(map[string][]store.QueuedEvent),
 		claimed: make(map[string]bool),
 	}
@@ -147,6 +157,22 @@ func (q *Queues) Enqueue(ev store.QueuedEvent) {
 	}
 }
 
+// Readmit re-enters an event the store has already durably requeued
+// (a §4.6 retry: interrupted → received, or an engine-failure retry)
+// at its thread's CURRENT tail. It takes the same per-thread ingest
+// lock as Persist, so a readmission never interleaves inside another
+// ingest's insert+enqueue critical section. This is the sanctioned
+// exception to Enqueue's receipt-order contract: a retried event's old
+// id lands behind newer arrivals live (the tail NOW), while a restart
+// would replay it by id order — an accepted asymmetry, per-thread
+// serialization (not cross-arrival order) is the §4.1 guarantee.
+func (q *Queues) Readmit(ev store.QueuedEvent) {
+	lock := q.ingestLock(ev.ThreadKey)
+	lock.Lock()
+	defer lock.Unlock()
+	q.Enqueue(ev)
+}
+
 // Rebuild reloads the index from the durable queue (§4.1: rebuilt from
 // the table on restart). UnprocessedEvents returns rows in id (receipt)
 // order, so per-thread FIFO order is reconstructed exactly. Call before
@@ -182,6 +208,12 @@ func (q *Queues) Rebuild(ctx context.Context) error {
 		}
 		q.logger.Warn("crash-interrupted event parked as interrupted — never auto-rerun (§4.6)",
 			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
+		if q.onPark != nil {
+			if err := q.onPark(ctx, ev); err != nil {
+				q.logger.Error("park surfacing failed — the park is durable, the notice is not (§4.6)",
+					"dedup_key", ev.DedupKey, "error", err.Error())
+			}
+		}
 	}
 	for _, ev := range rows {
 		if ev.Status == "received" {
@@ -263,6 +295,14 @@ func (q *Queues) dispatch(ev store.QueuedEvent) {
 			if err := store.ParkEvent(context.Background(), q.db, ev.ID, q.now().Unix()); err != nil {
 				q.logger.Error("park after panic failed — event stranded until restart recovery",
 					"dedup_key", ev.DedupKey, "error", err.Error())
+			} else if q.onPark != nil {
+				// The park must be HEARD (§4.6): Rebuild skips rows
+				// already interrupted, so a notice skipped here is
+				// skipped forever — this is the only chance to write it.
+				if err := q.onPark(context.Background(), ev); err != nil {
+					q.logger.Error("park surfacing failed — the park is durable, the notice is not (§4.6)",
+						"dedup_key", ev.DedupKey, "error", err.Error())
+				}
 			}
 		}
 	}()

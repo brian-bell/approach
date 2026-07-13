@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -160,5 +161,96 @@ func TestDaemonWithoutSenderLeavesDeliveriesOwed(t *testing.T) {
 	}
 	if !strings.Contains(errW.String(), "resend") {
 		t.Errorf("stderr %q never mentions the skipped resend — owed rows must not be silent", errW.String())
+	}
+}
+
+// TestDaemonRetryVerbRequeuesInterruptedEvent: the §4.6 manual retry,
+// end to end — an interrupted event seeded before boot goes back to
+// 'received' when the owner runs `retry <id>` against the admin
+// socket, and a second retry of the same id refuses (the queue owns
+// the row again).
+func TestDaemonRetryVerbRequeuesInterruptedEvent(t *testing.T) {
+	runner := &sendingRunner{fakeRunner: fakeRunner{run: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}}
+	stubRunner(t, runner)
+	state, configPath := discordDaemonDir(t)
+
+	// Seed an interrupted event the previous life parked.
+	var eventID int64
+	{
+		db, err := store.Open(filepath.Join(state, "approach.db"))
+		if err != nil {
+			t.Fatalf("pre-seed open: %v", err)
+		}
+		ev := store.Event{
+			DedupKey: "discord:msg:parked", ThreadKey: "discord:dm:123", Kind: "message", Trust: "owner",
+			Payload:  `{"dedup_key":"discord:msg:parked","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`,
+			Received: 1700000000,
+		}
+		eventID, _, err = store.InsertEvent(context.Background(), db, ev)
+		if err != nil {
+			t.Fatalf("pre-seed event: %v", err)
+		}
+		if _, err := db.Exec(`UPDATE events SET status = 'interrupted' WHERE id = ?`, eventID); err != nil {
+			t.Fatalf("park seeded event: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatalf("pre-seed close: %v", err)
+		}
+	}
+
+	var out, errW syncBuilder
+	exit := make(chan int, 1)
+	go func() { exit <- Run([]string{"daemon", "--state", state, "--config", configPath}, &out, &errW) }()
+	awaitReady(t, &out)
+	sock := filepath.Join(state, "approach.sock")
+
+	// Through the CLI subcommand — the exact invocation the §4.6
+	// notice advertises to the owner.
+	var cliOut, cliErr syncBuilder
+	if code := Run([]string{"retry", fmt.Sprint(eventID), "--socket", sock}, &cliOut, &cliErr); code != 0 {
+		t.Fatalf("approach retry exit = %d, stderr %q, want 0", code, cliErr.String())
+	}
+	if !strings.Contains(cliOut.String(), "ok") {
+		t.Errorf("retry stdout = %q, want ok", cliOut.String())
+	}
+	var dupOut, dupErr syncBuilder
+	if code := Run([]string{"retry", fmt.Sprint(eventID), "--socket", sock}, &dupOut, &dupErr); code == 0 {
+		t.Error("second retry exited 0, want failure — the queue owns the row again")
+	}
+
+	if _, err := admin.Request(sock, "drain"); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	select {
+	case code := <-exit:
+		if code != 0 {
+			t.Fatalf("daemon exit = %d; stderr=%q", code, errW.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("daemon did not exit after drain")
+	}
+
+	db, err := store.Open(filepath.Join(state, "approach.db"))
+	if err != nil {
+		t.Fatalf("post-run open: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Fatalf("post-run close: %v", err)
+		}
+	}()
+	var status string
+	if err := db.QueryRow(`SELECT status FROM events WHERE id = ?`, eventID).Scan(&status); err != nil {
+		t.Fatalf("read event: %v", err)
+	}
+	// The placeholder turn handler consumes the dispatch without a
+	// completion transition, so after drain the row reads 'processing'
+	// — proof the retry re-entered the queue and was dispatched. Once
+	// turn wiring lands this assertion follows the real lifecycle.
+	if status != "processing" && status != "received" {
+		t.Errorf("event status = %q, want received/processing — the retry must have left 'interrupted'", status)
 	}
 }

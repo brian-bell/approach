@@ -3,6 +3,7 @@ package router_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -408,6 +409,8 @@ func TestHandlerPanicParksEventAndContinues(t *testing.T) {
 	ctx, cancel := context.WithCancel(bg)
 	defer cancel()
 	var handled atomic.Int64
+	var mu sync.Mutex
+	var surfaced []string
 	q := router.New(ctx, db, router.Options{
 		Handler: func(_ context.Context, ev store.QueuedEvent) {
 			if ev.DedupKey == "discord:msg:1" {
@@ -417,6 +420,12 @@ func TestHandlerPanicParksEventAndContinues(t *testing.T) {
 		},
 		Logger: discardLogger(),
 		Now:    func() time.Time { return time.Unix(1700009999, 0) },
+		OnPark: func(_ context.Context, ev store.QueuedEvent) error {
+			mu.Lock()
+			defer mu.Unlock()
+			surfaced = append(surfaced, ev.DedupKey)
+			return nil
+		},
 	})
 	if err := q.Rebuild(bg); err != nil {
 		t.Fatalf("Rebuild: %v", err)
@@ -436,6 +445,14 @@ func TestHandlerPanicParksEventAndContinues(t *testing.T) {
 	}
 	if !updated.Valid || updated.Int64 != 1700009999 {
 		t.Errorf("parked event updated = %+v, want the injected clock's 1700009999", updated)
+	}
+	// The park must be HEARD (§4.6): a panic park skipped by OnPark
+	// would never surface — Rebuild skips already-interrupted rows, so
+	// no later boot writes the notice either.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(surfaced) != 1 || surfaced[0] != "discord:msg:1" {
+		t.Errorf("OnPark saw %v, want exactly the panicked event", surfaced)
 	}
 }
 
@@ -537,4 +554,81 @@ func TestCancelStopsDispatch(t *testing.T) {
 	if handled.Load() != 1 {
 		t.Errorf("event enqueued after cancel was dispatched")
 	}
+}
+
+// TestRebuildOnParkCallback: a crash-park must be HEARD, not just
+// written — Rebuild reports each parked event through OnPark so the
+// daemon can surface the §4.6 notice, and a callback failure degrades
+// to a logged loss (the park is durable; a boot refusal over a failed
+// notification would invert §4.6), never a failed Rebuild.
+func TestRebuildOnParkCallback(t *testing.T) {
+	db := mustOpen(t)
+	bg := context.Background()
+
+	if _, _, err := store.InsertEvent(bg, db, storeEvent(1, "discord:dm:a")); err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE events SET status = 'processing' WHERE dedup_key = 'discord:msg:1'`); err != nil {
+		t.Fatalf("mark processing: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	var parked []string
+	q := router.New(ctx, db, router.Options{
+		Handler: func(context.Context, store.QueuedEvent) {},
+		Logger:  discardLogger(),
+		OnPark: func(_ context.Context, ev store.QueuedEvent) error {
+			parked = append(parked, ev.DedupKey)
+			return errors.New("surface failed — must not fail the boot")
+		},
+	})
+	if err := q.Rebuild(bg); err != nil {
+		t.Fatalf("Rebuild: %v — an OnPark error must degrade to a log line, the park is already durable", err)
+	}
+	q.Wait()
+
+	if len(parked) != 1 || parked[0] != "discord:msg:1" {
+		t.Errorf("OnPark saw %v, want exactly the crash-parked event", parked)
+	}
+}
+
+// TestReadmitDispatchesRequeuedEvent: the §4.6 human retry re-enters
+// its thread through Readmit — the sanctioned re-admission path, taken
+// under the same per-thread ingest serialization as Persist, so a
+// retry never interleaves inside another ingest's insert+enqueue
+// critical section.
+func TestReadmitDispatchesRequeuedEvent(t *testing.T) {
+	db := mustOpen(t)
+	bg := context.Background()
+
+	id, _, err := store.InsertEvent(bg, db, storeEvent(1, "discord:dm:a"))
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if err := store.MarkEventProcessing(bg, db, id, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
+	if err := store.ParkEvent(bg, db, id, 1700000100); err != nil {
+		t.Fatalf("ParkEvent: %v", err)
+	}
+	ev, err := store.RequeueInterruptedEvent(bg, db, id, 1700000200)
+	if err != nil {
+		t.Fatalf("RequeueInterruptedEvent: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	var calls atomic.Int64
+	q := router.New(ctx, db, router.Options{
+		Handler: func(_ context.Context, got store.QueuedEvent) {
+			if got.ID == id {
+				calls.Add(1)
+			}
+		},
+		Logger: discardLogger(),
+	})
+	q.Readmit(ev)
+	waitFor(t, func() bool { return calls.Load() == 1 }, "readmitted dispatch")
+	q.Wait()
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -404,5 +405,60 @@ func TestPokeFiresHook(t *testing.T) {
 	case <-poked:
 	case <-time.After(5 * time.Second):
 		t.Error("OnPoke hook never fired")
+	}
+}
+
+// TestRetryVerb: the §4.6 manual retry — "retry <event-id>" hands the
+// id to the daemon's handler; a handler refusal (unknown id, wrong
+// state) comes back as err so a stale command never looks like a
+// requeue; a daemon without the handler wired says so instead of
+// pretending.
+func TestRetryVerb(t *testing.T) {
+	var got []int64
+	path := startServer(t, admin.Options{
+		OnRetry: func(id int64) error {
+			got = append(got, id)
+			if id == 404 {
+				return errors.New("no interrupted event 404")
+			}
+			return nil
+		},
+	})
+
+	reply, err := admin.Request(path, "retry 42")
+	if err != nil {
+		t.Fatalf("retry 42: %v", err)
+	}
+	if !strings.HasPrefix(reply, "ok") {
+		t.Errorf("reply = %q, want ok", reply)
+	}
+	if len(got) != 1 || got[0] != 42 {
+		t.Errorf("handler saw %v, want [42]", got)
+	}
+
+	for _, tc := range []struct{ verb, wantIn string }{
+		{"retry 404", "no interrupted event 404"}, // handler refusal relayed
+		{"retry notanumber", "positive event id"}, // parse failure, handler never runs
+		{"retry", "positive event id"},            // missing id
+	} {
+		reply, err := admin.Request(path, tc.verb)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.verb, err)
+		}
+		if !strings.HasPrefix(reply, "err") || !strings.Contains(reply, tc.wantIn) {
+			t.Errorf("%s reply = %q, want err mentioning %q", tc.verb, reply, tc.wantIn)
+		}
+	}
+	if len(got) != 2 || got[1] != 404 {
+		t.Errorf("handler saw %v, want [42 404] — parse failures must never reach it", got)
+	}
+
+	bare := startServer(t, admin.Options{})
+	bareReply, err := admin.Request(bare, "retry 42")
+	if err != nil {
+		t.Fatalf("retry on bare server: %v", err)
+	}
+	if !strings.HasPrefix(bareReply, "err") {
+		t.Errorf("reply = %q, want err — retry without a wired handler must be dormant AND loud", bareReply)
 	}
 }

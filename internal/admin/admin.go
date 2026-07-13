@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,11 @@ type Options struct {
 	// Status supplies the fields reported by the status verb. Nil
 	// reports an empty object.
 	Status func() map[string]any
+	// OnRetry is invoked for "retry <event-id>" — the §4.6 manual
+	// re-queue of an interrupted event. Its error is relayed to the
+	// client verbatim as a refusal. Nil means the verb answers err:
+	// a daemon without the retry path wired must say so, not pretend.
+	OnRetry func(eventID int64) error
 	// ReadTimeout bounds how long a connection may sit silent before
 	// it is cut off. Zero means a 5-second default.
 	ReadTimeout time.Duration
@@ -259,6 +265,12 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	verb := strings.TrimSuffix(line, "\n")
 	s.opts.Logger.Info("admin request", "verb", verb)
+	// Argumented verbs dispatch on the word before the first space;
+	// everything below the switch keeps the exact-match contract.
+	if arg, ok := strings.CutPrefix(verb, "retry "); ok || verb == "retry" {
+		s.handleRetry(conn, arg)
+		return
+	}
 	switch verb {
 	case "poke":
 		if s.opts.OnPoke != nil {
@@ -286,4 +298,25 @@ func (s *Server) handle(conn net.Conn) {
 		}
 		fmt.Fprintf(conn, "err unknown command %q — expected poke, status, or drain\n", verb)
 	}
+}
+
+// handleRetry answers "retry <event-id>" (§4.6): parse loud, hand the
+// id to the daemon, relay the outcome. Parse failures never reach the
+// handler — a garbled id must not be "helpfully" coerced into
+// requeueing some other event.
+func (s *Server) handleRetry(conn net.Conn, arg string) {
+	if s.opts.OnRetry == nil {
+		fmt.Fprintln(conn, "err retry is not wired on this daemon")
+		return
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(arg), 10, 64)
+	if err != nil || id <= 0 {
+		fmt.Fprintf(conn, "err retry wants a positive event id, got %q\n", arg)
+		return
+	}
+	if err := s.opts.OnRetry(id); err != nil {
+		fmt.Fprintf(conn, "err retry %d: %v\n", id, err)
+		return
+	}
+	fmt.Fprintf(conn, "ok retry %d requeued\n", id)
 }

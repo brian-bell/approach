@@ -90,6 +90,56 @@ func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, l
 	}
 }
 
+// Pump keeps the outbox drained for the daemon's whole life: one
+// drain at start (the §4.6 restart resend), then a drain per kick —
+// the low-latency path for notices composed mid-life (a park's §4.6
+// notice must post NOW, not on the next restart) — with a ticker as
+// the safety net for any writer that forgets to kick. Kick sends
+// should be non-blocking against a buffered channel; a kick that
+// lands mid-drain coalesces into the next pass.
+//
+// Blocks until ctx is cancelled — run it on its own goroutine and
+// wait for it before closing the store, exactly like the adapter.
+func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time, kick <-chan struct{}, interval time.Duration) {
+	pass := func() {
+		sweepUnsurfacedParks(ctx, db, logger)
+		ResendUnacked(ctx, db, senders, logger, now)
+	}
+	pass()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-kick:
+		case <-ticker.C:
+		}
+		pass()
+	}
+}
+
+// sweepUnsurfacedParks composes the missing §4.6 notice for every
+// interrupted event that has none — the durable repair for a park
+// whose surface write failed or whose daemon died between park and
+// notice. Interrupted rows are outside every queue rescan by design,
+// so without this sweep such a park is silent forever. Idempotent
+// (deterministic notice key); failures log and wait for the next pass.
+func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) {
+	events, err := store.UnsurfacedInterruptedEvents(ctx, db)
+	if err != nil {
+		logger.Error("unsurfaced-park sweep failed — parked events may be silent until the next pass", "error", err.Error())
+		return
+	}
+	for _, ev := range events {
+		if err := SurfaceInterrupted(ctx, db, ev); err != nil {
+			logger.Error("re-surfacing parked event failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
+			continue
+		}
+		logger.Warn("parked event had no notice — composed by sweep (§4.6)", "dedup_key", ev.DedupKey)
+	}
+}
+
 // channelOf extracts the channel segment of a §6 thread key — the
 // prefix before the first ':' ("discord:dm:123" → "discord"). A key
 // without a separator returns whole, matching no configured sender and

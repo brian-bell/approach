@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/brian-bell/approach/internal/delivery"
 	"github.com/brian-bell/approach/internal/store"
 )
 
@@ -43,6 +44,11 @@ type Options struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 	After  func(d time.Duration, f func())
+	// Notify, when set, is called after a park's §4.6 notice lands in
+	// the outbox — the daemon wires it to the outbox pump's kick so
+	// the notice posts now instead of on the next ticker pass. Must be
+	// non-blocking; nil means the pump's ticker is the delivery bound.
+	Notify func()
 }
 
 // backoff is the §4.6 retry schedule by budget unit being spent
@@ -84,20 +90,20 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Enqueuer, ev store
 		return 0, fmt.Errorf("recovery: judge event %s: journal unreadable — ambiguous, not retried: %w", ev.DedupKey, err)
 	}
 	if !safeToRetry(attempts) {
-		return park(ctx, db, ev, opts.Logger, now,
+		return park(ctx, db, ev, opts,
 			"side-effecting attempt without idempotency key — ambiguous, parked (§4.6)")
 	}
 
 	if err := store.RequeueEventForRetry(ctx, db, ev.ID, now().Unix()); err != nil {
 		if errors.Is(err, store.ErrRetryBudgetExhausted) {
-			return park(ctx, db, ev, opts.Logger, now,
+			return park(ctx, db, ev, opts,
 				"retry budget exhausted — parked for a human (§4.6)")
 		}
 		if errors.Is(err, store.ErrSideEffectingAttempt) {
 			// The judgment above went stale — a straggling PreToolUse
 			// journalled an attempt in the gap. The transition's atomic
 			// re-check caught it; ambiguity parks.
-			return park(ctx, db, ev, opts.Logger, now,
+			return park(ctx, db, ev, opts,
 				"attempt journalled during recovery — ambiguous, parked (§4.6)")
 		}
 		return 0, fmt.Errorf("recovery: requeue event %s: %w", ev.DedupKey, err)
@@ -140,14 +146,30 @@ func safeToRetry(attempts []store.ToolAttempt) bool {
 	return true
 }
 
-// park moves the event to 'interrupted' and reports Parked. A park
-// that cannot be written is an error, not a shrug: the event would
-// otherwise strand in 'processing', invisible until the next restart.
-func park(ctx context.Context, db *sql.DB, ev store.QueuedEvent, logger *slog.Logger, now func() time.Time, why string) (Outcome, error) {
+// park moves the event to 'interrupted', surfaces the §4.6 notice to
+// the originating thread through the outbox, and reports Parked. A
+// park that cannot be written is an error, not a shrug: the event
+// would otherwise strand in 'processing', invisible until the next
+// restart. A surface that cannot be written only logs — the park
+// already committed, and §4.6 routes a failed surface to the
+// dead-letter flow (x6n.3.6), never to a failed recovery.
+func park(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Options, why string) (Outcome, error) {
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
 	if err := store.ParkEvent(ctx, db, ev.ID, now().Unix()); err != nil {
 		return 0, fmt.Errorf("recovery: park event %s: %w", ev.DedupKey, err)
 	}
-	logger.Warn("engine failure — event parked as interrupted (§4.6)",
+	if err := delivery.SurfaceInterrupted(ctx, db, ev); err != nil {
+		opts.Logger.Error("park notice write failed — the pump's unsurfaced-park sweep repairs it next pass (§4.6)",
+			"dedup_key", ev.DedupKey, "error", err.Error())
+	} else if opts.Notify != nil {
+		// Wake the outbox pump so the notice posts now, not on the
+		// next ticker pass.
+		opts.Notify()
+	}
+	opts.Logger.Warn("engine failure — event parked as interrupted (§4.6)",
 		"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey, "reason", why)
 	return Parked, nil
 }
