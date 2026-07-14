@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -21,6 +22,7 @@ import (
 	"github.com/brian-bell/approach/internal/adapter/discord"
 	"github.com/brian-bell/approach/internal/admin"
 	"github.com/brian-bell/approach/internal/config"
+	"github.com/brian-bell/approach/internal/delivery"
 	"github.com/brian-bell/approach/internal/engine"
 	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
@@ -33,6 +35,11 @@ import (
 // restart-looping every RestartSec. Keep in sync with
 // deploy/systemd/approach.service.
 const exitUnrecoverable = 3
+
+// The production adapter must satisfy the outbound surface the §4.6
+// restart resend needs — a runtime type assertion alone would demote
+// a signature drift from compile error to silently-skipped resend.
+var _ delivery.Sender = (*discord.Adapter)(nil)
 
 // defaultStateDir is where the daemon keeps its socket and store:
 // $APPROACH_HOME/state, defaulting to ~/approach/state (§6).
@@ -84,9 +91,44 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// it must still be observable, not silently dropped: the count in
 	// status is how a timer's wake path is verified end to end.
 	var pokes atomic.Int64
+	// queues is assigned after the store opens; the admin socket only
+	// serves after that, so the retry closure never sees it nil in a
+	// living daemon — the guard is for the refusal paths.
+	var queues *router.Queues
 	srv, err := admin.New(socket, admin.Options{
 		Logger: logger,
 		OnPoke: func() { pokes.Add(1) },
+		// The §4.6 manual retry: interrupted → received durably, then
+		// back into the thread's queue at its current tail.
+		OnRetry: func(id int64) error {
+			if db == nil || queues == nil {
+				return fmt.Errorf("daemon still starting — store/router not ready")
+			}
+			ev, err := store.RequeueInterruptedEvent(context.Background(), db, id, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			queues.Readmit(ev)
+			return nil
+		},
+		// The §4.6 manual drain: one human decision per dead letter.
+		OnDeadRequeue: func(id int64) error {
+			if db == nil || queues == nil {
+				return fmt.Errorf("daemon still starting — store/router not ready")
+			}
+			ev, err := store.ResolveDeadLetterRequeue(context.Background(), db, id, time.Now().Unix())
+			if err != nil {
+				return err
+			}
+			queues.Readmit(ev)
+			return nil
+		},
+		OnDeadDiscard: func(id int64) error {
+			if db == nil {
+				return fmt.Errorf("daemon still starting — store not ready")
+			}
+			return store.ResolveDeadLetterDiscard(context.Background(), db, id)
+		},
 		Status: func() map[string]any {
 			fields := map[string]any{"version": version(), "pid": os.Getpid(), "pokes": pokes.Load()}
 			var schema int
@@ -175,9 +217,29 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// interrupted turns, re-indexing queued ones) must finish before new
 	// traffic can interleave with it. A rebuild that cannot write its
 	// parks is a startup refusal, not a degraded boot.
-	queues := router.New(ctx, db, router.Options{
+	// pumpKick wakes the outbox pump when a new outbound row lands
+	// mid-life (a park's §4.6 notice must post now, not next restart).
+	// Buffered + non-blocking: a kick during a drain coalesces.
+	pumpKick := make(chan struct{}, 1)
+	kickPump := func() {
+		select {
+		case pumpKick <- struct{}{}:
+		default:
+		}
+	}
+	queues = router.New(ctx, db, router.Options{
 		Handler: placeholderTurn(logger),
 		Logger:  logger,
+		// Crash parks surface to the originating thread through the
+		// outbox (§4.6) — write-before-send holds the notice durably
+		// until the adapter is up.
+		OnPark: func(ctx context.Context, ev store.QueuedEvent) error {
+			if err := delivery.SurfaceInterrupted(ctx, db, ev); err != nil {
+				return err
+			}
+			kickPump()
+			return nil
+		},
 	})
 	if err := queues.Rebuild(ctx); err != nil {
 		logger.Error("rebuild event queues", "error", err.Error())
@@ -215,6 +277,26 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		close(adapterDone)
 	}
 
+	// The outbox pump: one drain at start (the §4.6 restart resend —
+	// rows the previous life composed but never got acked re-send from
+	// their persisted payloads), then a drain per kick or ticker tick,
+	// so notices composed mid-life post now instead of next restart.
+	// Runs concurrent with fresh ingest — at-least-once tolerates the
+	// interleaving, and per-target order is the resender's own
+	// invariant. An adapter without an outbound surface must be LOUD:
+	// silence would read as "nothing owed" when the outbox disagrees.
+	resendDone := make(chan struct{})
+	if sender, ok := runner.(delivery.Sender); ok {
+		go func() {
+			defer close(resendDone)
+			delivery.Pump(ctx, db, map[string]delivery.Sender{"discord": sender},
+				logger, time.Now, pumpKick, 30*time.Second)
+		}()
+	} else {
+		close(resendDone)
+		logger.Warn("no outbound sender — restart resend skipped; owed deliveries stay durable (§4.6)")
+	}
+
 	serveErr := srv.Serve(ctx)
 	// Serve has returned (drain, signal, or adapter-triggered cancel):
 	// stop the adapter and WAIT for it — the ingest path must be dead
@@ -224,6 +306,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// in-flight turn must finish its writes before the store closes.
 	cancel()
 	<-adapterDone
+	<-resendDone
 	queues.Wait()
 	if adapterErr != nil {
 		logger.Error("discord adapter terminated", "error", adapterErr.Error())
@@ -402,7 +485,50 @@ func rejectLeftovers(verb string, flags *flag.FlagSet, stderr io.Writer) error {
 }
 
 // runAdminVerb sends poke, status, or drain to a running daemon.
-func runAdminVerb(verb string, args []string, stdout, stderr io.Writer) int {
+// runRetry is `approach retry <event-id>`: the §4.6 manual re-queue
+// of an interrupted event, exactly the invocation the park notice
+// advertises. The id is validated BEFORE the socket is touched — a
+// garbled id is a usage error, not a request.
+func runRetry(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "approach retry: missing event id")
+		return 2
+	}
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil || id <= 0 {
+		fmt.Fprintf(stderr, "approach retry: %q is not a positive event id\n", args[0])
+		return 2
+	}
+	return runAdminVerb("retry", fmt.Sprintf("retry %d", id), args[1:], stdout, stderr)
+}
+
+// runDead is `approach dead <requeue|discard> <event-id>` — the §4.6
+// manual drain, one decision per row. Same validate-before-socket
+// contract as retry.
+func runDead(args []string, stdout, stderr io.Writer) int {
+	if len(args) < 2 {
+		fmt.Fprintln(stderr, "approach dead: want 'requeue <event-id>' or 'discard <event-id>'")
+		return 2
+	}
+	var verb string
+	switch args[0] {
+	case "requeue":
+		verb = "dead-requeue"
+	case "discard":
+		verb = "dead-discard"
+	default:
+		fmt.Fprintf(stderr, "approach dead: unknown action %q — want requeue or discard\n", args[0])
+		return 2
+	}
+	id, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || id <= 0 {
+		fmt.Fprintf(stderr, "approach dead %s: %q is not a positive event id\n", args[0], args[1])
+		return 2
+	}
+	return runAdminVerb(verb, fmt.Sprintf("%s %d", verb, id), args[2:], stdout, stderr)
+}
+
+func runAdminVerb(verb, request string, args []string, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet(verb, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	socket := flags.String("socket", filepath.Join(defaultStateDir(), "approach.sock"), "path to the daemon admin socket")
@@ -413,7 +539,7 @@ func runAdminVerb(verb string, args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	reply, err := admin.Request(*socket, verb)
+	reply, err := admin.Request(*socket, request)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
