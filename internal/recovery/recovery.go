@@ -33,11 +33,14 @@ const (
 	Dead
 )
 
-// Enqueuer re-admits an event to its thread's in-memory queue —
-// *router.Queues satisfies it. One method, so recovery never imports
-// the router's world.
-type Enqueuer interface {
-	Enqueue(ev store.QueuedEvent)
+// Readmitter re-admits a durably requeued event to its thread's
+// in-memory queue — *router.Queues satisfies it, and Readmit (not raw
+// Enqueue) is deliberate: the router's sanctioned re-entry takes the
+// per-thread ingest lock, so a backoff firing mid-ingest can never
+// land the retry inside another arrival's insert+enqueue critical
+// section. One method, so recovery never imports the router's world.
+type Readmitter interface {
+	Readmit(ev store.QueuedEvent)
 }
 
 // Options wires the injectables. Logger is required; Now defaults to
@@ -78,7 +81,7 @@ var backoff = [...]time.Duration{30 * time.Second, 2 * time.Minute}
 // too, until the dead_letters landing (x6n.3.6) takes that branch
 // over. Either way the event ends in a durable, human-visible state —
 // never a silent drop.
-func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Enqueuer, ev store.QueuedEvent, opts Options) (Outcome, error) {
+func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Readmitter, ev store.QueuedEvent, opts Options) (Outcome, error) {
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -127,7 +130,7 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Enqueuer, ev store
 	}
 	requeued := ev
 	requeued.Status = "received"
-	after(delay, func() { enq.Enqueue(requeued) })
+	after(delay, func() { enq.Readmit(requeued) })
 	opts.Logger.Info("engine failure — clean turn requeued with backoff (§4.6)",
 		"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey, "attempt", spent, "backoff", delay.String())
 	return Retried, nil

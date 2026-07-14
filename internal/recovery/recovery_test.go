@@ -9,13 +9,20 @@ import (
 	"time"
 
 	"github.com/brian-bell/approach/internal/recovery"
+	"github.com/brian-bell/approach/internal/router"
 	"github.com/brian-bell/approach/internal/store"
 )
 
-// fakeEnqueuer records re-enqueued events.
-type fakeEnqueuer struct{ enqueued []store.QueuedEvent }
+// The production wiring hands recovery the router's queues — the
+// compile-time pin that the sanctioned re-entry (Readmit, under the
+// per-thread ingest lock) is what satisfies the seam, mirroring the
+// daemon's delivery.Sender assertion.
+var _ recovery.Readmitter = (*router.Queues)(nil)
 
-func (f *fakeEnqueuer) Enqueue(ev store.QueuedEvent) { f.enqueued = append(f.enqueued, ev) }
+// fakeReadmitter records re-admitted events.
+type fakeReadmitter struct{ readmitted []store.QueuedEvent }
+
+func (f *fakeReadmitter) Readmit(ev store.QueuedEvent) { f.readmitted = append(f.readmitted, ev) }
 
 // syncAfter runs the callback immediately and records the requested
 // delay — tests own the clock, no real timers (§6 convention).
@@ -95,13 +102,13 @@ func eventState(t *testing.T, db *sql.DB, id int64) (status string, attempts int
 	return status, attempts
 }
 
-func handle(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeEnqueuer, after *syncAfter) recovery.Outcome {
+func handle(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeReadmitter, after *syncAfter) recovery.Outcome {
 	out, notified := handleN(t, db, ev, enq, after)
 	_ = notified
 	return out
 }
 
-func handleN(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeEnqueuer, after *syncAfter) (recovery.Outcome, int) {
+func handleN(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeReadmitter, after *syncAfter) (recovery.Outcome, int) {
 	t.Helper()
 	notified := 0
 	out, err := recovery.HandleEngineFailure(context.Background(), db, enq, ev, recovery.Options{
@@ -123,7 +130,7 @@ func handleN(t *testing.T, db *sql.DB, ev store.QueuedEvent, enq *fakeEnqueuer, 
 func TestHandleEngineFailureRetriesCleanTurn(t *testing.T) {
 	db := openStore(t)
 	ev, _ := stageFailedTurn(t, db)
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	if out := handle(t, db, ev, enq, after); out != recovery.Retried {
@@ -133,11 +140,11 @@ func TestHandleEngineFailureRetriesCleanTurn(t *testing.T) {
 	if status != "received" || attempts != 1 {
 		t.Errorf("(status, attempts) = (%q, %d), want ('received', 1)", status, attempts)
 	}
-	if len(enq.enqueued) != 1 || enq.enqueued[0].ID != ev.ID {
-		t.Fatalf("enqueued = %+v, want the event exactly once", enq.enqueued)
+	if len(enq.readmitted) != 1 || enq.readmitted[0].ID != ev.ID {
+		t.Fatalf("enqueued = %+v, want the event exactly once", enq.readmitted)
 	}
-	if enq.enqueued[0].Status != "received" {
-		t.Errorf("re-enqueued status = %q, want 'received' — dispatch stamps processing from there", enq.enqueued[0].Status)
+	if enq.readmitted[0].Status != "received" {
+		t.Errorf("re-enqueued status = %q, want 'received' — dispatch stamps processing from there", enq.readmitted[0].Status)
 	}
 	if len(after.delays) != 1 || after.delays[0] != 30*time.Second {
 		t.Errorf("backoff = %v, want [30s] for the first retry", after.delays)
@@ -152,7 +159,7 @@ func TestHandleEngineFailureSecondRetryBacksOffLonger(t *testing.T) {
 	if _, err := db.Exec(`UPDATE events SET attempts = 1 WHERE id = ?`, ev.ID); err != nil {
 		t.Fatalf("spend one budget unit: %v", err)
 	}
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	if out := handle(t, db, ev, enq, after); out != recovery.Retried {
@@ -177,7 +184,7 @@ func TestHandleEngineFailureParksAmbiguousTurn(t *testing.T) {
 			db := openStore(t)
 			ev, sessionID := stageFailedTurn(t, db)
 			journalAttempt(t, db, sessionID, ev.ID, state, "")
-			enq := &fakeEnqueuer{}
+			enq := &fakeReadmitter{}
 			after := &syncAfter{}
 
 			out, notified := handleN(t, db, ev, enq, after)
@@ -191,8 +198,8 @@ func TestHandleEngineFailureParksAmbiguousTurn(t *testing.T) {
 			if status != "interrupted" || attempts != 0 {
 				t.Errorf("(status, attempts) = (%q, %d), want ('interrupted', 0) — ambiguity spends no budget, it ends the automation", status, attempts)
 			}
-			if len(enq.enqueued) != 0 {
-				t.Errorf("enqueued = %+v, want none", enq.enqueued)
+			if len(enq.readmitted) != 0 {
+				t.Errorf("enqueued = %+v, want none", enq.readmitted)
 			}
 			assertSurfaced(t, db, ev)
 		})
@@ -222,14 +229,14 @@ func TestHandleEngineFailureRetriesFullyKeyedTurn(t *testing.T) {
 	ev, sessionID := stageFailedTurn(t, db)
 	journalAttempt(t, db, sessionID, ev.ID, "started", "send:msg:42")
 	journalAttempt(t, db, sessionID, ev.ID, "done", "send:msg:43")
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	if out := handle(t, db, ev, enq, after); out != recovery.Retried {
 		t.Errorf("outcome = %v, want Retried — every attempt is keyed", out)
 	}
-	if len(enq.enqueued) != 1 {
-		t.Errorf("enqueued %d events, want 1", len(enq.enqueued))
+	if len(enq.readmitted) != 1 {
+		t.Errorf("enqueued %d events, want 1", len(enq.readmitted))
 	}
 }
 
@@ -241,14 +248,14 @@ func TestHandleEngineFailureParksMixedKeyTurn(t *testing.T) {
 	ev, sessionID := stageFailedTurn(t, db)
 	journalAttempt(t, db, sessionID, ev.ID, "done", "send:msg:42")
 	journalAttempt(t, db, sessionID, ev.ID, "started", "")
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	if out := handle(t, db, ev, enq, after); out != recovery.Parked {
 		t.Errorf("outcome = %v, want Parked", out)
 	}
-	if len(enq.enqueued) != 0 {
-		t.Errorf("enqueued = %+v, want none", enq.enqueued)
+	if len(enq.readmitted) != 0 {
+		t.Errorf("enqueued = %+v, want none", enq.readmitted)
 	}
 }
 
@@ -267,7 +274,7 @@ func TestHandleEngineFailureDeadLettersExhaustedBudget(t *testing.T) {
 	if _, err := db.Exec(`UPDATE events SET attempts = 2 WHERE id = ?`, ev.ID); err != nil {
 		t.Fatalf("spend budget: %v", err)
 	}
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	out, notified := handleN(t, db, ev, enq, after)
@@ -297,8 +304,8 @@ func TestHandleEngineFailureDeadLettersExhaustedBudget(t *testing.T) {
 	if target != "discord:dm:999" {
 		t.Errorf("notice target = %q, want the owner DM", target)
 	}
-	if len(enq.enqueued) != 0 {
-		t.Errorf("enqueued = %+v, want none", enq.enqueued)
+	if len(enq.readmitted) != 0 {
+		t.Errorf("enqueued = %+v, want none", enq.readmitted)
 	}
 }
 
@@ -312,7 +319,7 @@ func TestHandleEngineFailureUnreadableJournalIsAnError(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatalf("close db: %v", err)
 	}
-	enq := &fakeEnqueuer{}
+	enq := &fakeReadmitter{}
 	after := &syncAfter{}
 
 	_, err := recovery.HandleEngineFailure(context.Background(), db, enq, ev, recovery.Options{
@@ -323,7 +330,7 @@ func TestHandleEngineFailureUnreadableJournalIsAnError(t *testing.T) {
 	if err == nil {
 		t.Fatal("HandleEngineFailure returned a verdict from an unreadable journal, want error")
 	}
-	if len(enq.enqueued) != 0 {
-		t.Errorf("enqueued = %+v, want none — never retry on missing evidence", enq.enqueued)
+	if len(enq.readmitted) != 0 {
+		t.Errorf("enqueued = %+v, want none — never retry on missing evidence", enq.readmitted)
 	}
 }
