@@ -117,6 +117,46 @@ func TestResendUnackedSendsPersistedPayloadsInComposeOrder(t *testing.T) {
 	}
 }
 
+// shutdownSender wraps fakeSender so Send cancels the pass's context
+// the instant the platform accepts — the deterministic re-creation of
+// a shutdown landing in the gap between platform-accept and ack write.
+type shutdownSender struct {
+	inner  *fakeSender
+	cancel context.CancelFunc
+}
+
+func (s *shutdownSender) Send(ctx context.Context, target, payload string) (string, error) {
+	ack, err := s.inner.Send(ctx, target, payload)
+	s.cancel()
+	return ack, err
+}
+
+// TestResendUnackedAckSurvivesShutdownCancel: a SIGTERM that lands the
+// moment the platform accepts must not lose the ack — the send
+// HAPPENED, and the store is still open (the daemon waits for the pump
+// before closing it), so dropping the write here would make the next
+// boot re-send a message the human already received. Shutdown may
+// refuse to START sends (the loop's top-of-pass check); it must never
+// drop the record of one that finished.
+func TestResendUnackedAckSurvivesShutdownCancel(t *testing.T) {
+	db := openStore(t)
+	id := insertPending(t, db, "reply:1", "discord:dm:123", "hello")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender := &shutdownSender{inner: &fakeSender{}, cancel: cancel}
+	delivery.ResendUnacked(ctx, db,
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+
+	status, attempts, acked := deliveryState(t, db, id)
+	if status != "sent" || !acked.Valid {
+		t.Errorf("(status, acked) = (%q, %v), want ('sent', set) — a shutdown must not un-record a send the platform accepted", status, acked)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
+	}
+}
+
 // TestResendUnackedFailureLeavesRowPending: a refused send costs
 // nothing durable — the attempt is journalled (stamp precedes outcome,
 // §4.6) and the row stays pending for the next restart. This bead

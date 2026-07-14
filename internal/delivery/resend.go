@@ -77,7 +77,12 @@ func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, l
 			stopped[d.Target] = true
 			continue
 		}
-		if err := store.AckDelivery(ctx, db, d.ID, now().Unix()); err != nil {
+		// WithoutCancel: the send HAPPENED — a shutdown landing in the
+		// gap between platform-accept and this write must not lose the
+		// ack, or the next boot re-sends a message the human already
+		// received. The store is still open (the daemon waits for the
+		// pump before closing it), same as session's ActivateSession.
+		if err := store.AckDelivery(context.WithoutCancel(ctx), db, d.ID, now().Unix()); err != nil {
 			// The platform accepted but the ack write failed: the row
 			// stays owed and the NEXT pass re-sends — a duplicate
 			// message, the §4.1 trade at-least-once accepts.
