@@ -184,8 +184,14 @@ func MarkDeliveryAttempt(ctx context.Context, db *sql.DB, id int64, now int64) e
 // every sibling is acked. A terminally failed sibling blocks replied
 // PERMANENTLY — a reply with an undelivered chunk is not replied, and
 // the block must not depend on whether the failure or the last ack
-// landed first: both orders converge on completed, where the §4.6
-// dead-letter flow owns the event's terminal outcome.
+// landed first: both orders converge on completed, and the event RESTS
+// there — the honest terminal state for "turn done, reply not fully
+// delivered". Deliberately NOT the events dead-letter flow: that
+// drain's requeue re-runs the whole turn, and replaying a COMPLETED
+// turn's side effects is the §4.6 hazard itself. What failed is the
+// delivery row, and its terminal outcome belongs to the delivery-level
+// drain that must land with the retry-budget flow (approach-bqmh) —
+// retry re-sends the persisted payload, no engine involved.
 //
 // A duplicate ack is a no-op, not an error: at-least-once means
 // duplicate sends, and each send's ack is normal operation — the
@@ -294,8 +300,13 @@ func AckDelivery(ctx context.Context, db *sql.DB, id int64, now int64) error {
 }
 
 // MarkDeliveryFailed is the terminal give-up (§4.6): the retry budget
-// is exhausted and the row leaves the resend scan for the dead-letter
-// surfacing flows. Guarded to live unacked rows: flipping a delivered
+// is exhausted and the row leaves the resend scan for the
+// DELIVERY-level drain — surfacing, manual re-send, discard — that
+// must land with the retry-budget flow that calls this (approach-bqmh;
+// a terminal state never ships without its drain). Not the events
+// dead-letter flow: the bound event's turn already ran, and only a
+// re-SEND of the persisted payload is safe. Guarded to live unacked
+// rows: flipping a delivered
 // message to failed would un-deliver history, and re-entering failed
 // must not read as a FRESH transition — the §4.6 surfacing (one DM on
 // entry) keys off entering this state, so a repeat give-up reporting
