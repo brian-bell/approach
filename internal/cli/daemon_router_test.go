@@ -68,6 +68,33 @@ func TestDaemonStartupRebuildParksCrashInterrupted(t *testing.T) {
 	}()
 	waitDialable(t, socket)
 
+	// The queued row's dispatch runs on its thread's queue goroutine,
+	// and dispatch quietly REFUSES once shutdown begins (leaving the
+	// row 'received' for the next boot — correct router behavior, not
+	// what this test probes). An immediate drain can win that race on
+	// a slow runner, so wait for the pre-turn stamp — the §4.1
+	// contract under test — before draining. WAL allows this second
+	// reader alongside the daemon's own connection.
+	pollDB, err := store.Open(filepath.Join(state, "approach.db"))
+	if err != nil {
+		t.Fatalf("open poll store: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var status string
+		err := pollDB.QueryRow(`SELECT status FROM events WHERE dedup_key = 'discord:msg:2'`).Scan(&status)
+		if err == nil && status == "processing" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("discord:msg:2 never reached 'processing' (last: %q, err: %v)", status, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := pollDB.Close(); err != nil {
+		t.Fatalf("close poll store: %v", err)
+	}
+
 	var out, errW strings.Builder
 	if code := cli.Run([]string{"drain", "--socket", socket}, &out, &errW); code != 0 {
 		t.Fatalf("drain exit = %d, stderr %q", code, errW.String())
