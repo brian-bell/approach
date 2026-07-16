@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -270,5 +271,22 @@ func TestDailySpendRefusesInvertedWindow(t *testing.T) {
 	}
 	if _, err := store.DailySpend(context.Background(), db, 200, 100); err == nil {
 		t.Error("DailySpend accepted an inverted window")
+	}
+}
+
+// TestInsertTurnRejectsNonFiniteCost: a NaN cost would slip past the
+// "< 0" check (NaN compares false to everything) and then poison the
+// §7 spend SUM — one bad row and every daily total reads NaN, which
+// also breaks the status verb's JSON. Same for infinities.
+func TestInsertTurnRejectsNonFiniteCost(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	sessionID := seedSession(t, db)
+
+	for _, bad := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		turn := testTurn(sessionID)
+		turn.CostUSD = bad
+		if _, err := store.InsertTurn(context.Background(), db, turn); err == nil {
+			t.Errorf("InsertTurn accepted cost_usd = %v", bad)
+		}
 	}
 }

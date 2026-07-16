@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -357,7 +358,14 @@ func (c *Config) validateEngine(fail failFunc) {
 	}
 	// Zero disables the alarm (loudly warned at startup); negative is
 	// not a creative disable, it is a typo'd threshold — fail loud.
-	if e.DailySpendAlarmUSD < 0 {
+	// Non-finite is checked FIRST and explicitly: TOML accepts nan/inf
+	// literals, and NaN compares false to everything — it would slip
+	// past "< 0", then past both the startup warn and the alarm
+	// comparison, silently disabling the §7 alarm; +inf breaks the
+	// status verb's JSON.
+	if math.IsNaN(e.DailySpendAlarmUSD) || math.IsInf(e.DailySpendAlarmUSD, 0) {
+		fail("engine.daily_spend_alarm_usd must be a finite number, got %v", e.DailySpendAlarmUSD)
+	} else if e.DailySpendAlarmUSD < 0 {
 		fail("engine.daily_spend_alarm_usd must be >= 0, got %v (0 disables the §7 cost alarm)", e.DailySpendAlarmUSD)
 	}
 	// The enrolled set must be DECLARED, not defaulted or empty: hooks

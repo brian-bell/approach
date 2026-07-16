@@ -138,3 +138,19 @@ func TestEngineDailySpendAlarm(t *testing.T) {
 		t.Errorf("error %q does not name the offending key", err)
 	}
 }
+
+// TestEngineDailySpendAlarmRejectsNonFinite: TOML accepts nan and inf
+// float literals — NaN compares false to everything, so it would slip
+// past both the ">= 0" validation and the "== 0 warn / > 0 alarm"
+// branches, silently disabling the §7 alarm; +inf poisons the status
+// verb's JSON. Non-finite is a config error, full stop.
+func TestEngineDailySpendAlarmRejectsNonFinite(t *testing.T) {
+	for _, lit := range []string{"nan", "+nan", "inf", "+inf", "-inf"} {
+		if _, err := config.Parse(strings.NewReader(validModels + engineNoHooks +
+			"hooks = [\"Stop\"]\ndaily_spend_alarm_usd = " + lit + "\n")); err == nil {
+			t.Errorf("Parse accepted daily_spend_alarm_usd = %s", lit)
+		} else if !strings.Contains(err.Error(), "daily_spend_alarm_usd") {
+			t.Errorf("error %q for %s does not name the offending key", err, lit)
+		}
+	}
+}

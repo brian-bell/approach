@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 )
 
 // Turn is one row of the C11 observability table (§6): what one engine
@@ -130,6 +131,11 @@ func (t Turn) validate() error {
 		return fmt.Errorf("outcome %q is not ok|error|denied|timeout — the enum is closed (§6)", t.Outcome)
 	case t.InputTokens < 0 || t.OutputTokens < 0:
 		return fmt.Errorf("tokens (%d, %d) negative", t.InputTokens, t.OutputTokens)
+	case math.IsNaN(t.CostUSD) || math.IsInf(t.CostUSD, 0):
+		// NaN compares false to everything (it would slip past the
+		// negative check below) and one NaN row poisons every SUM the
+		// §7 spend query ever runs — reject at the door.
+		return fmt.Errorf("cost_usd %v is not finite", t.CostUSD)
 	case t.CostUSD < 0:
 		return fmt.Errorf("cost_usd %v negative", t.CostUSD)
 	case t.ToolCalls < 0:
