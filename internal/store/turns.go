@@ -81,6 +81,42 @@ func InsertTurn(ctx context.Context, db *sql.DB, t Turn) (id int64, err error) {
 	return id, nil
 }
 
+// SpendSummary is the §7 daily-spend answer. KnownUSD sums only the
+// turns whose result event arrived; UnknownTurns counts the rest —
+// killed children whose burn nobody measured — so a reader always sees
+// that KnownUSD is a lower bound, never mistakes it for the whole
+// story.
+type SpendSummary struct {
+	KnownUSD     float64 // SUM(cost_usd) over turns with known usage
+	Turns        int64   // every turn in the window
+	UnknownTurns int64   // turns whose usage never arrived (cost is NULL)
+}
+
+// DailySpend is the heartbeat's cost-alarm hook (§7): total burn over
+// the half-open window [since, until). The heartbeat wiring is a later
+// epic (C11 rides ahead of it, same as UnackedDeadLetters); the admin
+// status verb reads it today. An empty or inverted window is a caller
+// bug answered loudly — a silent $0 would read as "no burn", the exact
+// quiet degradation the alarm exists to prevent.
+func DailySpend(ctx context.Context, db *sql.DB, since, until int64) (SpendSummary, error) {
+	if since >= until {
+		return SpendSummary{}, fmt.Errorf("store: daily spend: window [%d, %d) is empty — a spend query over nothing would read as no burn (§7)", since, until)
+	}
+	var s SpendSummary
+	// COALESCE both aggregates: SUM over zero rows (or all-NULL costs)
+	// is NULL, and a scan failure on a fresh store must not masquerade
+	// as a broken checklist.
+	err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), COALESCE(SUM(cost_usd IS NULL), 0)
+		 FROM turns WHERE ts >= ? AND ts < ?`,
+		since, until,
+	).Scan(&s.KnownUSD, &s.Turns, &s.UnknownTurns)
+	if err != nil {
+		return SpendSummary{}, fmt.Errorf("store: daily spend over [%d, %d): %w", since, until, err)
+	}
+	return s, nil
+}
+
 // validate refuses a turn the §7 spend query could not reason from.
 func (t Turn) validate() error {
 	switch {

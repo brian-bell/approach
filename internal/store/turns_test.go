@@ -193,3 +193,82 @@ func TestInsertTurnRequiresKnownSession(t *testing.T) {
 		t.Errorf("error %q does not identify the failing insert", err)
 	}
 }
+
+// seedTurn inserts one turn with the given ts/cost — cost < 0 means
+// usage unknown (a killed child's NULL row).
+func seedTurn(t *testing.T, db *sql.DB, sessionID string, ts int64, costUSD float64) {
+	t.Helper()
+	turn := store.Turn{
+		SessionID: sessionID, TS: ts, Kind: "message", Model: "claude-sonnet-5",
+		ToolCalls: 1, DurationMS: 100, Outcome: "ok",
+	}
+	if costUSD >= 0 {
+		turn.UsageKnown = true
+		turn.CostUSD = costUSD
+		turn.InputTokens = 10
+		turn.OutputTokens = 10
+	} else {
+		turn.Outcome = "timeout"
+	}
+	if _, err := store.InsertTurn(context.Background(), db, turn); err != nil {
+		t.Fatalf("InsertTurn(ts=%d): %v", ts, err)
+	}
+}
+
+// TestDailySpend: the §7 heartbeat checklist query — cost summed over
+// a half-open [since, until) window, with unknown-usage turns counted
+// separately so the total reads as the LOWER BOUND it is, never as a
+// complete answer it cannot be.
+func TestDailySpend(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	sessionID := seedSession(t, db)
+
+	const midnight = int64(1700000000)
+	seedTurn(t, db, sessionID, midnight-1, 99.0)   // yesterday — outside
+	seedTurn(t, db, sessionID, midnight, 0.25)     // window start, inclusive
+	seedTurn(t, db, sessionID, midnight+100, 0.50) // inside
+	seedTurn(t, db, sessionID, midnight+200, -1)   // inside, usage unknown
+	seedTurn(t, db, sessionID, midnight+86400, 77) // next window, exclusive
+
+	got, err := store.DailySpend(context.Background(), db, midnight, midnight+86400)
+	if err != nil {
+		t.Fatalf("DailySpend: %v", err)
+	}
+	if got.KnownUSD != 0.75 {
+		t.Errorf("KnownUSD = %v, want 0.75 — window edges are [since, until)", got.KnownUSD)
+	}
+	if got.Turns != 3 {
+		t.Errorf("Turns = %d, want 3", got.Turns)
+	}
+	if got.UnknownTurns != 1 {
+		t.Errorf("UnknownTurns = %d, want 1 — unknown burn must stay visible (§7)", got.UnknownTurns)
+	}
+}
+
+// TestDailySpendEmptyWindow: no turns is zeros, not an error — a
+// fresh store's checklist reads $0, and NULL SUM must not scan-fail.
+func TestDailySpendEmptyWindow(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	got, err := store.DailySpend(context.Background(), db, 0, 1)
+	if err != nil {
+		t.Fatalf("DailySpend on empty store: %v", err)
+	}
+	if got.KnownUSD != 0 || got.Turns != 0 || got.UnknownTurns != 0 {
+		t.Errorf("empty window = %+v, want zeros", got)
+	}
+}
+
+// TestDailySpendRefusesInvertedWindow: a window that ends before it
+// starts is a caller bug answered loudly, not an empty $0 that would
+// read as "no burn today".
+func TestDailySpendRefusesInvertedWindow(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+
+	if _, err := store.DailySpend(context.Background(), db, 100, 100); err == nil {
+		t.Error("DailySpend accepted an empty [since, until) window")
+	}
+	if _, err := store.DailySpend(context.Background(), db, 200, 100); err == nil {
+		t.Error("DailySpend accepted an inverted window")
+	}
+}

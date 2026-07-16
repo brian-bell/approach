@@ -43,6 +43,12 @@ type Engine struct {
 	MaxTurns    int      `toml:"max_turns"`    // --max-turns per spawn (§11); default 25
 	TurnTimeout Duration `toml:"turn_timeout"` // wall-clock kill per turn (§11); default 10m
 	Hooks       []string `toml:"hooks"`        // enrolled hook set (§2) — consumed by C8/C9 enrollment
+	// DailySpendAlarmUSD is the §7 cost-alarm threshold the C11
+	// daily-spend query compares against ("cost as a safety control").
+	// Zero/absent disables the alarm — the daemon warns loudly at
+	// startup so a missing alarm is a choice someone can see, never a
+	// silent default. Negative is a config error.
+	DailySpendAlarmUSD float64 `toml:"daily_spend_alarm_usd"`
 }
 
 // Policy is the §7 capability × trust matrix. STUB in this milestone:
@@ -348,6 +354,11 @@ func (c *Config) validateEngine(fail failFunc) {
 	}
 	if e.TurnTimeout < Duration(time.Second) {
 		fail("engine.turn_timeout must be at least 1s, got %v (§11 — a turn without a wall clock is the runaway shape)", e.TurnTimeout.Duration())
+	}
+	// Zero disables the alarm (loudly warned at startup); negative is
+	// not a creative disable, it is a typo'd threshold — fail loud.
+	if e.DailySpendAlarmUSD < 0 {
+		fail("engine.daily_spend_alarm_usd must be >= 0, got %v (0 disables the §7 cost alarm)", e.DailySpendAlarmUSD)
 	}
 	// The enrolled set must be DECLARED, not defaulted or empty: hooks
 	// are the enforcement and reflection substrate (§2), and an engine
