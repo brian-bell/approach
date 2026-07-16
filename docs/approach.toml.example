@@ -78,4 +78,10 @@ bin = "/usr/local/bin/claude"
 version = "2.1.199"
 max_turns = 25        # --max-turns per spawn (§11); default 25
 turn_timeout = "10m"  # wall-clock kill per turn (§11); default 10m
+# The §7 cost alarm: `approach status` (and later the heartbeat
+# checklist) reports OVER once today's known burn from the turns
+# table reaches this. Omit (or 0) to disable — the daemon warns
+# loudly at startup, because an engine that can burn money with no
+# alarm should be a visible choice.
+daily_spend_alarm_usd = 25.0
 hooks = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd"]

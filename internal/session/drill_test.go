@@ -199,7 +199,7 @@ func TestDrillThreadContinuesAfterHoursAndRestart(t *testing.T) {
 	// transition and the write-before-send reply compose (§4.1).
 	runTurn := func(db *sql.DB, m *session.Manager) router.Handler {
 		return func(ctx context.Context, ev store.QueuedEvent) {
-			if err := m.Turn(ctx, ev.ThreadKey, "owner", cwd, ev.DedupKey); err != nil {
+			if err := m.Turn(ctx, ev.ThreadKey, "owner", cwd, "message", ev.DedupKey); err != nil {
 				t.Errorf("turn for %s: %v", ev.DedupKey, err)
 				return
 			}

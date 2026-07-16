@@ -108,3 +108,49 @@ func TestEngineValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestEngineDailySpendAlarm: the §7 cost-alarm threshold parses from
+// [engine] — the turns table's daily-spend query compares against it.
+// Absent means disabled (the daemon warns loudly, never silently);
+// negative is a config error, not a creative way to disable.
+func TestEngineDailySpendAlarm(t *testing.T) {
+	c, err := config.Parse(strings.NewReader(validModels + engineNoHooks +
+		"hooks = [\"Stop\"]\ndaily_spend_alarm_usd = 25.5\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if c.Engine.DailySpendAlarmUSD != 25.5 {
+		t.Errorf("daily_spend_alarm_usd = %v, want 25.5", c.Engine.DailySpendAlarmUSD)
+	}
+
+	c, err = config.Parse(strings.NewReader(validModels + validEngine))
+	if err != nil {
+		t.Fatalf("Parse (absent alarm): %v", err)
+	}
+	if c.Engine.DailySpendAlarmUSD != 0 {
+		t.Errorf("absent daily_spend_alarm_usd = %v, want 0 (disabled)", c.Engine.DailySpendAlarmUSD)
+	}
+
+	if _, err := config.Parse(strings.NewReader(validModels + engineNoHooks +
+		"hooks = [\"Stop\"]\ndaily_spend_alarm_usd = -1.0\n")); err == nil {
+		t.Error("Parse accepted a negative daily_spend_alarm_usd")
+	} else if !strings.Contains(err.Error(), "daily_spend_alarm_usd") {
+		t.Errorf("error %q does not name the offending key", err)
+	}
+}
+
+// TestEngineDailySpendAlarmRejectsNonFinite: TOML accepts nan and inf
+// float literals — NaN compares false to everything, so it would slip
+// past both the ">= 0" validation and the "== 0 warn / > 0 alarm"
+// branches, silently disabling the §7 alarm; +inf poisons the status
+// verb's JSON. Non-finite is a config error, full stop.
+func TestEngineDailySpendAlarmRejectsNonFinite(t *testing.T) {
+	for _, lit := range []string{"nan", "+nan", "inf", "+inf", "-inf"} {
+		if _, err := config.Parse(strings.NewReader(validModels + engineNoHooks +
+			"hooks = [\"Stop\"]\ndaily_spend_alarm_usd = " + lit + "\n")); err == nil {
+			t.Errorf("Parse accepted daily_spend_alarm_usd = %s", lit)
+		} else if !strings.Contains(err.Error(), "daily_spend_alarm_usd") {
+			t.Errorf("error %q for %s does not name the offending key", err, lit)
+		}
+	}
+}

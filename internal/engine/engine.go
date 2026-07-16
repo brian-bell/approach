@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/brian-bell/approach/internal/session"
+	"github.com/brian-bell/approach/internal/store"
 )
 
 // Config pins the engine invocation. Every field is load-bearing and
@@ -33,17 +34,26 @@ type Config struct {
 	Model       string        // pinned per event kind in approach.toml (§8)
 	MaxTurns    int           // --max-turns per spawn (§11)
 	TurnTimeout time.Duration // wall-clock kill for one turn (§11)
-	Logger      *slog.Logger
+	// RecordTurn receives every turn's C11 observability row (§6) —
+	// the daemon wires it to store.InsertTurn. Required: the turns
+	// table feeds the §7 cost alarm, and an engine that burns tokens
+	// invisibly is the quiet degradation that alarm exists to prevent.
+	// A returned error is logged loudly but never fails the turn —
+	// erroring a turn whose engine work succeeded would invite a §4.6
+	// replay of completed side effects.
+	RecordTurn func(context.Context, store.Turn) error
+	Logger     *slog.Logger
 }
 
 // Engine spawns claude -p children. One engine per daemon; safe for
 // concurrent use (it holds no per-turn state).
 type Engine struct {
-	bin      string
-	model    string
-	maxTurns int
-	timeout  time.Duration
-	logger   *slog.Logger
+	bin        string
+	model      string
+	maxTurns   int
+	timeout    time.Duration
+	recordTurn func(context.Context, store.Turn) error
+	logger     *slog.Logger
 }
 
 // New validates the pin. Fail-loud: an engine with a hole in its
@@ -63,17 +73,20 @@ func New(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("engine: max turns %d — the §11 runaway cap must be positive", cfg.MaxTurns)
 	case cfg.TurnTimeout <= 0:
 		return nil, fmt.Errorf("engine: turn timeout %v — a turn without a wall clock is the §11 runaway shape", cfg.TurnTimeout)
+	case cfg.RecordTurn == nil:
+		return nil, fmt.Errorf("engine: no turn recorder — an engine that burns tokens invisibly defeats the §7 cost alarm (C11)")
 	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Engine{
-		bin:      cfg.Bin,
-		model:    cfg.Model,
-		maxTurns: cfg.MaxTurns,
-		timeout:  cfg.TurnTimeout,
-		logger:   logger,
+		bin:        cfg.Bin,
+		model:      cfg.Model,
+		maxTurns:   cfg.MaxTurns,
+		timeout:    cfg.TurnTimeout,
+		recordTurn: cfg.RecordTurn,
+		logger:     logger,
 	}, nil
 }
 
@@ -101,18 +114,26 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 	defer cancel()
 
 	// THE pinned form (§7 — tested, see TestStartInvocationFormPinned):
-	// -p, model pin, turn cap, then exactly one session flag. The
-	// prompt travels on stdin: argv is world-readable in process
-	// listings, and message content must not leak there (§7).
+	// -p, model pin, turn cap, the stream-json output the C11 turn
+	// record parses (--verbose is the CLI's own requirement for
+	// stream-json under -p), then exactly one session flag. The prompt
+	// travels on stdin: argv is world-readable in process listings, and
+	// message content must not leak there (§7).
 	args := []string{
 		"-p",
 		"--model", e.model,
 		"--max-turns", strconv.Itoa(e.maxTurns),
+		"--output-format", "stream-json", "--verbose",
 		sessionFlag, sessionID,
 	}
 	cmd := exec.CommandContext(ctx, e.bin, args...)
 	cmd.Dir = spec.Cwd
 	cmd.Stdin = strings.NewReader(promptText(spec))
+	// stdout carries the stream-json event feed; the collector keeps
+	// the C11 score (model, tool calls, result usage) as it streams,
+	// bounded against a child that floods it (§11).
+	stats := &turnStats{}
+	cmd.Stdout = stats
 	// Bounded: stderr is diagnostics, and an unbounded buffer hands a
 	// misbehaving (or prompt-injected) child a path to exhaust daemon
 	// memory long before its timeout — the cap is enforced at write
@@ -141,6 +162,11 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 		// gone — the normal case) is fine.
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+	// The C11 record happens on EVERY exit path — a killed or failed
+	// turn still burned tokens and must be visible to the §7 spend
+	// query. WithoutCancel: the turn happened; a shutdown that killed
+	// it must not also lose its record (same rule as the ack write).
+	e.record(context.WithoutCancel(ctx), spec, stats.snapshot(), begin, err, ctx.Err())
 	if err == nil {
 		e.logger.Info("engine turn completed",
 			"session_id", sessionID, "duration_ms", time.Since(begin).Milliseconds())
@@ -156,6 +182,55 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 		return fmt.Errorf("engine: %s: %s: %w", sessionID, excerpt(stderr.String()), session.ErrResumeFailed)
 	}
 	return fmt.Errorf("engine: turn for %s: %v: %s", sessionID, err, excerpt(stderr.String()))
+}
+
+// record builds and hands off one turn's C11 row (§6). Outcome is the
+// closed §6 enum: timeout when the wall clock killed the child, error
+// for any other failure (including a result event that reports one),
+// ok otherwise — 'denied' arrives with the C9 policy gate, not here.
+// Usage is known only when the result event arrived; a killed child's
+// tokens are NOBODY's to invent, so they stay unknown and land NULL.
+// A recorder failure is a loud log, never a turn failure: erroring a
+// turn whose engine work succeeded would invite a §4.6 replay of
+// completed side effects.
+func (e *Engine) record(ctx context.Context, spec session.Spec, snap statsSnapshot, begin time.Time, runErr, ctxErr error) {
+	turn := store.Turn{
+		SessionID:  spec.SessionID,
+		TS:         time.Now().Unix(),
+		Kind:       spec.Kind,
+		Model:      snap.model,
+		ToolCalls:  snap.toolCalls,
+		DurationMS: time.Since(begin).Milliseconds(),
+		Outcome:    "ok",
+	}
+	if snap.resultSeen {
+		// The CLI's own accounting beats the engine's wall clock, and
+		// an errored result still burned real tokens — usage stays
+		// known so the spend query counts it (§7).
+		turn.UsageKnown = true
+		turn.InputTokens = snap.inputTokens
+		turn.OutputTokens = snap.outputTokens
+		turn.CostUSD = snap.costUSD
+		turn.DurationMS = snap.durationMS
+		if !snap.resultOK {
+			turn.Outcome = "error"
+		}
+	}
+	switch {
+	case errors.Is(ctxErr, context.DeadlineExceeded):
+		turn.Outcome = "timeout"
+	case ctxErr != nil:
+		// Shutdown cancellation killed the child — not a wall-clock
+		// timeout, and the closed enum has no 'interrupted': the event
+		// layer owns that disposition (§4.6); here it is an error.
+		turn.Outcome = "error"
+	case runErr != nil:
+		turn.Outcome = "error"
+	}
+	if err := e.recordTurn(ctx, turn); err != nil {
+		e.logger.Error("turn record failed — the §7 spend query is missing this turn",
+			"session_id", spec.SessionID, "outcome", turn.Outcome, "error", err.Error())
+	}
 }
 
 // termGroup TERMs a spawn's process group, translating ESRCH into

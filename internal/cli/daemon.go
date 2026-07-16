@@ -95,6 +95,10 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	// serves after that, so the retry closure never sees it nil in a
 	// living daemon — the guard is for the refusal paths.
 	var queues *router.Queues
+	// spendAlarmUSD is set after the config loads (same serve-after
+	// ordering as db/queues): the §7 cost-alarm threshold the status
+	// verb's daily-spend fields compare against.
+	var spendAlarmUSD float64
 	srv, err := admin.New(socket, admin.Options{
 		Logger: logger,
 		OnPoke: func() { pokes.Add(1) },
@@ -135,6 +139,10 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 			if err := db.QueryRow("PRAGMA user_version").Scan(&schema); err == nil {
 				fields["schema_version"] = schema
 			}
+			// The §7 daily-spend checklist rides the status verb —
+			// C11's burn numbers, visible to a human today and to the
+			// M3 heartbeat later.
+			spendStatus(db, spendAlarmUSD, time.Now(), fields)
 			return fields
 		},
 		// Readiness is printed only once the socket is bound — this
@@ -185,6 +193,15 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	if err := verifyEnginePin(cfg, logger); err != nil {
 		logger.Error("engine pin", "error", err.Error())
 		return exitUnrecoverable
+	}
+	if cfg != nil && cfg.Engine != nil {
+		spendAlarmUSD = cfg.Engine.DailySpendAlarmUSD
+		// An engine that can burn money with no alarm must be a
+		// visible choice, never a silent default (§7 — cost as a
+		// safety control).
+		if spendAlarmUSD == 0 {
+			logger.Warn("engine.daily_spend_alarm_usd not set — anomalous burn will not self-alarm (§7)")
+		}
 	}
 
 	db, err = store.Open(filepath.Join(*state, "approach.db"))
@@ -320,6 +337,35 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	return 0
 }
 
+// spendStatus appends the §7 daily-spend checklist fields to a status
+// reply: today's known burn (since LOCAL midnight — the operator's
+// day, not UTC's), turn counts, and — when a threshold is configured —
+// the alarm verdict. This is the C11 feed the heartbeat checklist
+// reads once M3 lands; until then the status verb is where a human
+// sees the burn. A failed query reports itself as spend_error rather
+// than reading as $0: a made-up number is worse than none.
+func spendStatus(db *sql.DB, alarmUSD float64, now time.Time, fields map[string]any) {
+	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	spend, err := store.DailySpend(context.Background(), db, midnight.Unix(), now.Unix()+1)
+	if err != nil {
+		fields["spend_error"] = err.Error()
+		return
+	}
+	fields["spend_today_usd"] = spend.KnownUSD
+	fields["spend_today_turns"] = spend.Turns
+	fields["spend_today_unknown_usage"] = spend.UnknownTurns
+	if alarmUSD > 0 {
+		fields["spend_alarm_usd"] = alarmUSD
+		// >= not >: an alarm that stays quiet AT its threshold has a
+		// dead band exactly where the operator drew the line.
+		if spend.KnownUSD >= alarmUSD {
+			fields["spend_alarm"] = "OVER"
+		} else {
+			fields["spend_alarm"] = "ok"
+		}
+	}
+}
+
 // adapterRunner is the daemon's view of a channel adapter: one
 // blocking Run under the daemon context. An interface so lifecycle
 // tests can supervise a fake without a gateway.
@@ -373,14 +419,16 @@ func verifyEnginePin(cfg *config.Config, logger *slog.Logger) error {
 
 // placeholderTurn is the M1 scaffold handler: the queue claims,
 // serializes, stamps 'processing', and survives restarts NOW, but the
-// completion transitions land with the epic 1.3 turn wiring — so a
-// scaffold-dispatched row stays 'processing' and the NEXT restart
-// parks it as interrupted (§4.6), where the delivery flows will
-// surface it. Honest on purpose: a no-op turn did consume the event,
-// and faking 'completed' would hide that no engine ever ran.
+// completion transitions land with the production dispatch wiring
+// (approach-x6n.11: engine + session manager + the C11 turn recorder,
+// store.InsertTurn as Engine.RecordTurn) — so a scaffold-dispatched
+// row stays 'processing' and the NEXT restart parks it as interrupted
+// (§4.6), where the delivery flows will surface it. Honest on
+// purpose: a no-op turn did consume the event, and faking 'completed'
+// would hide that no engine ever ran.
 func placeholderTurn(logger *slog.Logger) router.Handler {
 	return func(_ context.Context, ev store.QueuedEvent) {
-		logger.Debug("turn dispatch not yet wired — event stays durably queued (x6n.2.5)",
+		logger.Debug("turn dispatch not yet wired — event stays durably queued (approach-x6n.11)",
 			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
 	}
 }

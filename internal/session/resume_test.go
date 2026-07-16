@@ -164,7 +164,7 @@ func TestTurnRoutesByLifecycle(t *testing.T) {
 	cwd := t.TempDir()
 
 	// Empty thread → first turn, session active.
-	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "hi"); err != nil {
+	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
 		t.Fatalf("Turn (new): %v", err)
 	}
 	if len(eng.specs) != 1 || len(eng.resumes) != 0 {
@@ -179,7 +179,7 @@ func TestTurnRoutesByLifecycle(t *testing.T) {
 	}
 
 	// Active thread → resume, same session, no new Start.
-	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "hi"); err != nil {
+	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
 		t.Fatalf("Turn (resume): %v", err)
 	}
 	if len(eng.specs) != 1 || len(eng.resumes) != 1 {
@@ -202,7 +202,7 @@ func TestTurnRetriesCreatingFirstTurn(t *testing.T) {
 	ctx := context.Background()
 	cwd := t.TempDir()
 
-	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "hi"); err == nil {
+	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "message", "hi"); err == nil {
 		t.Fatal("Turn swallowed the first-turn failure")
 	}
 	pinned, _, err := store.ResolveLiveSession(ctx, db, "discord:dm:a")
@@ -215,7 +215,7 @@ func TestTurnRetriesCreatingFirstTurn(t *testing.T) {
 
 	// The engine recovers; the next event retries the same session.
 	eng.err = nil
-	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "hi"); err != nil {
+	if err := m.Turn(ctx, "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
 		t.Fatalf("Turn (retry): %v", err)
 	}
 	if len(eng.specs) != 2 || len(eng.resumes) != 0 {

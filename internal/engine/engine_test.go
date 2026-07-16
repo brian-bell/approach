@@ -13,6 +13,7 @@ import (
 
 	"github.com/brian-bell/approach/internal/engine"
 	"github.com/brian-bell/approach/internal/session"
+	"github.com/brian-bell/approach/internal/store"
 )
 
 type discard struct{}
@@ -57,6 +58,7 @@ func newEngine(t *testing.T, bin string, timeout time.Duration) *engine.Engine {
 		Model:       "claude-sonnet-5",
 		MaxTurns:    25,
 		TurnTimeout: timeout,
+		RecordTurn:  func(context.Context, store.Turn) error { return nil },
 		Logger:      discardLogger(),
 	})
 	if err != nil {
@@ -89,7 +91,8 @@ func TestStartInvocationFormPinned(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	wantArgv := strings.Join([]string{
-		"-p", "--model", "claude-sonnet-5", "--max-turns", "25", "--session-id", s.SessionID,
+		"-p", "--model", "claude-sonnet-5", "--max-turns", "25",
+		"--output-format", "stream-json", "--verbose", "--session-id", s.SessionID,
 	}, "\n") + "\n"
 	if got := slurp(t, filepath.Join(dir, "argv")); got != wantArgv {
 		t.Errorf("pinned invocation drifted:\ngot  %q\nwant %q", got, wantArgv)
@@ -122,7 +125,8 @@ func TestResumeInvocationFormPinned(t *testing.T) {
 		t.Fatalf("Resume: %v", err)
 	}
 	wantArgv := strings.Join([]string{
-		"-p", "--model", "claude-sonnet-5", "--max-turns", "25", "--resume", s.SessionID,
+		"-p", "--model", "claude-sonnet-5", "--max-turns", "25",
+		"--output-format", "stream-json", "--verbose", "--resume", s.SessionID,
 	}, "\n") + "\n"
 	if got := slurp(t, filepath.Join(dir, "argv")); got != wantArgv {
 		t.Errorf("pinned resume invocation drifted:\ngot  %q\nwant %q", got, wantArgv)
@@ -232,7 +236,9 @@ exit 1`)
 func TestConfigValidation(t *testing.T) {
 	valid := engine.Config{
 		Bin: "/usr/local/bin/claude", Model: "claude-sonnet-5",
-		MaxTurns: 25, TurnTimeout: time.Minute, Logger: discardLogger(),
+		MaxTurns: 25, TurnTimeout: time.Minute,
+		RecordTurn: func(context.Context, store.Turn) error { return nil },
+		Logger:     discardLogger(),
 	}
 	cases := []struct {
 		name   string
@@ -244,6 +250,7 @@ func TestConfigValidation(t *testing.T) {
 		{"zero max turns", func(c *engine.Config) { c.MaxTurns = 0 }},
 		{"negative max turns", func(c *engine.Config) { c.MaxTurns = -1 }},
 		{"zero timeout", func(c *engine.Config) { c.TurnTimeout = 0 }},
+		{"missing turn recorder (C11 observability is load-bearing)", func(c *engine.Config) { c.RecordTurn = nil }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -60,6 +60,11 @@ func TestDaemonAdminRoundTrip(t *testing.T) {
 	if !strings.Contains(out.String(), `"pokes":1`) {
 		t.Errorf("status stdout = %q, want pokes count 1 after one poke", out.String())
 	}
+	// The §7 daily-spend checklist rides status: a fresh store reads
+	// $0 — the field must exist, not appear only once money burns.
+	if !strings.Contains(out.String(), `"spend_today_usd":0`) {
+		t.Errorf("status stdout = %q, want a zero spend_today_usd field on a fresh store", out.String())
+	}
 
 	out.Reset()
 	errW.Reset()

@@ -36,6 +36,11 @@ type Spec struct {
 	SessionID string
 	ThreadKey string
 	Cwd       string
+	// Kind is the event kind this turn answers (message | heartbeat |
+	// webhook | cron | approval | task) — recorded on the turn's C11
+	// observability row (§6) so cost can be attributed per entry point.
+	// Empty for turns outside the queue.
+	Kind string
 	// Prompt is the event text this turn answers. It travels to the
 	// engine on stdin, never argv (§7 — process listings are
 	// world-readable and message content must not leak there).
@@ -278,12 +283,13 @@ func (m *Manager) touch(ctx context.Context, sessionID string) {
 // below closes the other half — a turn that limps in after expiry must
 // not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
-	return m.startNew(ctx, live, "", "")
+	return m.startNew(ctx, live, "", "", "")
 }
 
-// startNew is StartNew plus the event prompt and the §4.6 transparency
+// startNew is StartNew plus the driving event's kind (recorded on the
+// C11 turns row, §6), the event prompt, and the §4.6 transparency
 // note a degradation successor's first turn carries.
-func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, prompt string) error {
+func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, kind, prompt string) error {
 	// The caller's snapshot identifies WHICH session; every durable
 	// fact about it — status, deadline, cwd — is re-read from the row
 	// before the spawn. Engine.Start is a side-effecting call, the one
@@ -334,6 +340,7 @@ func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, pr
 		SessionID:        current.SessionID,
 		ThreadKey:        current.ThreadKey,
 		Cwd:              current.Cwd,
+		Kind:             kind,
 		Prompt:           prompt,
 		TransparencyNote: note,
 	}); err != nil {
