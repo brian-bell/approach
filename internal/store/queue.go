@@ -49,6 +49,57 @@ func MarkEventProcessing(ctx context.Context, db *sql.DB, id int64, now int64) e
 	return nil
 }
 
+// MarkEventCompleted is the post-turn transition (§4.1): the turn ran
+// to completion, so the row leaves the live queue — 'completed' is the
+// rest state until (and unless) the reply leg's last platform ack
+// advances it to 'replied' (AckDelivery). Guarded: turns run from
+// 'processing', so completing any other status is a caller sequencing
+// bug that must fail loud — silently re-completing history would hide
+// a double dispatch.
+func MarkEventCompleted(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'completed', updated = ? WHERE id = ? AND status = 'processing'`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: mark event %d completed: not in processing state", id)
+	}
+	return nil
+}
+
+// SkipEvent records a deliberate refusal to process (§6 'skipped' —
+// the §4.2 misfire coalescing state, and until the C9 policy hook
+// lands, the trust admission gate's landing): the row leaves the live
+// queue consumed on purpose — no turn ran, nothing is owed, and unlike
+// a park or a dead letter nothing is surfaced, so a stranger's refused
+// message cannot flood the owner with notices. Guarded to processing:
+// only the handler that claimed an event may skip it, and skipping any
+// other state would erase queue history.
+func SkipEvent(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'skipped', updated = ? WHERE id = ? AND status = 'processing'`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: skip event %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: skip event %d: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: skip event %d: not in processing state", id)
+	}
+	return nil
+}
+
 // scanQueuedEvent reads one queue-view row: the eight event columns
 // plus the nullable correlation, in the canonical SELECT order every
 // queue query uses — one scanner, so a new column cannot be carried by

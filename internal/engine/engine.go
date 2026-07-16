@@ -130,9 +130,10 @@ func (e *Engine) run(ctx context.Context, spec session.Spec, sessionFlag, sessio
 	cmd.Dir = spec.Cwd
 	cmd.Stdin = strings.NewReader(promptText(spec))
 	// stdout carries the stream-json event feed; the collector keeps
-	// the C11 score (model, tool calls, result usage) as it streams,
-	// bounded against a child that floods it (§11).
-	stats := &turnStats{}
+	// the C11 score (model, tool calls, result usage) as it streams —
+	// and forwards assistant text to the turn's Output sink (the reply
+	// relay) — bounded against a child that floods it (§11).
+	stats := &turnStats{output: spec.Output}
 	cmd.Stdout = stats
 	// Bounded: stderr is diagnostics, and an unbounded buffer hands a
 	// misbehaving (or prompt-injected) child a path to exhaust daemon

@@ -118,6 +118,117 @@ func TestParkEventGuards(t *testing.T) {
 	}
 }
 
+// TestMarkEventCompleted: the post-turn transition (§4.1) — only a
+// processing row completes (a turn runs from processing; anything else
+// is a caller bug), and the guard failing is an error, never a silent
+// re-completion of history.
+func TestMarkEventCompleted(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	for i, tc := range []struct {
+		status  string
+		wantErr bool
+	}{
+		{"processing", false},
+		{"received", true},
+		{"completed", true},
+		{"interrupted", true},
+	} {
+		ev := store.Event{
+			DedupKey:  fmt.Sprintf("discord:msg:%d", i+1),
+			ThreadKey: "discord:dm:a",
+			Kind:      "message",
+			Trust:     "owner",
+			Payload: fmt.Sprintf(
+				`{"dedup_key":"discord:msg:%d","thread_key":"discord:dm:a","kind":"message","trust":"owner"}`, i+1),
+			Received: int64(1700000000 + i),
+		}
+		id, _, err := store.InsertEvent(ctx, db, ev)
+		if err != nil {
+			t.Fatalf("InsertEvent %d: %v", i+1, err)
+		}
+		if _, err := db.Exec(`UPDATE events SET status = ? WHERE id = ?`, tc.status, id); err != nil {
+			t.Fatalf("set status %s: %v", tc.status, err)
+		}
+		err = store.MarkEventCompleted(ctx, db, id, 1700009999)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("MarkEventCompleted over %s row: want error, got nil", tc.status)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("MarkEventCompleted over %s row: %v", tc.status, err)
+		}
+		var got string
+		var updated int64
+		if err := db.QueryRow(`SELECT status, updated FROM events WHERE id = ?`, id).Scan(&got, &updated); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if got != "completed" || updated != 1700009999 {
+			t.Errorf("MarkEventCompleted: status = %q updated = %d, want completed / 1700009999", got, updated)
+		}
+	}
+
+	// A missing row is a caller bug, not a quiet success.
+	if err := store.MarkEventCompleted(ctx, db, 9999, 1700009999); err == nil {
+		t.Error("MarkEventCompleted on a missing row: want error, got nil")
+	}
+}
+
+// TestSkipEvent: the deliberate-refusal transition — a claimed
+// (processing) event the daemon chose not to run leaves the queue as
+// 'skipped'; any other state refuses loud (skipping unclaimed or
+// finished history would erase queue truth).
+func TestSkipEvent(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	for i, tc := range []struct {
+		status  string
+		wantErr bool
+	}{
+		{"processing", false},
+		{"received", true},
+		{"completed", true},
+	} {
+		ev := store.Event{
+			DedupKey:  fmt.Sprintf("discord:msg:s%d", i+1),
+			ThreadKey: "discord:dm:a",
+			Kind:      "message",
+			Trust:     "untrusted",
+			Payload: fmt.Sprintf(
+				`{"dedup_key":"discord:msg:s%d","thread_key":"discord:dm:a","kind":"message","trust":"untrusted"}`, i+1),
+			Received: int64(1700000000 + i),
+		}
+		id, _, err := store.InsertEvent(ctx, db, ev)
+		if err != nil {
+			t.Fatalf("InsertEvent %d: %v", i+1, err)
+		}
+		if _, err := db.Exec(`UPDATE events SET status = ? WHERE id = ?`, tc.status, id); err != nil {
+			t.Fatalf("set status %s: %v", tc.status, err)
+		}
+		err = store.SkipEvent(ctx, db, id, 1700009999)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("SkipEvent over %s row: want error, got nil", tc.status)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("SkipEvent over %s row: %v", tc.status, err)
+		}
+		var got string
+		if err := db.QueryRow(`SELECT status FROM events WHERE id = ?`, id).Scan(&got); err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		if got != "skipped" {
+			t.Errorf("SkipEvent: status = %q, want skipped", got)
+		}
+	}
+}
+
 // TestUnprocessedEventsEmpty: an empty (or fully-drained) queue rebuilds
 // to nothing — no error, no phantom rows.
 func TestUnprocessedEventsEmpty(t *testing.T) {

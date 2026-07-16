@@ -1,7 +1,8 @@
 // stream.go parses the pinned CLI's --output-format stream-json stdout
-// into the C11 turn record (§6): the served model from the init event,
-// tool_use blocks counted as they stream, and the result event's
-// usage. Parsing is fail-contained by design — a garbled line, an
+// into the C11 turn record (§6) — the served model from the init event,
+// tool_use blocks counted as they stream, the result event's usage —
+// and feeds assistant text to the turn's reply sink (Spec.Output, the
+// §4.1 live relay). Parsing is fail-contained by design — a garbled line, an
 // unknown event type, or a line past the size cap is skimmed, never a
 // turn failure: observability must not fail a turn that succeeded, and
 // a hostile child must not grow daemon memory through its own stdout
@@ -11,6 +12,7 @@ package engine
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"sync"
 )
 
@@ -21,10 +23,10 @@ import (
 // newline, costing at worst an undercounted tool_calls, never memory.
 const lineCap = 4 * 1024 * 1024
 
-// streamEvent is the slice of the CLI's stream-json schema the C11
-// record needs. Everything else in an event is deliberately ignored —
-// the reply-relay wiring reads the same stream for content later; this
-// collector only keeps score.
+// streamEvent is the slice of the CLI's stream-json schema this
+// collector consumes: the C11 score (init model, tool_use counts, the
+// result usage) plus the assistant text blocks the reply relay
+// carries. Everything else in an event is deliberately ignored.
 type streamEvent struct {
 	Type    string `json:"type"`
 	Subtype string `json:"subtype"`
@@ -32,6 +34,7 @@ type streamEvent struct {
 	Message struct {
 		Content []struct {
 			Type string `json:"type"`
+			Text string `json:"text"` // text blocks: the reply the relay carries
 		} `json:"content"`
 	} `json:"message"`
 	IsError    bool    `json:"is_error"`
@@ -51,6 +54,12 @@ type turnStats struct {
 	mu         sync.Mutex
 	buf        bytes.Buffer // current partial line
 	discarding bool         // inside a line past lineCap — drop to next newline
+
+	// output is the turn's Spec.Output sink (nil = discard): each
+	// assistant message's text streams to it as it parses — the
+	// reply-relay feed. Called under mu from the copy goroutine; the
+	// Spec contract makes prompt return the sink's job.
+	output func(delta string)
 
 	model        string
 	toolCalls    int64
@@ -123,10 +132,24 @@ func (s *turnStats) consumeLine() {
 			s.model = ev.Model
 		}
 	case "assistant":
+		// One Output call per assistant MESSAGE, its text blocks joined
+		// verbatim: adjacent blocks are one utterance, and injecting
+		// anything between them would alter the model's own text. The
+		// message boundary is the only separator the sink may infer —
+		// it is carried by the granularity of the calls themselves.
+		var text strings.Builder
 		for _, block := range ev.Message.Content {
-			if block.Type == "tool_use" {
+			switch block.Type {
+			case "tool_use":
 				s.toolCalls++
+			case "text":
+				text.WriteString(block.Text)
 			}
+		}
+		// An empty message carries nothing to relay and would only
+		// churn the relay's throttle windows.
+		if s.output != nil && text.Len() > 0 {
+			s.output(text.String())
 		}
 	case "result":
 		s.resultSeen = true

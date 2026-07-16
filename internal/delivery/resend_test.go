@@ -81,6 +81,49 @@ func testClock() func() time.Time {
 	return func() time.Time { return time.Unix(1700000500, 0) }
 }
 
+// TestResendUnackedSkipsHeldRows: a delivery key claimed by a live
+// relay send is not the pump's to touch — sending it would deliver
+// the same row twice from one living daemon — and the claim stops the
+// whole TARGET for the pass (per-target order, §4.1) while other
+// targets keep flowing. After release, the next pass drains it.
+func TestResendUnackedSkipsHeldRows(t *testing.T) {
+	db := openStore(t)
+	heldRow := insertPending(t, db, "reply:evt:0", "discord:dm:123", "live send owns this")
+	laterRow := insertPending(t, db, "notice:1", "discord:dm:123", "same target, later row")
+	otherRow := insertPending(t, db, "notice:2", "discord:dm:456", "other target flows")
+
+	held := delivery.NewInFlight()
+	held.Claim("reply:evt:0")
+
+	sender := &fakeSender{}
+	delivery.ResendUnacked(context.Background(), db,
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), held)
+
+	if got := sender.count(); got != 1 {
+		t.Fatalf("sent %d rows, want only the other target's", got)
+	}
+	if status, attempts, acked := deliveryState(t, db, heldRow); attempts != 0 || acked.Valid || status != "pending" {
+		t.Errorf("held row = (%s, %d, %v) — the pump must not even stamp an attempt on a claimed row", status, attempts, acked.Valid)
+	}
+	if _, attempts, _ := deliveryState(t, db, laterRow); attempts != 0 {
+		t.Error("later sibling for the held target was sent — per-target order broken (§4.1)")
+	}
+	if _, _, acked := deliveryState(t, db, otherRow); !acked.Valid {
+		t.Error("other target's row not delivered — a claim must only stop its own target")
+	}
+
+	// Released: the next pass drains everything left owed.
+	held.Release("reply:evt:0")
+	delivery.ResendUnacked(context.Background(), db,
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), held)
+	if _, _, acked := deliveryState(t, db, heldRow); !acked.Valid {
+		t.Error("released row not delivered on the next pass")
+	}
+	if _, _, acked := deliveryState(t, db, laterRow); !acked.Valid {
+		t.Error("held target's later sibling not delivered after release")
+	}
+}
+
 // TestResendUnackedSendsPersistedPayloadsInComposeOrder: the §4.6
 // recovery half of write-before-send — every row still owed a send
 // re-sends from the PERSISTED payload, in compose (id) order, and ends
@@ -92,7 +135,7 @@ func TestResendUnackedSendsPersistedPayloadsInComposeOrder(t *testing.T) {
 
 	sender := &fakeSender{}
 	delivery.ResendUnacked(context.Background(), db,
-		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), nil)
 
 	want := []sentCall{
 		{"discord:dm:123", "first message"},
@@ -146,7 +189,7 @@ func TestResendUnackedAckSurvivesShutdownCancel(t *testing.T) {
 	defer cancel()
 	sender := &shutdownSender{inner: &fakeSender{}, cancel: cancel}
 	delivery.ResendUnacked(ctx, db,
-		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), nil)
 
 	status, attempts, acked := deliveryState(t, db, id)
 	if status != "sent" || !acked.Valid {
@@ -167,7 +210,7 @@ func TestResendUnackedFailureLeavesRowPending(t *testing.T) {
 
 	sender := &fakeSender{fail: map[string]bool{"discord:dm:123": true}}
 	delivery.ResendUnacked(context.Background(), db,
-		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), nil)
 
 	status, attempts, acked := deliveryState(t, db, id)
 	if status != "pending" || acked.Valid {
@@ -190,7 +233,7 @@ func TestResendUnackedFailedTargetStopsItsChain(t *testing.T) {
 
 	sender := &fakeSender{fail: map[string]bool{"discord:dm:blocked": true}}
 	delivery.ResendUnacked(context.Background(), db,
-		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), nil)
 
 	if len(sender.sent) != 1 || sender.sent[0].target != "discord:dm:ok" {
 		t.Fatalf("sent = %+v, want exactly the independent target's row", sender.sent)
@@ -219,7 +262,7 @@ func TestResendUnackedUnroutableChannelIsSkipped(t *testing.T) {
 
 	sender := &fakeSender{}
 	delivery.ResendUnacked(context.Background(), db,
-		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": sender}, slog.Default(), testClock(), nil)
 
 	if len(sender.sent) != 0 {
 		t.Fatalf("sent = %+v, want none", sender.sent)
@@ -388,7 +431,7 @@ func TestResendUnackedAdvancesBoundEvent(t *testing.T) {
 	}
 
 	delivery.ResendUnacked(ctx, db,
-		map[string]delivery.Sender{"discord": &fakeSender{}}, slog.Default(), testClock())
+		map[string]delivery.Sender{"discord": &fakeSender{}}, slog.Default(), testClock(), nil)
 
 	var evStatus string
 	if err := db.QueryRow(`SELECT status FROM events WHERE id = ?`, evID).Scan(&evStatus); err != nil {
@@ -416,7 +459,7 @@ func TestPumpDrainsNewRowsWhileRunning(t *testing.T) {
 	go func() {
 		defer close(done)
 		delivery.Pump(ctx, db, map[string]delivery.Sender{"discord": sender},
-			slog.Default(), testClock(), kick, time.Hour) // ticker out of the picture — kicks drive this test
+			slog.Default(), testClock(), kick, time.Hour, nil) // ticker out of the picture — kicks drive this test
 	}()
 
 	waitForSends := func(n int) {
@@ -484,7 +527,7 @@ func TestPumpSurfacesUnsurfacedInterruptedEvents(t *testing.T) {
 	go func() {
 		defer close(done)
 		delivery.Pump(pumpCtx, db, map[string]delivery.Sender{"discord": sender},
-			slog.Default(), testClock(), kick, time.Hour)
+			slog.Default(), testClock(), kick, time.Hour, nil)
 	}()
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -625,7 +668,7 @@ func TestPumpSurfacesUnsurfacedDeadLetters(t *testing.T) {
 	go func() {
 		defer close(done)
 		delivery.Pump(ctx, db, map[string]delivery.Sender{"discord": sender},
-			slog.Default(), testClock(), make(chan struct{}), time.Hour)
+			slog.Default(), testClock(), make(chan struct{}), time.Hour, nil)
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && sender.count() == 0 {

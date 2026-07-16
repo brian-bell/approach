@@ -81,7 +81,7 @@ func TestDrillCrashAfterComposeBeforeAckResends(t *testing.T) {
 	})
 	sender := &fakeSender{}
 	senders := map[string]delivery.Sender{"discord": sender}
-	delivery.ResendUnacked(ctx, db2, senders, slog.Default(), testClock())
+	delivery.ResendUnacked(ctx, db2, senders, slog.Default(), testClock(), nil)
 
 	// Both chunks re-sent from their persisted payloads, in compose
 	// order — chunk one's re-send is the accepted duplicate, chunk
@@ -126,7 +126,7 @@ func TestDrillCrashAfterComposeBeforeAckResends(t *testing.T) {
 
 	// Steady state: another pass (and by extension every later
 	// restart) owes nothing — acked history never re-sends.
-	delivery.ResendUnacked(ctx, db2, senders, slog.Default(), testClock())
+	delivery.ResendUnacked(ctx, db2, senders, slog.Default(), testClock(), nil)
 	if n := len(sender.sent); n != len(want) {
 		t.Errorf("a second pass sent %d more messages, want 0 — the ack ended this delivery's story", n-len(want))
 	}

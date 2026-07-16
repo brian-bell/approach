@@ -136,6 +136,17 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Readmitter, ev sto
 	return Retried, nil
 }
 
+// ParkAmbiguous parks one event on the CALLER's evidence of a
+// side effect the tool journal cannot see — a partial reply already
+// visible on the thread is the canonical case: the journal only
+// records tool attempts, so HandleEngineFailure would judge such a
+// turn clean and retry it, answering twice. Same landing as the
+// journal-driven park: interrupted, §4.6 notice to the originating
+// thread, pump woken. why names the evidence in the journal record.
+func ParkAmbiguous(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Options, why string) (Outcome, error) {
+	return park(ctx, db, ev, opts, why)
+}
+
 // deadLetter is the terminal landing for an exhausted budget (§4.6):
 // event dead + dead_letters row atomically, owner-DM entry notice
 // through the outbox, pump woken. If the dead-letter write itself

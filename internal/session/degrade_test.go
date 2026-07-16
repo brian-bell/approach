@@ -15,7 +15,7 @@ import (
 // machinery: one Turn (first turn activates it).
 func activeThread(t *testing.T, m *session.Manager, db *sql.DB, cwd string) store.LiveSession {
 	t.Helper()
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("setup Turn: %v", err)
 	}
 	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
@@ -40,7 +40,7 @@ func TestTurnDegradesOnResumeFailed(t *testing.T) {
 	old := activeThread(t, m, db, cwd)
 
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn over a dead transcript: %v (must degrade, never hard-error — §4.6)", err)
 	}
 
@@ -101,7 +101,7 @@ func TestTurnDegradesOnCwdGone(t *testing.T) {
 
 	newCwd := t.TempDir()
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", newCwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: newCwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn over a vanished cwd: %v (must degrade — §4.6, §11)", err)
 	}
 
@@ -142,7 +142,7 @@ func TestTurnDoesNotDegradeOnTransientError(t *testing.T) {
 	old := activeThread(t, m, db, cwd)
 
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err == nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err == nil {
 		t.Fatal("Turn swallowed a transient resume failure")
 	}
 	live, ok, err := store.ResolveLiveSession(context.Background(), db, "discord:dm:a")
@@ -178,7 +178,7 @@ func TestRotationOverMissingCwdDegrades(t *testing.T) {
 
 	clock += 3601 // past the idle TTL — rotation is due
 	newCwd := t.TempDir()
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", newCwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: newCwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn over a rotation-due session with a dead cwd: %v (must degrade, never wedge)", err)
 	}
 
@@ -247,7 +247,7 @@ func TestDegradationNoteSurvivesRetry(t *testing.T) {
 	// ALSO fails, transiently.
 	eng.err = errors.New("transient spawn failure")
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err == nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err == nil {
 		t.Fatal("Turn swallowed the successor's transient first-turn failure")
 	}
 
@@ -256,7 +256,7 @@ func TestDegradationNoteSurvivesRetry(t *testing.T) {
 	eng.err = nil
 	eng.resumeErr = nil
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn (retry): %v", err)
 	}
 	last := eng.specs[len(eng.specs)-1]
@@ -285,7 +285,7 @@ func TestDegradationNoteSurvivesExpiry(t *testing.T) {
 	// Degradation happens; the successor's first turn fails transiently.
 	eng.err = errors.New("transient spawn failure")
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err == nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err == nil {
 		t.Fatal("Turn swallowed the successor's transient first-turn failure")
 	}
 
@@ -293,7 +293,7 @@ func TestDegradationNoteSurvivesExpiry(t *testing.T) {
 	// the next event expires it and mints a linked retry — which also
 	// fails once.
 	clock += 121
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err == nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err == nil {
 		t.Fatal("Turn swallowed the expiry retry's failure")
 	}
 
@@ -302,7 +302,7 @@ func TestDegradationNoteSurvivesExpiry(t *testing.T) {
 	eng.err = nil
 	eng.resumeErr = nil
 	clock += 10
-	if err := m.Turn(context.Background(), "discord:dm:a", "owner", cwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: "discord:dm:a", TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn (recovered): %v", err)
 	}
 	last := eng.specs[len(eng.specs)-1]

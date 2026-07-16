@@ -133,6 +133,7 @@ type Adapter struct {
 	sendMessage     func(ctx context.Context, s *discordgo.Session, channelID, content string) (*discordgo.Message, error)
 	createDMChannel func(ctx context.Context, s *discordgo.Session, userID string) (*discordgo.Channel, error)
 	editMessage     func(ctx context.Context, s *discordgo.Session, channelID, messageID, content string) (*discordgo.Message, error)
+	deleteMessage   func(ctx context.Context, s *discordgo.Session, channelID, messageID string) error
 	typing          func(ctx context.Context, s *discordgo.Session, channelID string) error
 }
 
@@ -173,6 +174,9 @@ func New(token string, handle MessageHandler, logger *slog.Logger) (*Adapter, er
 		},
 		editMessage: func(ctx context.Context, s *discordgo.Session, channelID, messageID, content string) (*discordgo.Message, error) {
 			return s.ChannelMessageEdit(channelID, messageID, content, discordgo.WithContext(ctx))
+		},
+		deleteMessage: func(ctx context.Context, s *discordgo.Session, channelID, messageID string) error {
+			return s.ChannelMessageDelete(channelID, messageID, discordgo.WithContext(ctx))
 		},
 		typing: func(ctx context.Context, s *discordgo.Session, channelID string) error {
 			return s.ChannelTyping(channelID, discordgo.WithContext(ctx))

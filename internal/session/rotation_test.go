@@ -27,7 +27,7 @@ func rotationManager(db *sql.DB, eng session.Engine, clock *int64) *session.Mana
 func turnAndResolve(t *testing.T, m *session.Manager, db *sql.DB, cwd string) store.LiveSession {
 	const threadKey = "discord:dm:a"
 	t.Helper()
-	if err := m.Turn(context.Background(), threadKey, "owner", cwd, "message", "hi"); err != nil {
+	if err := m.Turn(context.Background(), session.TurnRequest{ThreadKey: threadKey, TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: "hi"}); err != nil {
 		t.Fatalf("Turn: %v", err)
 	}
 	live, ok, err := store.ResolveLiveSession(context.Background(), db, threadKey)

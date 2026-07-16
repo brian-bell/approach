@@ -43,6 +43,21 @@ type Delivery struct {
 // the INSERT statement itself (a separate pre-check could pass just
 // before a concurrent ack seals the event, landing the row anyway).
 func InsertDelivery(ctx context.Context, db *sql.DB, d Delivery) (id int64, inserted bool, err error) {
+	return insertDelivery(ctx, db, d)
+}
+
+// queryExecer is the slice of database/sql shared by *sql.DB and
+// *sql.Tx that the delivery insert needs — the write plus the
+// duplicate-vs-seal disambiguation read.
+type queryExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// insertDelivery is InsertDelivery's core over either a bare handle or
+// a transaction — InsertDeliveries runs the same semantics per row
+// inside one tx.
+func insertDelivery(ctx context.Context, ex queryExecer, d Delivery) (id int64, inserted bool, err error) {
 	if err := d.validate(); err != nil {
 		return 0, false, fmt.Errorf("store: insert delivery: %w", err)
 	}
@@ -53,7 +68,7 @@ func InsertDelivery(ctx context.Context, db *sql.DB, d Delivery) (id int64, inse
 	if d.EventID != 0 {
 		eventID = d.EventID
 	}
-	res, err := db.ExecContext(ctx,
+	res, err := ex.ExecContext(ctx,
 		`INSERT INTO deliveries (delivery_key, event_id, target, payload)
 		 SELECT ?, ?, ?, ?
 		 WHERE NOT EXISTS (SELECT 1 FROM events WHERE id = ? AND status = 'replied')
@@ -73,7 +88,7 @@ func InsertDelivery(ctx context.Context, db *sql.DB, d Delivery) (id int64, inse
 		// (no row exists and none may land). The two must not collapse:
 		// one is normal at-least-once operation, the other a bug.
 		var exists int
-		if err := db.QueryRowContext(ctx,
+		if err := ex.QueryRowContext(ctx,
 			`SELECT count(*) FROM deliveries WHERE delivery_key = ?`, d.DeliveryKey,
 		).Scan(&exists); err != nil {
 			return 0, false, fmt.Errorf("store: insert delivery %s: %w", d.DeliveryKey, err)
@@ -88,6 +103,69 @@ func InsertDelivery(ctx context.Context, db *sql.DB, d Delivery) (id int64, inse
 		return 0, false, fmt.Errorf("store: insert delivery %s: %w", d.DeliveryKey, err)
 	}
 	return id, true, nil
+}
+
+// InsertDeliveries composes one turn's whole reply atomically: every
+// chunk row lands, or none do. The all-or-nothing shape is what makes
+// a compose failure RECOVERABLE — a partial compose would leave a
+// truncated head durably owed, and a later re-compose of the same turn
+// would collide with the stale prefix's keys (first write wins) and
+// deliver a mixed reply. With rollback, the caller can park the event
+// (§4.6) knowing no fragment of the failed compose survives.
+//
+// A DUPLICATE key anywhere in the batch rolls the whole batch back
+// too (composed=false, no error): a prior execution of this event
+// already composed its reply — completely, because every compose is
+// this same atomic batch — and committing only the fresh remainder
+// would stitch a stale prefix from that execution onto this one's
+// tail (a manual §4.6 retry may produce different text and a
+// different chunk count). First write wins for the WHOLE reply: the
+// caller leaves sending to the pump, which delivers the coherent
+// prior compose. ids aligns with ds and is meaningful only when
+// composed is true.
+func InsertDeliveries(ctx context.Context, db *sql.DB, ds []Delivery) (ids []int64, composed bool, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: insert deliveries: %w", err)
+	}
+	// Rollback after a successful Commit is a documented no-op — this
+	// only sweeps the error and duplicate-conflict paths.
+	defer func() { _ = tx.Rollback() }()
+
+	ids = make([]int64, 0, len(ds))
+	for _, d := range ds {
+		id, inserted, err := insertDelivery(ctx, tx, d)
+		if err != nil {
+			return nil, false, err
+		}
+		if !inserted {
+			return nil, false, nil
+		}
+		ids = append(ids, id)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, fmt.Errorf("store: insert deliveries: %w", err)
+	}
+	return ids, true, nil
+}
+
+// OwedDeliveriesBefore counts target's rows still owed a send — the
+// resend-scan predicate (unacked, not failed) — with an id below
+// before. The live-send path consults it: a direct send while an OLDER
+// row is owed would deliver this thread's messages out of order
+// (§4.1), so the turn defers to the pump, which sends in compose
+// order.
+func OwedDeliveriesBefore(ctx context.Context, db *sql.DB, target string, before int64) (int64, error) {
+	var n int64
+	err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM deliveries
+		 WHERE target = ? AND id < ? AND acked IS NULL AND status <> 'failed'`,
+		target, before,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: owed deliveries before %d for %s: %w", before, target, err)
+	}
+	return n, nil
 }
 
 // ResendableDelivery is one row of the §4.6 restart resend scan:

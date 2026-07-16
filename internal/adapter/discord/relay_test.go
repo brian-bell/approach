@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -72,6 +73,31 @@ func fastRelay(f *relayFixture) *Relay {
 // TestRelayTypingKeepalive: a turn that has produced output but no
 // visible message yet shows a heartbeat — typing repeats while the
 // engine composes, and stops once a partial message replaces it.
+// TestChunkMessage: the exported chunker is the one definition of how
+// a reply splits across Discord's per-message cap — the outbox composer
+// writes one delivery row per chunk, and Relay.Finish must send exactly
+// those chunks, or acks and rows would misalign.
+func TestChunkMessage(t *testing.T) {
+	if got := ChunkMessage(""); got != nil {
+		t.Errorf("ChunkMessage(\"\") = %v, want nil", got)
+	}
+	if got := ChunkMessage("hi"); len(got) != 1 || got[0] != "hi" {
+		t.Errorf("ChunkMessage(short) = %v, want [hi]", got)
+	}
+	long := strings.Repeat("é", messageCap+1) // rune-counted, not bytes
+	got := ChunkMessage(long)
+	if len(got) != 2 {
+		t.Fatalf("ChunkMessage(long) = %d chunks, want 2", len(got))
+	}
+	if utf8.RuneCountInString(got[0]) != messageCap || utf8.RuneCountInString(got[1]) != 1 {
+		t.Errorf("chunk rune counts = %d,%d, want %d,1",
+			utf8.RuneCountInString(got[0]), utf8.RuneCountInString(got[1]), messageCap)
+	}
+	if got[0]+got[1] != long {
+		t.Error("chunks do not reassemble the original text")
+	}
+}
+
 func TestRelayTypingKeepalive(t *testing.T) {
 	f := newRelayFixture(t)
 	r := fastRelay(f)
@@ -103,6 +129,99 @@ func TestRelayTypingKeepalive(t *testing.T) {
 	}
 	if _, err := r.Finish(); err != nil {
 		t.Fatalf("Finish: %v", err)
+	}
+}
+
+// TestRelayPostedTracksVisibleOutput: Posted is the §4.6 evidence bit
+// — false while nothing has reached the platform (below threshold, or
+// a failed partial send), true from the moment a partial message
+// lands, and STICKY through channel invalidation: losing the edit
+// target does not un-show what a human already saw.
+func TestRelayPostedTracksVisibleOutput(t *testing.T) {
+	f := newRelayFixture(t)
+	r := fastRelay(f)
+
+	if r.Posted() {
+		t.Error("Posted before any push")
+	}
+	r.Push("tiny") // below threshold — typing only, nothing visible
+	if r.Posted() {
+		t.Error("Posted while below the partial threshold — nothing was shown")
+	}
+	r.Push(strings.Repeat("x", 30)) // crosses threshold — partial message lands
+	if !r.Posted() {
+		t.Error("not Posted after a partial message reached the platform")
+	}
+	// A dead channel clears the edit target, never the evidence bit —
+	// the human already saw the text (§4.6). Locked call: the test is
+	// in-package and owns the mutex contract here.
+	r.mu.Lock()
+	r.invalidateChannelLocked()
+	r.mu.Unlock()
+	if !r.Posted() {
+		t.Error("Posted cleared by channel invalidation — the human still saw the text (§4.6)")
+	}
+	r.Cancel()
+	if !r.Posted() {
+		t.Error("Posted cleared by Cancel — sticky means sticky")
+	}
+}
+
+// TestRelayRetractRemovesPostedPartial: Retract deletes the partial
+// message the turn posted — the defer-to-pump paths call it because
+// the pump re-sends the full text and a standing partial would show
+// the reply twice. Posted stays sticky: deletion is not un-seeing
+// (§4.6). Below the threshold there is nothing to delete.
+func TestRelayRetractRemovesPostedPartial(t *testing.T) {
+	f := newRelayFixture(t)
+	var deleted []string
+	f.a.deleteMessage = func(_ context.Context, _ *discordgo.Session, _, messageID string) error {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		deleted = append(deleted, messageID)
+		return nil
+	}
+	r := fastRelay(f)
+
+	r.Push(strings.Repeat("x", 30)) // partial message lands
+	r.Retract()
+	f.mu.Lock()
+	got := append([]string(nil), deleted...)
+	f.mu.Unlock()
+	if len(got) != 1 || got[0] != msgID(1) {
+		t.Errorf("deleted = %v, want the posted partial %q", got, msgID(1))
+	}
+	if !r.Posted() {
+		t.Error("Posted cleared by Retract — deletion is not un-seeing (§4.6)")
+	}
+
+	// Nothing posted → nothing deleted.
+	f2 := newRelayFixture(t)
+	var deleted2 int
+	f2.a.deleteMessage = func(context.Context, *discordgo.Session, string, string) error {
+		deleted2++
+		return nil
+	}
+	r2 := fastRelay(f2)
+	r2.Push("tiny")
+	r2.Retract()
+	if deleted2 != 0 {
+		t.Errorf("deleted %d messages with no partial posted, want 0", deleted2)
+	}
+}
+
+// TestRelayPostedFalseOnFailedPartial: a partial send the platform
+// refused put nothing on screen — Posted stays false, so the §4.6
+// judgment can still auto-retry a provably invisible turn.
+func TestRelayPostedFalseOnFailedPartial(t *testing.T) {
+	f := newRelayFixture(t)
+	f.a.sendMessage = func(context.Context, *discordgo.Session, string, string) (*discordgo.Message, error) {
+		return nil, fmt.Errorf("fake: refused")
+	}
+	r := fastRelay(f)
+	r.Push(strings.Repeat("x", 30)) // crosses threshold, send fails
+	if r.Posted() {
+		t.Error("Posted after a refused partial send — nothing reached the platform")
 	}
 }
 
