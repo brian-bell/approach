@@ -703,3 +703,45 @@ func TestProductionTurnDuplicateComposeDefersToPump(t *testing.T) {
 		t.Error("pump not kicked for the owed reply")
 	}
 }
+
+// TestProductionTurnDuplicateComposeReconcilesAckedRows covers the
+// crash-after-compose path after restart recovery has already sent and
+// acked the persisted reply while the event was parked. A human retry
+// may run the turn again, but duplicate composition must reconcile the
+// prior acks after completion; no unacked row remains to call
+// AckDelivery and advance the event later.
+func TestProductionTurnDuplicateComposeReconcilesAckedRows(t *testing.T) {
+	runner := &fakeTurnRunner{deltas: []string{"hello"}}
+	relay := &fakeTurnRelay{acks: []string{"discord:msg:900"}}
+	f := newDispatchFixture(t, runner, relay)
+	id, inserted, err := store.InsertDelivery(context.Background(), f.db, store.Delivery{
+		DeliveryKey: "reply:discord:msg:1:0",
+		EventID:     f.ev.ID,
+		Target:      "discord:dm:a",
+		Payload:     "an earlier life's words",
+	})
+	if err != nil || !inserted {
+		t.Fatalf("pre-compose: inserted=%v err=%v", inserted, err)
+	}
+	if err := store.ParkEvent(context.Background(), f.db, f.ev.ID, 1700000060); err != nil {
+		t.Fatalf("ParkEvent: %v", err)
+	}
+	if err := store.AckDelivery(context.Background(), f.db, id, 1700000070); err != nil {
+		t.Fatalf("restart-pump AckDelivery: %v", err)
+	}
+	requeued, err := store.RequeueInterruptedEvent(context.Background(), f.db, f.ev.ID, 1700000080)
+	if err != nil {
+		t.Fatalf("RequeueInterruptedEvent: %v", err)
+	}
+	if err := store.MarkEventProcessing(context.Background(), f.db, f.ev.ID, 1700000090); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
+	f.ev = requeued
+	f.ev.Status = "processing"
+
+	productionTurn(f.deps)(context.Background(), f.ev)
+
+	if got := eventStatus(t, f.db, f.ev.ID); got != "replied" {
+		t.Errorf("event status = %q, want replied — all existing reply rows were already acked", got)
+	}
+}

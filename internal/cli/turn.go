@@ -339,7 +339,15 @@ func finishTurn(ctx context.Context, d turnDeps, ev store.QueuedEvent, text stri
 		}
 	}
 
-	if err := store.MarkEventCompleted(wctx, d.db, ev.ID, d.now().Unix()); err != nil {
+	complete := store.MarkEventCompleted
+	if !composed {
+		// Duplicate compose means the prior reply rows may already have
+		// been acked while this event was parked. Reconcile those acks in
+		// the completion write; otherwise an all-acked event would rest at
+		// completed forever because no future AckDelivery call remains.
+		complete = store.MarkEventCompletedReconciled
+	}
+	if err := complete(wctx, d.db, ev.ID, d.now().Unix()); err != nil {
 		// Should-never-happen store failure: the composed rows are owed
 		// but must NOT reach the pump while the event sits pre-completion
 		// — AckDelivery refuses an ack for a still-processing event

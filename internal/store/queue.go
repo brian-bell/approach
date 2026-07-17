@@ -74,6 +74,39 @@ func MarkEventCompleted(ctx context.Context, db *sql.DB, id int64, now int64) er
 	return nil
 }
 
+// MarkEventCompletedReconciled is the duplicate-compose completion
+// transition. A prior life already wrote this event's reply rows, and
+// restart recovery may have acked all of them while the event was
+// parked interrupted. Complete and reconcile in ONE statement so the
+// event lands directly at replied when every existing outbound row is
+// already accepted; otherwise no future ack remains to advance a
+// completed row (§4.1, §4.6). No delivery rows still means completed,
+// and any unacked or failed row blocks replied just as AckDelivery
+// does. The processing guard matches MarkEventCompleted.
+func MarkEventCompletedReconciled(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events
+		 SET status = CASE
+		     WHEN EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?)
+		      AND NOT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ? AND acked IS NULL)
+		     THEN 'replied' ELSE 'completed' END,
+		     updated = ?
+		 WHERE id = ? AND status = 'processing'`,
+		id, id, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: not in processing state", id)
+	}
+	return nil
+}
+
 // SkipEvent records a deliberate refusal to process (§6 'skipped' —
 // the §4.2 misfire coalescing state, and until the C9 policy hook
 // lands, the trust admission gate's landing): the row leaves the live
