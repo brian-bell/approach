@@ -28,12 +28,13 @@ var ErrCwdGone = errors.New("session cwd no longer exists")
 // transcript-gone from transient is x6n.2.8's classification. Bounding
 // a hung resume (timeout kill) is the x6n.2.9 child-management remit.
 func (m *Manager) Resume(ctx context.Context, live store.LiveSession) error {
-	return m.resume(ctx, live, "", "")
+	return m.resume(ctx, live, "", "", nil)
 }
 
 // resume is Resume plus the driving event's kind (recorded on the C11
-// turns row, §6) and the prompt the turn answers.
-func (m *Manager) resume(ctx context.Context, live store.LiveSession, kind, prompt string) error {
+// turns row, §6), the prompt the turn answers, and the reply sink the
+// engine streams assistant text to (nil = discard).
+func (m *Manager) resume(ctx context.Context, live store.LiveSession, kind, prompt string, output func(string)) error {
 	current, ok, err := store.ResolveLiveSession(ctx, m.db, live.ThreadKey)
 	if err != nil {
 		return fmt.Errorf("session: resume %s: %w", live.SessionID, err)
@@ -53,6 +54,7 @@ func (m *Manager) resume(ctx context.Context, live store.LiveSession, kind, prom
 		Cwd:       current.Cwd,
 		Kind:      kind,
 		Prompt:    prompt,
+		Output:    output,
 	}); err != nil {
 		return fmt.Errorf("session: resume %s: %w", current.SessionID, err)
 	}
@@ -78,16 +80,31 @@ func assertCwd(sessionID, cwd string) error {
 	return nil
 }
 
+// TurnRequest is one queued event translated into what its turn needs:
+// the thread to run under, the floor and cwd a fresh session would pin
+// (an existing live session keeps its own — Ensure's contract), the
+// event kind that rides the C11 turns row (§6), the prompt, and the
+// reply sink the engine streams assistant text to (nil = discard).
+// A struct rather than positional strings: five same-typed parameters
+// were a transposition bug waiting for its sixth.
+type TurnRequest struct {
+	ThreadKey  string
+	TrustFloor string
+	Cwd        string
+	Kind       string
+	Prompt     string
+	Output     func(delta string)
+}
+
 // Turn is the unified per-event entry the queue handler calls: resolve
 // the thread's session and run the right flow for its lifecycle state
 // (§4.1). creating — fresh or a prior pin whose first turn failed
 // transiently — owes a FIRST turn against the same pinned id (no
 // transcript exists to resume; the expiry window, not the retry count,
 // bounds how long the thread keeps trying). active resumes.
-// kind is the event's kind (message | heartbeat | … §6) — it rides the
-// engine Spec onto the turn's C11 observability row.
-func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, kind, prompt string) error {
-	live, _, err := m.Ensure(ctx, threadKey, trustFloor, cwd)
+func (m *Manager) Turn(ctx context.Context, req TurnRequest) error {
+	threadKey, cwd, kind, prompt := req.ThreadKey, req.Cwd, req.Kind, req.Prompt
+	live, _, err := m.Ensure(ctx, threadKey, req.TrustFloor, cwd)
 	if err != nil {
 		return fmt.Errorf("session: turn for %s: %w", threadKey, err)
 	}
@@ -108,7 +125,7 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, kind, pr
 				if derr != nil {
 					return fmt.Errorf("session: turn for %s: rotation-due cwd gone (%v) and degradation also failed: %w", threadKey, cwdErr, derr)
 				}
-				return m.startNew(ctx, fresh, resumeFailureNote, kind, prompt)
+				return m.startNew(ctx, fresh, resumeFailureNote, kind, prompt, req.Output)
 			}
 			live, err = m.rotate(ctx, live, cause)
 			if err != nil {
@@ -126,9 +143,9 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, kind, pr
 		if nerr != nil {
 			return fmt.Errorf("session: turn for %s: %w", threadKey, nerr)
 		}
-		return m.startNew(ctx, live, note, kind, prompt)
+		return m.startNew(ctx, live, note, kind, prompt, req.Output)
 	case "active":
-		err := m.resume(ctx, live, kind, prompt)
+		err := m.resume(ctx, live, kind, prompt, req.Output)
 		if err == nil || !isResumeFailure(err) {
 			return err
 		}
@@ -140,7 +157,7 @@ func (m *Manager) Turn(ctx context.Context, threadKey, trustFloor, cwd, kind, pr
 		if derr != nil {
 			return fmt.Errorf("session: turn for %s: resume failed (%v) and degradation also failed: %w", threadKey, err, derr)
 		}
-		return m.startNew(ctx, fresh, resumeFailureNote, kind, prompt)
+		return m.startNew(ctx, fresh, resumeFailureNote, kind, prompt, req.Output)
 	default:
 		// ResolveLiveSession only returns the two live states; a third
 		// here means the store contract broke — refuse loudly.

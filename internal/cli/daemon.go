@@ -25,6 +25,7 @@ import (
 	"github.com/brian-bell/approach/internal/delivery"
 	"github.com/brian-bell/approach/internal/engine"
 	"github.com/brian-bell/approach/internal/router"
+	"github.com/brian-bell/approach/internal/session"
 	"github.com/brian-bell/approach/internal/store"
 )
 
@@ -244,14 +245,85 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		default:
 		}
 	}
+
+	// Production turn dispatch (§4.1): with [engine] pinned, the router
+	// handler runs real turns — session manager + engine + the C11 turn
+	// recorder (store.InsertTurn). Without it the placeholder keeps
+	// events durably queued: dormant, and loud (verifyEnginePin warned
+	// above). The discord adapter is built only after Rebuild (its
+	// ingest needs live queues), but Rebuild itself can dispatch turns —
+	// so the relay source is late-bound through an atomic pointer, and
+	// a turn that runs before the adapter is up loses only the
+	// partial-message UX: the outbox pump owns final delivery.
+	handler := placeholderTurn(logger)
+	var relayAdapter atomic.Pointer[discord.Adapter]
+	// inFlight fences the pump off delivery rows a live relay send owns
+	// at this moment — without it a ticker pass between a reply's
+	// compose and its platform ack would send the same row twice from
+	// one living daemon.
+	inFlight := delivery.NewInFlight()
+	if cfg != nil && cfg.Engine != nil {
+		// Message is the only event kind dispatched today, so the
+		// engine pins the interactive model (§8); per-kind routing
+		// (heartbeat tier) arrives with the heartbeat source.
+		eng, err := engine.New(engine.Config{
+			Bin:         cfg.Engine.Bin,
+			Model:       cfg.Models.Message,
+			MaxTurns:    cfg.Engine.MaxTurns,
+			TurnTimeout: cfg.Engine.TurnTimeout.Duration(),
+			RecordTurn: func(ctx context.Context, t store.Turn) error {
+				_, err := store.InsertTurn(ctx, db, t)
+				return err
+			},
+			Logger: logger,
+		})
+		if err != nil {
+			// Config validation already vetted these fields, so this
+			// refusal is unexpected — but an engine with a hole in its
+			// safety pins must never run, and a restart cannot fix it.
+			logger.Error("engine construction", "error", err.Error())
+			return exitUnrecoverable
+		}
+		// Assistant sessions spawn from the APPROACH_HOME root — the
+		// state directory's parent, the same layout derivation as the
+		// defaulted config path (§8: assistant sessions run in
+		// ~/approach; worker cwd policy arrives with task events, §4.5).
+		home := filepath.Dir(filepath.Clean(*state))
+		handler = productionTurn(turnDeps{
+			db: db,
+			runner: session.NewManager(db, eng, session.Config{
+				IdleTTL: cfg.Sessions.IdleTTL.Duration(),
+				TurnCap: int64(cfg.Sessions.TurnCap),
+				Logger:  logger,
+			}),
+			relay: func(ctx context.Context, threadKey string) turnRelay {
+				a := relayAdapter.Load()
+				if a == nil {
+					return nil
+				}
+				return a.NewRelay(ctx, threadKey)
+			},
+			// queues is assigned just below, before Rebuild can spawn
+			// the first drain goroutine — the closure is never called
+			// against nil in a living daemon.
+			readmit:  func(ev store.QueuedEvent) { queues.Readmit(ev) },
+			notify:   kickPump,
+			inflight: inFlight,
+			cwd:      home,
+			logger:   logger,
+			now:      time.Now,
+		})
+		logger.Info("turn dispatch wired", "model", cfg.Models.Message, "session_cwd", home)
+	}
+
 	queues = router.New(ctx, db, router.Options{
-		Handler: placeholderTurn(logger),
+		Handler: handler,
 		Logger:  logger,
 		// Crash parks surface to the originating thread through the
 		// outbox (§4.6) — write-before-send holds the notice durably
 		// until the adapter is up.
 		OnPark: func(ctx context.Context, ev store.QueuedEvent) error {
-			if err := delivery.SurfaceInterrupted(ctx, db, ev); err != nil {
+			if err := delivery.SurfaceInterruptedCoordinated(ctx, db, ev, inFlight); err != nil {
 				return err
 			}
 			kickPump()
@@ -272,6 +344,12 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 	if err != nil {
 		logger.Error("discord adapter", "error", err.Error())
 		return exitUnrecoverable
+	}
+	// The adapter exists: bind it as the turn relay source, so turns
+	// dispatched from here on stream typing + partials to their thread
+	// (turns already in flight simply deliver through the outbox).
+	if a, ok := runner.(*discord.Adapter); ok {
+		relayAdapter.Store(a)
 	}
 
 	// The adapter runs supervised: Run only returns on cancellation
@@ -307,7 +385,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		go func() {
 			defer close(resendDone)
 			delivery.Pump(ctx, db, map[string]delivery.Sender{"discord": sender},
-				logger, time.Now, pumpKick, 30*time.Second)
+				logger, time.Now, pumpKick, 30*time.Second, inFlight)
 		}()
 	} else {
 		close(resendDone)
@@ -417,18 +495,18 @@ func verifyEnginePin(cfg *config.Config, logger *slog.Logger) error {
 	return nil
 }
 
-// placeholderTurn is the M1 scaffold handler: the queue claims,
-// serializes, stamps 'processing', and survives restarts NOW, but the
-// completion transitions land with the production dispatch wiring
-// (approach-x6n.11: engine + session manager + the C11 turn recorder,
-// store.InsertTurn as Engine.RecordTurn) — so a scaffold-dispatched
-// row stays 'processing' and the NEXT restart parks it as interrupted
-// (§4.6), where the delivery flows will surface it. Honest on
-// purpose: a no-op turn did consume the event, and faking 'completed'
-// would hide that no engine ever ran.
+// placeholderTurn is the DORMANT handler — a daemon without an
+// [engine] section (verifyEnginePin warned loudly at startup): the
+// queue claims, serializes, stamps 'processing', and survives restarts,
+// but no engine exists to run the turn — so a dispatched row stays
+// 'processing' and the NEXT restart parks it as interrupted (§4.6),
+// where the delivery flows surface it. Honest on purpose: a no-op turn
+// did consume the event, and faking 'completed' would hide that no
+// engine ever ran. The production handler is productionTurn (turn.go),
+// selected in runDaemon when [engine] is pinned.
 func placeholderTurn(logger *slog.Logger) router.Handler {
 	return func(_ context.Context, ev store.QueuedEvent) {
-		logger.Debug("turn dispatch not yet wired — event stays durably queued (approach-x6n.11)",
+		logger.Debug("no [engine] pinned — turn not run; event stays durably queued (§2)",
 			"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey)
 	}
 }

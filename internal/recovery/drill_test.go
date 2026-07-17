@@ -196,7 +196,7 @@ func TestDrillRateLimitStormOutboxAbsorbed(t *testing.T) {
 	clock := func() time.Time { return time.Unix(1700000500, 0) }
 	// Three pump passes: two inside the storm, one after it clears.
 	for pass := 1; pass <= 3; pass++ {
-		delivery.ResendUnacked(ctx, db, senders, discardLogger(), clock)
+		delivery.ResendUnacked(ctx, db, senders, discardLogger(), clock, nil)
 	}
 
 	if sender.delivered != 1 {

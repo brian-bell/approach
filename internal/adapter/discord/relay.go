@@ -45,6 +45,7 @@ type Relay struct {
 	buf          strings.Builder
 	channelID    string // resolved on first need; "" until then
 	partialID    string // the message being edited, once one exists
+	posted       bool   // a partial message REACHED the platform — sticky (§4.6 evidence)
 	partialAtCap bool   // partial shows the full cap; edits are no-ops now
 	lastEdit     time.Time
 	done         bool // Finish or Cancel happened
@@ -111,6 +112,7 @@ func (r *Relay) Push(delta string) {
 			return
 		}
 		r.partialID = msg.ID
+		r.posted = true
 		r.lastEdit = time.Now()
 		r.stopTypingLocked()
 		return
@@ -171,6 +173,23 @@ func (r *Relay) partialContentLocked() string {
 // the outbox must know both what landed and that the turn is not
 // fully delivered.
 func (r *Relay) Finish() ([]string, error) {
+	return r.finish(nil)
+}
+
+// FinishJournaled is Finish with a durable-attempt boundary. It calls
+// beforeSend immediately before every final edit or fresh send for a
+// chunk, and aborts without touching the platform when that journal
+// write fails. A failed edit followed by a fresh-send fallback invokes
+// the callback twice for chunk 0 because two platform operations
+// actually started (§4.6).
+func (r *Relay) FinishJournaled(beforeSend func(chunkIndex int) error) ([]string, error) {
+	if beforeSend == nil {
+		return nil, fmt.Errorf("discord: relay for %s: nil attempt journal", r.threadKey)
+	}
+	return r.finish(beforeSend)
+}
+
+func (r *Relay) finish(beforeSend func(chunkIndex int) error) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.done {
@@ -197,14 +216,21 @@ func (r *Relay) Finish() ([]string, error) {
 	chunks := chunkRunes(text, messageCap)
 	var acks []string
 	rest := chunks
+	restStart := 0
 	if r.partialID != "" && len(chunks) > 0 {
 		// The partial message becomes the final first chunk. If the
 		// edit fails, fall through to a fresh send of the same chunk —
 		// a stale partial plus a complete message beats a truncated
 		// turn.
+		if beforeSend != nil {
+			if err := beforeSend(0); err != nil {
+				return acks, fmt.Errorf("discord: relay finish to %s: journal chunk 0 before final edit: %w", r.threadKey, err)
+			}
+		}
 		if _, err := r.a.editMessage(r.ctx, r.a.currentSession(), r.channelID, r.partialID, chunks[0]); err == nil {
 			acks = append(acks, "discord:msg:"+r.partialID)
 			rest = chunks[1:]
+			restStart = 1
 		} else {
 			r.invalidateChannelLocked()
 			r.logPartialLoss("final edit", err)
@@ -216,7 +242,13 @@ func (r *Relay) Finish() ([]string, error) {
 			}
 		}
 	}
-	for _, chunk := range rest {
+	for i, chunk := range rest {
+		chunkIndex := restStart + i
+		if beforeSend != nil {
+			if err := beforeSend(chunkIndex); err != nil {
+				return acks, fmt.Errorf("discord: relay finish to %s: journal chunk %d before send: %w", r.threadKey, chunkIndex, err)
+			}
+		}
 		msg, err := r.a.sendMessage(r.ctx, r.a.currentSession(), r.channelID, chunk)
 		if err != nil {
 			r.invalidateChannelLocked()
@@ -230,6 +262,19 @@ func (r *Relay) Finish() ([]string, error) {
 	return acks, nil
 }
 
+// Posted reports whether this relay put anything VISIBLE on the
+// platform — a partial message was created, whether or not it can
+// still be edited. Sticky on purpose: channel invalidation clears the
+// edit target (partialID), not the fact that a human saw text. The
+// turn wiring consults this on engine failure — a visible partial is
+// an outbound side effect the tool journal knows nothing about, and a
+// turn that showed one must never silently auto-retry (§4.6).
+func (r *Relay) Posted() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.posted
+}
+
 // Cancel abandons the turn: typing stops, nothing further is sent.
 // Idempotent; Finish after Cancel is refused.
 func (r *Relay) Cancel() {
@@ -237,6 +282,28 @@ func (r *Relay) Cancel() {
 	defer r.mu.Unlock()
 	r.done = true
 	r.stopTypingLocked()
+}
+
+// Retract is Cancel plus best-effort removal of the posted partial
+// message — for the paths where the SAME text is guaranteed to arrive
+// again through the outbox pump (a deferred send): leaving the partial
+// standing would show the reply twice, once as an abandoned fragment.
+// Best-effort on purpose: a failed delete only costs UX (the duplicate
+// the caller was avoiding), never turn state — and Posted stays sticky
+// either way, because a deleted message may still have been read
+// (§4.6: retraction is not un-seeing).
+func (r *Relay) Retract() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done = true
+	r.stopTypingLocked()
+	if r.partialID == "" || r.channelID == "" {
+		return
+	}
+	if err := r.a.deleteMessage(r.ctx, r.a.currentSession(), r.channelID, r.partialID); err != nil {
+		r.logPartialLoss("partial retract", err)
+	}
+	r.partialID = ""
 }
 
 // resolveChannelLocked resolves and caches the platform channel for
@@ -319,6 +386,15 @@ func (r *Relay) logPartialLoss(stage string, err error) {
 	}
 	r.a.log.Warn("discord relay "+stage+" failed — partial UX degraded, final delivery unaffected",
 		"thread_key", r.threadKey, "error", detail)
+}
+
+// ChunkMessage splits a reply into the exact per-message pieces this
+// adapter will send for it — THE definition the outbox composer keys
+// delivery rows off (§4.1: one row per outbound message), so the acks
+// Relay.Finish returns align one-to-one with the rows the caller wrote.
+// A second, drifting chunker would misalign acks and rows silently.
+func ChunkMessage(text string) []string {
+	return chunkRunes(text, messageCap)
 }
 
 // chunkRunes splits text into <=capRunes-rune pieces on rune

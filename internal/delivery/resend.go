@@ -36,7 +36,11 @@ type Sender interface {
 // Failures are per-row and never abort the pass (§4.6: events are
 // never silently dropped — but a scan that stopped at the first bad
 // row would silently strand the rest). Every skip is logged loud.
-func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time) {
+//
+// held is the live-send claim table (nil = nothing claimed): a row a
+// turn's relay owns RIGHT NOW is not this pass's to send — racing the
+// relay would deliver it twice from one living daemon.
+func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time, held *InFlight) {
 	rows, err := store.ResendableDeliveries(ctx, db)
 	if err != nil {
 		logger.Error("resend scan failed — owed deliveries stay durable for the next restart", "error", err.Error())
@@ -48,6 +52,16 @@ func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, l
 			return // shutdown: everything left stays durably owed
 		}
 		if stopped[d.Target] {
+			continue
+		}
+		if held.Held(d.DeliveryKey) {
+			// A live relay owns this row. Stop the TARGET, not just
+			// the row: sending a later sibling first would break
+			// per-target order (§4.1). The relay's own completion acks
+			// it — or releases it still owed, for the next pass.
+			logger.Debug("delivery held by a live send — target skipped this pass",
+				"delivery_key", d.DeliveryKey, "target", d.Target)
+			stopped[d.Target] = true
 			continue
 		}
 		sender, ok := senders[channelOf(d.Target)]
@@ -105,10 +119,10 @@ func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, l
 //
 // Blocks until ctx is cancelled — run it on its own goroutine and
 // wait for it before closing the store, exactly like the adapter.
-func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time, kick <-chan struct{}, interval time.Duration) {
+func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time, kick <-chan struct{}, interval time.Duration, held *InFlight) {
 	pass := func() {
-		sweepUnsurfacedParks(ctx, db, logger)
-		ResendUnacked(ctx, db, senders, logger, now)
+		sweepUnsurfacedParks(ctx, db, logger, held)
+		ResendUnacked(ctx, db, senders, logger, now, held)
 	}
 	pass()
 	ticker := time.NewTicker(interval)
@@ -130,14 +144,14 @@ func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *sl
 // notice. Interrupted rows are outside every queue rescan by design,
 // so without this sweep such a park is silent forever. Idempotent
 // (deterministic notice key); failures log and wait for the next pass.
-func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) {
+func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger, held *InFlight) {
 	events, err := store.UnsurfacedInterruptedEvents(ctx, db)
 	if err != nil {
 		logger.Error("unsurfaced-park sweep failed — parked events may be silent until the next pass", "error", err.Error())
 		return
 	}
 	for _, ev := range events {
-		if err := SurfaceInterrupted(ctx, db, ev); err != nil {
+		if err := SurfaceInterruptedCoordinated(ctx, db, ev, held); err != nil {
 			logger.Error("re-surfacing parked event failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
 			continue
 		}
@@ -150,7 +164,7 @@ func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) 
 		return
 	}
 	for _, ev := range deaths {
-		if err := SurfaceDeadLetter(ctx, db, ev); err != nil {
+		if err := SurfaceDeadLetterCoordinated(ctx, db, ev, held); err != nil {
 			logger.Error("re-surfacing dead letter failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
 			continue
 		}

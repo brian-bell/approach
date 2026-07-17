@@ -95,6 +95,109 @@ func TestInsertDeliveryPersistsBeforeSend(t *testing.T) {
 	}
 }
 
+// TestInsertDeliveriesAllOrNothing: one turn's reply composes
+// atomically — a failure on ANY chunk rolls back every chunk, so a
+// failed compose leaves no truncated head durably owed and the caller
+// can park the event against a clean outbox (§4.6).
+func TestInsertDeliveriesAllOrNothing(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	// Second row binds a nonexistent event — the FK refuses it, and the
+	// first row must vanish with it.
+	_, _, err := store.InsertDeliveries(ctx, db, []store.Delivery{
+		{DeliveryKey: "reply:e:0", Target: "discord:dm:1", Payload: "head"},
+		{DeliveryKey: "reply:e:1", EventID: 9999, Target: "discord:dm:1", Payload: "tail"},
+	})
+	if err == nil {
+		t.Fatal("InsertDeliveries with a bad row: want error, got nil")
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("deliveries = %d rows after a failed batch, want 0 — a partial compose is the truncated-reply hazard", n)
+	}
+
+	// Happy path: both rows land, ids in order, composed true.
+	ids, composed, err := store.InsertDeliveries(ctx, db, []store.Delivery{
+		{DeliveryKey: "reply:e:0", Target: "discord:dm:1", Payload: "head"},
+		{DeliveryKey: "reply:e:1", Target: "discord:dm:1", Payload: "tail"},
+	})
+	if err != nil || !composed || len(ids) != 2 || ids[0] <= 0 || ids[1] <= ids[0] {
+		t.Fatalf("InsertDeliveries = (%v, %v, %v), want two fresh ordered rows", ids, composed, err)
+	}
+
+	// A duplicate ANYWHERE rolls the whole batch back: a prior
+	// execution already composed this reply completely, and committing
+	// the fresh remainder would stitch that execution's stale prefix
+	// onto this one's tail — a §4.6 manual retry may produce different
+	// text. No error: the prior compose IS the reply; the pump sends it.
+	ids, composed, err = store.InsertDeliveries(ctx, db, []store.Delivery{
+		{DeliveryKey: "reply:e:1", Target: "discord:dm:1", Payload: "different tail"},
+		{DeliveryKey: "reply:e:2", Target: "discord:dm:1", Payload: "more"},
+	})
+	if err != nil || composed || ids != nil {
+		t.Fatalf("InsertDeliveries with duplicate = (%v, %v, %v), want (nil, false, nil) — whole batch rolled back", ids, composed, err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("deliveries = %d rows after a duplicate-conflict batch, want the prior 2 only — a mixed batch is a malformed reply", n)
+	}
+	var payload string
+	if err := db.QueryRow(`SELECT payload FROM deliveries WHERE delivery_key = 'reply:e:1'`).Scan(&payload); err != nil {
+		t.Fatalf("read prior row: %v", err)
+	}
+	if payload != "tail" {
+		t.Errorf("prior compose's payload = %q, want %q untouched (first write wins)", payload, "tail")
+	}
+}
+
+// TestOwedDeliveriesBefore: the live-send order check — only OLDER
+// rows still owed to the SAME target count; acked, failed, other-target
+// and newer rows do not (§4.1 per-target order).
+func TestOwedDeliveriesBefore(t *testing.T) {
+	db := mustOpen(t, filepath.Join(t.TempDir(), "state", "approach.db"))
+	ctx := context.Background()
+
+	insert := func(key, target string) int64 {
+		t.Helper()
+		id, inserted, err := store.InsertDelivery(ctx, db, store.Delivery{
+			DeliveryKey: key, Target: target, Payload: "p",
+		})
+		if err != nil || !inserted {
+			t.Fatalf("InsertDelivery(%s): %v", key, err)
+		}
+		return id
+	}
+	owedOld := insert("a", "discord:dm:1")
+	ackedOld := insert("b", "discord:dm:1")
+	failedOld := insert("c", "discord:dm:1")
+	otherTarget := insert("d", "discord:dm:2")
+	mine := insert("e", "discord:dm:1")
+	newer := insert("f", "discord:dm:1")
+	_ = owedOld
+	_ = otherTarget
+	_ = newer
+	if err := store.AckDelivery(ctx, db, ackedOld, 1700000000); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if err := store.MarkDeliveryFailed(ctx, db, failedOld); err != nil {
+		t.Fatalf("fail: %v", err)
+	}
+
+	n, err := store.OwedDeliveriesBefore(ctx, db, "discord:dm:1", mine)
+	if err != nil {
+		t.Fatalf("OwedDeliveriesBefore: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("owed before = %d, want 1 (only the older unacked unfailed same-target row)", n)
+	}
+}
+
 // TestInsertDeliveryDuplicateKeyIsNoOp: a crash-retried compose must
 // collapse to the original row (§4.1) — the first write wins,
 // including lifecycle state a send may already have advanced, and

@@ -49,6 +49,90 @@ func MarkEventProcessing(ctx context.Context, db *sql.DB, id int64, now int64) e
 	return nil
 }
 
+// MarkEventCompleted is the post-turn transition (§4.1): the turn ran
+// to completion, so the row leaves the live queue — 'completed' is the
+// rest state until (and unless) the reply leg's last platform ack
+// advances it to 'replied' (AckDelivery). Guarded: turns run from
+// 'processing', so completing any other status is a caller sequencing
+// bug that must fail loud — silently re-completing history would hide
+// a double dispatch.
+func MarkEventCompleted(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'completed', updated = ? WHERE id = ? AND status = 'processing'`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: mark event %d completed: not in processing state", id)
+	}
+	return nil
+}
+
+// MarkEventCompletedReconciled is the duplicate-compose completion
+// transition. A prior life already wrote this event's reply rows, and
+// restart recovery may have acked all of them while the event was
+// parked interrupted. Complete and reconcile in ONE statement so the
+// event lands directly at replied when every existing outbound row is
+// already accepted; otherwise no future ack remains to advance a
+// completed row (§4.1, §4.6). No delivery rows still means completed,
+// and any unacked or failed row blocks replied just as AckDelivery
+// does. The processing guard matches MarkEventCompleted.
+func MarkEventCompletedReconciled(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events
+		 SET status = CASE
+		     WHEN EXISTS (SELECT 1 FROM deliveries WHERE event_id = ?)
+		      AND NOT EXISTS (SELECT 1 FROM deliveries WHERE event_id = ? AND acked IS NULL)
+		     THEN 'replied' ELSE 'completed' END,
+		     updated = ?
+		 WHERE id = ? AND status = 'processing'`,
+		id, id, now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: mark event %d completed with delivery reconciliation: not in processing state", id)
+	}
+	return nil
+}
+
+// SkipEvent records a deliberate refusal to process (§6 'skipped' —
+// the §4.2 misfire coalescing state, and until the C9 policy hook
+// lands, the trust admission gate's landing): the row leaves the live
+// queue consumed on purpose — no turn ran, nothing is owed, and unlike
+// a park or a dead letter nothing is surfaced, so a stranger's refused
+// message cannot flood the owner with notices. Guarded to processing:
+// only the handler that claimed an event may skip it, and skipping any
+// other state would erase queue history.
+func SkipEvent(ctx context.Context, db *sql.DB, id int64, now int64) error {
+	res, err := db.ExecContext(ctx,
+		`UPDATE events SET status = 'skipped', updated = ? WHERE id = ? AND status = 'processing'`,
+		now, id,
+	)
+	if err != nil {
+		return fmt.Errorf("store: skip event %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: skip event %d: %w", id, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("store: skip event %d: not in processing state", id)
+	}
+	return nil
+}
+
 // scanQueuedEvent reads one queue-view row: the eight event columns
 // plus the nullable correlation, in the canonical SELECT order every
 // queue query uses — one scanner, so a new column cannot be carried by

@@ -50,6 +50,9 @@ type Options struct {
 	Logger *slog.Logger
 	Now    func() time.Time
 	After  func(d time.Duration, f func())
+	// InFlight coordinates every notice composer with live relays for
+	// the same target. Nil preserves the unlocked test/restart seam.
+	InFlight *delivery.InFlight
 	// Notify, when set, is called after a park's §4.6 notice lands in
 	// the outbox — the daemon wires it to the outbox pump's kick so
 	// the notice posts now instead of on the next ticker pass. Must be
@@ -136,6 +139,17 @@ func HandleEngineFailure(ctx context.Context, db *sql.DB, enq Readmitter, ev sto
 	return Retried, nil
 }
 
+// ParkAmbiguous parks one event on the CALLER's evidence of a
+// side effect the tool journal cannot see — a partial reply already
+// visible on the thread is the canonical case: the journal only
+// records tool attempts, so HandleEngineFailure would judge such a
+// turn clean and retry it, answering twice. Same landing as the
+// journal-driven park: interrupted, §4.6 notice to the originating
+// thread, pump woken. why names the evidence in the journal record.
+func ParkAmbiguous(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Options, why string) (Outcome, error) {
+	return park(ctx, db, ev, opts, why)
+}
+
 // deadLetter is the terminal landing for an exhausted budget (§4.6):
 // event dead + dead_letters row atomically, owner-DM entry notice
 // through the outbox, pump woken. If the dead-letter write itself
@@ -153,7 +167,7 @@ func deadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Opti
 		return park(ctx, db, ev, opts,
 			"retry budget exhausted; dead-letter write failed — parked instead (§4.6)")
 	}
-	if err := delivery.SurfaceDeadLetter(ctx, db, ev); err != nil {
+	if err := delivery.SurfaceDeadLetterCoordinated(ctx, db, ev, opts.InFlight); err != nil {
 		opts.Logger.Error("dead-letter entry notice failed — the pump's sweep repairs it next pass (§4.6)",
 			"dedup_key", ev.DedupKey, "error", err.Error())
 	} else if opts.Notify != nil {
@@ -194,7 +208,7 @@ func park(ctx context.Context, db *sql.DB, ev store.QueuedEvent, opts Options, w
 	if err := store.ParkEvent(ctx, db, ev.ID, now().Unix()); err != nil {
 		return 0, fmt.Errorf("recovery: park event %s: %w", ev.DedupKey, err)
 	}
-	if err := delivery.SurfaceInterrupted(ctx, db, ev); err != nil {
+	if err := delivery.SurfaceInterruptedCoordinated(ctx, db, ev, opts.InFlight); err != nil {
 		opts.Logger.Error("park notice write failed — the pump's unsurfaced-park sweep repairs it next pass (§4.6)",
 			"dedup_key", ev.DedupKey, "error", err.Error())
 	} else if opts.Notify != nil {

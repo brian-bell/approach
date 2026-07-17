@@ -51,6 +51,15 @@ type Spec struct {
 	// injects it into the turn; the full fact-package seeding of a
 	// fresh session belongs to the context assembler (C6), not here.
 	TransparencyNote string
+	// Output, when set, receives each assistant MESSAGE's text as it
+	// streams, blocks joined verbatim — the reply-relay seam (§4.1:
+	// live stream-json relay); one call per message, so the message
+	// boundary is the only separator a sink may infer. nil means
+	// discard. The engine calls it from its stdout-reading goroutine,
+	// so implementations must be safe for that; they should also
+	// return promptly — a blocking sink backpressures the child's
+	// stdout pipe.
+	Output func(delta string)
 }
 
 // Config wires a Manager. ActivationWindow bounds how long a session
@@ -283,13 +292,14 @@ func (m *Manager) touch(ctx context.Context, sessionID string) {
 // below closes the other half — a turn that limps in after expiry must
 // not activate a row Ensure is entitled to have failed already.
 func (m *Manager) StartNew(ctx context.Context, live store.LiveSession) error {
-	return m.startNew(ctx, live, "", "", "")
+	return m.startNew(ctx, live, "", "", "", nil)
 }
 
 // startNew is StartNew plus the driving event's kind (recorded on the
-// C11 turns row, §6), the event prompt, and the §4.6 transparency
-// note a degradation successor's first turn carries.
-func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, kind, prompt string) error {
+// C11 turns row, §6), the event prompt, the §4.6 transparency note a
+// degradation successor's first turn carries, and the reply sink the
+// engine streams assistant text to (nil = discard).
+func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, kind, prompt string, output func(string)) error {
 	// The caller's snapshot identifies WHICH session; every durable
 	// fact about it — status, deadline, cwd — is re-read from the row
 	// before the spawn. Engine.Start is a side-effecting call, the one
@@ -343,6 +353,7 @@ func (m *Manager) startNew(ctx context.Context, live store.LiveSession, note, ki
 		Kind:             kind,
 		Prompt:           prompt,
 		TransparencyNote: note,
+		Output:           output,
 	}); err != nil {
 		return fmt.Errorf("session: first turn for %s: %w", current.SessionID, err)
 	}

@@ -12,11 +12,16 @@ SQLite state store and a trust/policy model designed in
 `docs/approach-agent-harness-spec.html`. Section references in code
 comments (§4.1, §6, §7, …) point at that spec.
 
-**Current state**: the daemon skeleton and trust foundation are built
-(admin socket, state store + migrations, config loading, identity
-seeding, trust levels, path denylist). The event router, channel
-adapters, and engine spawning are later milestones (M1+) — a `poke`
-today only increments a counter visible in `status`.
+**Current state**: the daemon runs end to end for discord messages —
+event router (per-thread queues over the events table), discord
+adapter, session lifecycle, engine spawning (`claude -p` under the §2
+version pin), the C11 turns table, and the deliveries outbox with
+restart resend. With `[engine]` configured, an inbound owner-stamped
+message runs a real engine turn and the reply relays back; sub-owner
+events are refused fail-closed (`skipped`) until the C9 policy gate
+lands, and without `[engine]` the daemon boots dormant and loud.
+Policy enforcement (C9 hook), sandbox (C10), heartbeats, and workers
+are later milestones.
 
 ## Build & Test
 

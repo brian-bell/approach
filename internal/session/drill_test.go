@@ -199,7 +199,7 @@ func TestDrillThreadContinuesAfterHoursAndRestart(t *testing.T) {
 	// transition and the write-before-send reply compose (§4.1).
 	runTurn := func(db *sql.DB, m *session.Manager) router.Handler {
 		return func(ctx context.Context, ev store.QueuedEvent) {
-			if err := m.Turn(ctx, ev.ThreadKey, "owner", cwd, "message", ev.DedupKey); err != nil {
+			if err := m.Turn(ctx, session.TurnRequest{ThreadKey: ev.ThreadKey, TrustFloor: "owner", Cwd: cwd, Kind: "message", Prompt: ev.DedupKey}); err != nil {
 				t.Errorf("turn for %s: %v", ev.DedupKey, err)
 				return
 			}
@@ -238,7 +238,7 @@ func TestDrillThreadContinuesAfterHoursAndRestart(t *testing.T) {
 		// The pump's start pass — the §4.6 restart resend. Life 1 owes
 		// nothing; a later life must drain whatever an earlier crash
 		// left, and here proves nothing is double-sent.
-		delivery.ResendUnacked(ctx, db, senders, discardLogger(), now)
+		delivery.ResendUnacked(ctx, db, senders, discardLogger(), now, nil)
 		if _, err := q.Persist(ctx, msg); err != nil {
 			t.Fatalf("persist %s: %v", msg.DedupKey, err)
 		}
@@ -256,7 +256,7 @@ func TestDrillThreadContinuesAfterHoursAndRestart(t *testing.T) {
 		}, msg.DedupKey+" turn to complete and compose its reply")
 		// The reply leg: send from the outbox, ack advances the event
 		// completed → replied (§4.1).
-		delivery.ResendUnacked(ctx, db, senders, discardLogger(), now)
+		delivery.ResendUnacked(ctx, db, senders, discardLogger(), now, nil)
 		if got := eventStatus(db, msg.DedupKey); got != "replied" {
 			t.Errorf("event %s status = %q, want 'replied' — the reply rides the ack (§4.1)", msg.DedupKey, got)
 		}
