@@ -188,6 +188,24 @@ func HasOwedDeliveries(ctx context.Context, db *sql.DB, target string) (bool, er
 	return owed, nil
 }
 
+// EventHasDeliveries reports whether any outbound row was ever bound
+// to event, including acked and terminally failed history. A manual
+// retry of an interrupted event may encounter its prior reply only at
+// duplicate compose; suppressing the live relay up front prevents the
+// rerun from exposing duplicate partial text before that discovery
+// (§4.1, §4.6).
+func EventHasDeliveries(ctx context.Context, db *sql.DB, eventID int64) (bool, error) {
+	var exists bool
+	err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM deliveries WHERE event_id = ?)`,
+		eventID,
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: check deliveries for event %d: %w", eventID, err)
+	}
+	return exists, nil
+}
+
 // ResendableDelivery is one row of the §4.6 restart resend scan:
 // everything a re-send needs, read in one query. EventID is 0 when the
 // row has no originating event (§4.2 notifies); Attempts rides along

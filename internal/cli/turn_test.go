@@ -825,4 +825,7 @@ func TestProductionTurnDuplicateComposeReconcilesAckedRows(t *testing.T) {
 	if got := eventStatus(t, f.db, f.ev.ID); got != "replied" {
 		t.Errorf("event status = %q, want replied — all existing reply rows were already acked", got)
 	}
+	if len(relay.pushes) != 0 || relay.finished || relay.cancelled || relay.retracted {
+		t.Errorf("relay changed despite prior acknowledged reply: %+v — a manual retry must not expose duplicate text", relay)
+	}
 }

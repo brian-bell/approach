@@ -135,8 +135,17 @@ func productionTurn(d turnDeps) router.Handler {
 				d.logger.Error("target reservation failed — suppressing live relay for ordered pump delivery",
 					"dedup_key", ev.DedupKey, "error", err.Error())
 			} else {
-				owed, oerr := store.HasOwedDeliveries(ctx, d.db, ev.ThreadKey)
-				if oerr != nil {
+				priorReply, perr := store.EventHasDeliveries(ctx, d.db, ev.ID)
+				if perr != nil {
+					d.logger.Error("event delivery-history check failed — suppressing live relay",
+						"dedup_key", ev.DedupKey, "error", perr.Error())
+				} else if priorReply {
+					// Manual retries can revisit an interrupted event after
+					// its prior reply was already accepted. Acked history is
+					// not backlog, but it still forbids duplicate live text.
+					d.logger.Info("event already has reply history — suppressing live relay (§4.6)",
+						"dedup_key", ev.DedupKey)
+				} else if owed, oerr := store.HasOwedDeliveries(ctx, d.db, ev.ThreadKey); oerr != nil {
 					d.logger.Error("backlog check failed — suppressing live relay for ordered pump delivery",
 						"dedup_key", ev.DedupKey, "error", oerr.Error())
 				} else if owed {
