@@ -37,7 +37,7 @@ type turnRunner interface {
 // *discord.Relay satisfies it; tests fake it.
 type turnRelay interface {
 	Push(delta string)
-	Finish() ([]string, error)
+	FinishJournaled(beforeSend func(chunkIndex int) error) ([]string, error)
 	Cancel()
 	Retract()
 	Posted() bool
@@ -379,22 +379,17 @@ func finishTurn(ctx context.Context, d turnDeps, ev store.QueuedEvent, text stri
 		return
 	}
 
-	// The live send: attempts are journalled BEFORE the platform is
-	// touched (§4.6 — recovery reasons from what provably started),
-	// then the relay delivers and each returned ack settles its row in
-	// order. A shortfall (error, or fewer acks than rows) leaves the
-	// remainder owed; the pump re-sends from the persisted payloads.
-	for _, id := range ids {
-		if err := store.MarkDeliveryAttempt(wctx, d.db, id, d.now().Unix()); err != nil {
-			d.logger.Error("attempt stamp failed — direct send skipped, reply stays owed",
-				"dedup_key", ev.DedupKey, "error", err.Error())
-			relay.Retract()
-			release()
-			d.notify()
-			return
+	// The relay owns the per-chunk platform loop, so it calls back at
+	// the exact attempt boundary: immediately before each corresponding
+	// edit/send. Later chunks stay unstamped when an earlier operation
+	// fails or the process exits (§4.6 recovery must record only work
+	// that provably started).
+	acks, err := relay.FinishJournaled(func(chunkIndex int) error {
+		if chunkIndex < 0 || chunkIndex >= len(ids) {
+			return fmt.Errorf("relay requested attempt stamp for chunk %d of %d", chunkIndex, len(ids))
 		}
-	}
-	acks, err := relay.Finish()
+		return store.MarkDeliveryAttempt(wctx, d.db, ids[chunkIndex], d.now().Unix())
+	})
 	for i := range acks {
 		if i >= len(ids) {
 			// More acks than rows would mean the relay chunked

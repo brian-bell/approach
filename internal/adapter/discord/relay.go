@@ -173,6 +173,23 @@ func (r *Relay) partialContentLocked() string {
 // the outbox must know both what landed and that the turn is not
 // fully delivered.
 func (r *Relay) Finish() ([]string, error) {
+	return r.finish(nil)
+}
+
+// FinishJournaled is Finish with a durable-attempt boundary. It calls
+// beforeSend immediately before every final edit or fresh send for a
+// chunk, and aborts without touching the platform when that journal
+// write fails. A failed edit followed by a fresh-send fallback invokes
+// the callback twice for chunk 0 because two platform operations
+// actually started (§4.6).
+func (r *Relay) FinishJournaled(beforeSend func(chunkIndex int) error) ([]string, error) {
+	if beforeSend == nil {
+		return nil, fmt.Errorf("discord: relay for %s: nil attempt journal", r.threadKey)
+	}
+	return r.finish(beforeSend)
+}
+
+func (r *Relay) finish(beforeSend func(chunkIndex int) error) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.done {
@@ -199,14 +216,21 @@ func (r *Relay) Finish() ([]string, error) {
 	chunks := chunkRunes(text, messageCap)
 	var acks []string
 	rest := chunks
+	restStart := 0
 	if r.partialID != "" && len(chunks) > 0 {
 		// The partial message becomes the final first chunk. If the
 		// edit fails, fall through to a fresh send of the same chunk —
 		// a stale partial plus a complete message beats a truncated
 		// turn.
+		if beforeSend != nil {
+			if err := beforeSend(0); err != nil {
+				return acks, fmt.Errorf("discord: relay finish to %s: journal chunk 0 before final edit: %w", r.threadKey, err)
+			}
+		}
 		if _, err := r.a.editMessage(r.ctx, r.a.currentSession(), r.channelID, r.partialID, chunks[0]); err == nil {
 			acks = append(acks, "discord:msg:"+r.partialID)
 			rest = chunks[1:]
+			restStart = 1
 		} else {
 			r.invalidateChannelLocked()
 			r.logPartialLoss("final edit", err)
@@ -218,7 +242,13 @@ func (r *Relay) Finish() ([]string, error) {
 			}
 		}
 	}
-	for _, chunk := range rest {
+	for i, chunk := range rest {
+		chunkIndex := restStart + i
+		if beforeSend != nil {
+			if err := beforeSend(chunkIndex); err != nil {
+				return acks, fmt.Errorf("discord: relay finish to %s: journal chunk %d before send: %w", r.threadKey, chunkIndex, err)
+			}
+		}
 		msg, err := r.a.sendMessage(r.ctx, r.a.currentSession(), r.channelID, chunk)
 		if err != nil {
 			r.invalidateChannelLocked()

@@ -673,3 +673,28 @@ func TestRelayFinishSurfacesSendError(t *testing.T) {
 		t.Errorf("Finish error = %v, want the REST error surfaced", err)
 	}
 }
+
+// TestRelayFinishJournalsOnlyStartedChunks pins the attempt boundary
+// to the relay's platform loop. When the first send of a multi-chunk
+// reply fails, the second chunk never starts and must never reach the
+// durable journal callback.
+func TestRelayFinishJournalsOnlyStartedChunks(t *testing.T) {
+	f := newRelayFixture(t)
+	f.a.sendMessage = func(context.Context, *discordgo.Session, string, string) (*discordgo.Message, error) {
+		return nil, errors.New("rest down")
+	}
+	r := fastRelay(f)
+	r.partialMin = 9999 // keep Push from creating a partial before Finish
+	r.Push(strings.Repeat("x", messageCap) + "tail")
+	var attempted []int
+	_, err := r.FinishJournaled(func(chunkIndex int) error {
+		attempted = append(attempted, chunkIndex)
+		return nil
+	})
+	if err == nil {
+		t.Fatal("FinishJournaled succeeded, want the first platform error")
+	}
+	if fmt.Sprint(attempted) != "[0]" {
+		t.Errorf("journal callbacks = %v, want [0] — chunk 1 never started", attempted)
+	}
+}

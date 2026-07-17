@@ -77,10 +77,20 @@ func (r *fakeTurnRelay) Push(delta string) {
 	r.pushes = append(r.pushes, delta)
 }
 
-func (r *fakeTurnRelay) Finish() ([]string, error) {
+func (r *fakeTurnRelay) FinishJournaled(beforeSend func(chunkIndex int) error) ([]string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.finished = true
+	attempts := len(r.acks)
+	if r.finishErr != nil {
+		attempts++ // the operation after the accepted prefix started and failed
+	}
+	for i := 0; i < attempts; i++ {
+		if err := beforeSend(i); err != nil {
+			accepted := min(i, len(r.acks))
+			return r.acks[:accepted], err
+		}
+	}
 	return r.acks, r.finishErr
 }
 
@@ -315,6 +325,28 @@ func TestProductionTurnZeroAckFinishRetractsPartial(t *testing.T) {
 	}
 	if f.notify == 0 {
 		t.Error("pump not kicked for the owed reply")
+	}
+}
+
+// TestProductionTurnFailedFirstChunkDoesNotStampLaterChunks: a
+// multi-chunk direct reply whose first platform operation fails has
+// started exactly one delivery attempt. Later chunks were never
+// touched, so their recovery journal and retry budget must remain
+// pristine (§4.6).
+func TestProductionTurnFailedFirstChunkDoesNotStampLaterChunks(t *testing.T) {
+	long := strings.Repeat("x", 2000) + "tail"
+	runner := &fakeTurnRunner{deltas: []string{long}}
+	relay := &fakeTurnRelay{finishErr: errors.New("platform down")}
+	f := newDispatchFixture(t, runner, relay)
+
+	productionTurn(f.deps)(context.Background(), f.ev)
+
+	rows := deliveryRows(t, f.db, f.ev.ID)
+	if len(rows) != 2 {
+		t.Fatalf("deliveries = %+v, want two chunks", rows)
+	}
+	if rows[0].Att != 1 || rows[1].Att != 0 {
+		t.Errorf("attempts = %d/%d, want 1/0 — only the first platform operation started", rows[0].Att, rows[1].Att)
 	}
 }
 
@@ -662,9 +694,9 @@ type hookedRelay struct {
 	onFinish func()
 }
 
-func (h *hookedRelay) Finish() ([]string, error) {
+func (h *hookedRelay) FinishJournaled(beforeSend func(chunkIndex int) error) ([]string, error) {
 	h.onFinish()
-	return h.fakeTurnRelay.Finish()
+	return h.fakeTurnRelay.FinishJournaled(beforeSend)
 }
 
 // TestProductionTurnDuplicateComposeDefersToPump: a prior life already
