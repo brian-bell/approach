@@ -341,6 +341,64 @@ func TestSurfaceInterrupted(t *testing.T) {
 	}
 }
 
+// TestSurfaceInterruptedWaitsForTargetGate: notice composition and a
+// live reply share one per-target serialization point. While the live
+// turn owns the destination, a cross-thread recovery notice cannot
+// acquire an older outbox id behind an already-visible partial.
+func TestSurfaceInterruptedWaitsForTargetGate(t *testing.T) {
+	db := openStore(t)
+	ctx := context.Background()
+	evID, _, err := store.InsertEvent(ctx, db, store.Event{
+		DedupKey: "discord:msg:guild", ThreadKey: "discord:dm:123", Kind: "message", Trust: "owner",
+		Payload:  `{"dedup_key":"discord:msg:guild","thread_key":"discord:dm:123","kind":"message","trust":"owner"}`,
+		Received: 1700000000,
+	})
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if err := store.MarkEventProcessing(ctx, db, evID, 1700000050); err != nil {
+		t.Fatalf("MarkEventProcessing: %v", err)
+	}
+	if err := store.ParkEvent(ctx, db, evID, 1700000100); err != nil {
+		t.Fatalf("ParkEvent: %v", err)
+	}
+	ev := store.QueuedEvent{ID: evID, DedupKey: "discord:msg:guild", ThreadKey: "discord:dm:123"}
+	claims := delivery.NewInFlight()
+	release, err := claims.AcquireTarget(ctx, ev.ThreadKey)
+	if err != nil {
+		t.Fatalf("AcquireTarget: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- delivery.SurfaceInterruptedCoordinated(ctx, db, ev, claims)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	var before int
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&before); err != nil {
+		t.Fatalf("count while target held: %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("notice composed while live target held: %d rows", before)
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SurfaceInterruptedCoordinated: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notice did not compose after target release")
+	}
+	var after int
+	if err := db.QueryRow(`SELECT count(*) FROM deliveries`).Scan(&after); err != nil {
+		t.Fatalf("count after release: %v", err)
+	}
+	if after != 1 {
+		t.Errorf("rows after release = %d, want 1 notice", after)
+	}
+}
+
 // TestSurfaceInterruptedFreshNoticePerEpisode: a manual retry that
 // fails again is a NEW episode — the first notice must not suppress
 // the second, or the owner's failed retry parks silently forever.

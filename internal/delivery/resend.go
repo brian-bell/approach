@@ -121,7 +121,7 @@ func ResendUnacked(ctx context.Context, db *sql.DB, senders map[string]Sender, l
 // wait for it before closing the store, exactly like the adapter.
 func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *slog.Logger, now func() time.Time, kick <-chan struct{}, interval time.Duration, held *InFlight) {
 	pass := func() {
-		sweepUnsurfacedParks(ctx, db, logger)
+		sweepUnsurfacedParks(ctx, db, logger, held)
 		ResendUnacked(ctx, db, senders, logger, now, held)
 	}
 	pass()
@@ -144,14 +144,14 @@ func Pump(ctx context.Context, db *sql.DB, senders map[string]Sender, logger *sl
 // notice. Interrupted rows are outside every queue rescan by design,
 // so without this sweep such a park is silent forever. Idempotent
 // (deterministic notice key); failures log and wait for the next pass.
-func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) {
+func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger, held *InFlight) {
 	events, err := store.UnsurfacedInterruptedEvents(ctx, db)
 	if err != nil {
 		logger.Error("unsurfaced-park sweep failed — parked events may be silent until the next pass", "error", err.Error())
 		return
 	}
 	for _, ev := range events {
-		if err := SurfaceInterrupted(ctx, db, ev); err != nil {
+		if err := SurfaceInterruptedCoordinated(ctx, db, ev, held); err != nil {
 			logger.Error("re-surfacing parked event failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
 			continue
 		}
@@ -164,7 +164,7 @@ func sweepUnsurfacedParks(ctx context.Context, db *sql.DB, logger *slog.Logger) 
 		return
 	}
 	for _, ev := range deaths {
-		if err := SurfaceDeadLetter(ctx, db, ev); err != nil {
+		if err := SurfaceDeadLetterCoordinated(ctx, db, ev, held); err != nil {
 			logger.Error("re-surfacing dead letter failed — next pass retries", "dedup_key", ev.DedupKey, "error", err.Error())
 			continue
 		}

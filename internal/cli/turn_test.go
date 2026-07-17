@@ -521,6 +521,55 @@ func TestProductionTurnDefersToPumpWhenOlderRowOwed(t *testing.T) {
 	}
 }
 
+// TestProductionTurnReservesRelayTargetThroughComposition: after the
+// relay passes its backlog check, cross-thread recovery may target the
+// same owner DM. The live turn holds the shared target gate through
+// reply composition/send so that notice waits and receives a later
+// outbox id; visible partial order and durable order cannot diverge.
+func TestProductionTurnReservesRelayTargetThroughComposition(t *testing.T) {
+	runner := &fakeTurnRunner{deltas: []string{"hello"}}
+	relay := &fakeTurnRelay{acks: []string{"discord:msg:900"}}
+	f := newDispatchFixture(t, runner, relay)
+	f.deps.inflight = delivery.NewInFlight()
+	noticeEv := stageProcessingEvent(t, f.db, "discord:msg:notice", "other turn")
+	if err := store.ParkEvent(context.Background(), f.db, noticeEv.ID, 1700000060); err != nil {
+		t.Fatalf("ParkEvent notice source: %v", err)
+	}
+	surfaceDone := make(chan error, 1)
+	runner.hook = func() {
+		go func() {
+			surfaceDone <- delivery.SurfaceInterruptedCoordinated(context.Background(), f.db, noticeEv, f.deps.inflight)
+		}()
+		time.Sleep(20 * time.Millisecond)
+		var notices int
+		if err := f.db.QueryRow(`SELECT count(*) FROM deliveries WHERE delivery_key LIKE 'interrupted:discord:msg:notice:%'`).Scan(&notices); err != nil {
+			t.Errorf("count concurrent notices: %v", err)
+		} else if notices != 0 {
+			t.Errorf("notice composed during live turn: %d rows — target reservation did not span the engine", notices)
+		}
+	}
+
+	productionTurn(f.deps)(context.Background(), f.ev)
+	select {
+	case err := <-surfaceDone:
+		if err != nil {
+			t.Fatalf("SurfaceInterruptedCoordinated: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent notice did not compose after live turn released target")
+	}
+	var replyID, noticeID int64
+	if err := f.db.QueryRow(`SELECT id FROM deliveries WHERE delivery_key = 'reply:discord:msg:1:0'`).Scan(&replyID); err != nil {
+		t.Fatalf("read reply id: %v", err)
+	}
+	if err := f.db.QueryRow(`SELECT id FROM deliveries WHERE delivery_key LIKE 'interrupted:discord:msg:notice:%'`).Scan(&noticeID); err != nil {
+		t.Fatalf("read notice id: %v", err)
+	}
+	if replyID >= noticeID {
+		t.Errorf("delivery order reply=%d notice=%d, want live reply composed first", replyID, noticeID)
+	}
+}
+
 // TestProductionTurnComposeFailureParks: the turn ran but its reply
 // could not be composed into the outbox — completing anyway would be a
 // silent drop wearing a success stamp (completed events never dispatch

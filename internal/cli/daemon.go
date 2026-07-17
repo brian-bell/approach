@@ -323,7 +323,7 @@ func runDaemon(args []string, stdout, stderr io.Writer) (code int) {
 		// outbox (§4.6) — write-before-send holds the notice durably
 		// until the adapter is up.
 		OnPark: func(ctx context.Context, ev store.QueuedEvent) error {
-			if err := delivery.SurfaceInterrupted(ctx, db, ev); err != nil {
+			if err := delivery.SurfaceInterruptedCoordinated(ctx, db, ev, inFlight); err != nil {
 				return err
 			}
 			kickPump()

@@ -1,27 +1,93 @@
 package delivery
 
-import "sync"
+import (
+	"context"
+	"fmt"
+	"sync"
+)
 
-// InFlight is the live-send claim table: the delivery keys a turn's
-// relay currently owns, excluded from the pump's resend scan so a
-// ticker or kick pass cannot pick the same row up mid-send and deliver
-// it twice. At-least-once (§4.1) accepts duplicates across a CRASH —
-// it must not manufacture them between two goroutines of one living
-// daemon. In-memory on purpose: a claim's whole job is to fence the
-// pump off a send that is happening right now, and if the daemon dies
-// mid-claim the next life's pump re-sends from the durable row —
-// exactly the crash contract.
+// InFlight coordinates live delivery in two dimensions: delivery-key
+// claims exclude rows from the pump while a relay sends them, and
+// per-target gates serialize relay eligibility/composition with
+// recovery notices aimed at the same destination. At-least-once
+// (§4.1) accepts duplicates across a CRASH — it must not manufacture
+// them or reorder visible output between goroutines of one living
+// daemon. In-memory on purpose: both fences protect only concurrent
+// work in this process; the next life recovers from durable rows.
 //
 // A nil *InFlight holds nothing and never fails — callers without a
 // live-send path (tests, the restart-only resend) just pass nil.
 type InFlight struct {
-	mu   sync.Mutex
-	keys map[string]struct{}
+	mu      sync.Mutex
+	keys    map[string]struct{}
+	targets map[string]*targetGate
+}
+
+type targetGate struct {
+	token chan struct{}
+	refs  int
 }
 
 // NewInFlight builds an empty claim table.
 func NewInFlight() *InFlight {
-	return &InFlight{keys: make(map[string]struct{})}
+	return &InFlight{
+		keys:    make(map[string]struct{}),
+		targets: make(map[string]*targetGate),
+	}
+}
+
+// AcquireTarget serializes delivery composition for one destination.
+// A live relay holds this gate from its backlog check through durable
+// reply composition and the direct send; recovery/dead-letter notices
+// acquire the same gate before inserting. That closes the otherwise
+// unavoidable check-then-compose race where a newer visible partial
+// could jump a notice inserted during the engine turn (§4.1).
+//
+// Waiting honors ctx. The returned release is idempotent. A nil
+// *InFlight is an unlocked seam for tests and restart-only callers.
+func (f *InFlight) AcquireTarget(ctx context.Context, target string) (release func(), err error) {
+	if f == nil {
+		return func() {}, nil
+	}
+	if target == "" {
+		return nil, fmt.Errorf("delivery: acquire empty target")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	f.mu.Lock()
+	gate := f.targets[target]
+	if gate == nil {
+		gate = &targetGate{token: make(chan struct{}, 1)}
+		gate.token <- struct{}{}
+		f.targets[target] = gate
+	}
+	gate.refs++
+	f.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		f.releaseTargetRef(target, gate)
+		return nil, ctx.Err()
+	case <-gate.token:
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				gate.token <- struct{}{}
+				f.releaseTargetRef(target, gate)
+			})
+		}, nil
+	}
+}
+
+func (f *InFlight) releaseTargetRef(target string, gate *targetGate) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	gate.refs--
+	if gate.refs == 0 && f.targets[target] == gate {
+		delete(f.targets, target)
+	}
 }
 
 // Claim marks keys as owned by a live send. No-op on nil.

@@ -111,24 +111,43 @@ func productionTurn(d turnDeps) router.Handler {
 			return
 		}
 
-		// The relay is minted per turn and is pure UX until Finish. It is
-		// suppressed while this target has backlog: even a partial posted
-		// during the engine turn would expose this newer reply before the
-		// pump sends the older row, and a later best-effort retract cannot
-		// undo that observation (§4.1). A failed check fails toward the
-		// ordered pump. A missing adapter likewise costs only the typing
-		// indicator; the outbox still owns the durable reply.
+		// The relay is minted per turn and is pure UX until Finish. Its
+		// target gate serializes the eligibility check + engine + durable
+		// compose/send against EVERY recovery/dead-letter composer for the
+		// same destination. Without that reservation, a notice could land
+		// after this point but before our reply row, making an already-seen
+		// partial jump the now-older notice (§4.1). Existing backlog still
+		// suppresses the relay; a failed gate/check fails toward the ordered
+		// pump. A missing adapter costs only the typing indicator.
 		var relay turnRelay
+		var releaseTarget func()
+		releaseRelayTarget := func() {
+			if releaseTarget != nil {
+				releaseTarget()
+				releaseTarget = nil
+			}
+		}
+		defer releaseRelayTarget()
 		if d.relay != nil {
-			owed, err := store.HasOwedDeliveries(ctx, d.db, ev.ThreadKey)
+			var err error
+			releaseTarget, err = d.inflight.AcquireTarget(ctx, ev.ThreadKey)
 			if err != nil {
-				d.logger.Error("backlog check failed — suppressing live relay for ordered pump delivery",
+				d.logger.Error("target reservation failed — suppressing live relay for ordered pump delivery",
 					"dedup_key", ev.DedupKey, "error", err.Error())
-			} else if owed {
-				d.logger.Info("delivery backlog exists — suppressing live relay for order (§4.1)",
-					"dedup_key", ev.DedupKey)
 			} else {
-				relay = d.relay(ctx, ev.ThreadKey)
+				owed, oerr := store.HasOwedDeliveries(ctx, d.db, ev.ThreadKey)
+				if oerr != nil {
+					d.logger.Error("backlog check failed — suppressing live relay for ordered pump delivery",
+						"dedup_key", ev.DedupKey, "error", oerr.Error())
+				} else if owed {
+					d.logger.Info("delivery backlog exists — suppressing live relay for order (§4.1)",
+						"dedup_key", ev.DedupKey)
+				} else {
+					relay = d.relay(ctx, ev.ThreadKey)
+				}
+			}
+			if relay == nil {
+				releaseRelayTarget()
 			}
 		}
 
@@ -171,6 +190,10 @@ func productionTurn(d turnDeps) router.Handler {
 			if relay != nil {
 				relay.Cancel()
 			}
+			// Recovery may compose a notice to this same target. The
+			// live relay is over, so release before entering that shared
+			// composer path rather than self-deadlocking on the gate.
+			releaseRelayTarget()
 			// Shutdown is not this event's failure (router contract):
 			// the row stays 'processing' and the next boot parks it as
 			// interrupted (§4.6) — recovery under a dead context could
@@ -183,10 +206,11 @@ func productionTurn(d turnDeps) router.Handler {
 			d.logger.Error("engine turn failed — applying §4.6 recovery",
 				"thread_key", ev.ThreadKey, "dedup_key", ev.DedupKey, "error", err.Error())
 			opts := recovery.Options{
-				Logger: d.logger,
-				Now:    d.now,
-				After:  d.after,
-				Notify: d.notify,
+				Logger:   d.logger,
+				Now:      d.now,
+				After:    d.after,
+				Notify:   d.notify,
+				InFlight: d.inflight,
 			}
 			// A relay that already POSTED a partial message put this
 			// turn's side effect on the thread where everyone can see
@@ -213,7 +237,7 @@ func productionTurn(d turnDeps) router.Handler {
 			return
 		}
 
-		finishTurn(ctx, d, ev, reply.String(), relay)
+		finishTurn(ctx, d, ev, reply.String(), relay, releaseRelayTarget)
 	}
 }
 
@@ -227,7 +251,7 @@ func deadLetterMalformed(ctx context.Context, d turnDeps, ev store.QueuedEvent) 
 			"dedup_key", ev.DedupKey, "error", err.Error())
 		return
 	}
-	if err := delivery.SurfaceDeadLetter(ctx, d.db, ev); err != nil {
+	if err := delivery.SurfaceDeadLetterCoordinated(ctx, d.db, ev, d.inflight); err != nil {
 		d.logger.Error("dead-letter entry notice failed — the pump's sweep repairs it next pass (§4.6)",
 			"dedup_key", ev.DedupKey, "error", err.Error())
 		return
@@ -241,7 +265,7 @@ func deadLetterMalformed(ctx context.Context, d turnDeps, ev store.QueuedEvent) 
 // store write runs under WithoutCancel — the turn HAPPENED, and a
 // shutdown landing now must not lose its completion or its composed
 // reply (same rule as the session activation write).
-func finishTurn(ctx context.Context, d turnDeps, ev store.QueuedEvent, text string, relay turnRelay) {
+func finishTurn(ctx context.Context, d turnDeps, ev store.QueuedEvent, text string, relay turnRelay, releaseTarget func()) {
 	wctx := context.WithoutCancel(ctx)
 
 	if text == "" {
@@ -307,9 +331,13 @@ func finishTurn(ctx context.Context, d turnDeps, ev store.QueuedEvent, text stri
 		if relay != nil {
 			relay.Cancel()
 		}
+		// ParkAmbiguous surfaces to this same target through the shared
+		// composer gate. The live send is abandoned, so release before
+		// entering recovery rather than waiting on our own reservation.
+		releaseTarget()
 		release()
 		if _, perr := recovery.ParkAmbiguous(ctx, d.db, ev, recovery.Options{
-			Logger: d.logger, Now: d.now, After: d.after, Notify: d.notify,
+			Logger: d.logger, Now: d.now, After: d.after, Notify: d.notify, InFlight: d.inflight,
 		}, "turn ran but its reply could not be composed into the outbox (§4.6)"); perr != nil {
 			d.logger.Error("park failed — event stranded in processing until restart recovery (§4.6)",
 				"dedup_key", ev.DedupKey, "error", perr.Error())

@@ -24,6 +24,14 @@ import (
 // ERROR, not a skip: the caller logs loud and the pump's sweep retries
 // — a death notice with nowhere to go must never quietly evaporate.
 func SurfaceDeadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent) error {
+	return SurfaceDeadLetterCoordinated(ctx, db, ev, nil)
+}
+
+// SurfaceDeadLetterCoordinated is SurfaceDeadLetter under the same
+// per-target composition gate a live relay holds. Once its owner-DM
+// target is known, the notice waits until any live reply has composed
+// and sent, preserving durable and visible order (§4.1).
+func SurfaceDeadLetterCoordinated(ctx context.Context, db *sql.DB, ev store.QueuedEvent, claims *InFlight) error {
 	var nativeID string
 	err := db.QueryRowContext(ctx,
 		`SELECT native_id FROM identities
@@ -34,6 +42,11 @@ func SurfaceDeadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent) er
 		return fmt.Errorf("delivery: surface dead letter %s: no enrolled discord owner to notify (§4.6): %w", ev.DedupKey, err)
 	}
 	target := "discord:dm:" + nativeID
+	release, err := claims.AcquireTarget(ctx, target)
+	if err != nil {
+		return fmt.Errorf("delivery: surface dead letter %s: acquire target %s: %w", ev.DedupKey, target, err)
+	}
+	defer release()
 
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO deliveries (delivery_key, target, payload)
@@ -78,6 +91,14 @@ func SurfaceDeadLetter(ctx context.Context, db *sql.DB, ev store.QueuedEvent) er
 // already committed, and the pump's unsurfaced-park sweep repairs a
 // lost notice on its next pass.
 func SurfaceInterrupted(ctx context.Context, db *sql.DB, ev store.QueuedEvent) error {
+	return SurfaceInterruptedCoordinated(ctx, db, ev, nil)
+}
+
+// SurfaceInterruptedCoordinated is SurfaceInterrupted under the
+// shared per-target composition gate. It cannot insert a notice into
+// the middle of a live turn that has already been granted relay
+// eligibility (§4.1).
+func SurfaceInterruptedCoordinated(ctx context.Context, db *sql.DB, ev store.QueuedEvent, claims *InFlight) error {
 	payload := fmt.Sprintf(
 		"A turn on this thread was interrupted mid-run (event %s) — its side effects are unknown, so it was not re-run automatically. Reply with a retry request or run `approach retry %d` to re-queue it (§4.6).",
 		ev.DedupKey, ev.ID,
@@ -87,7 +108,12 @@ func SurfaceInterrupted(ctx context.Context, db *sql.DB, ev store.QueuedEvent) e
 	// back in received/processing when the notice's ack lands — a
 	// bound notice would roll its ack back and re-send on every pump
 	// pass. The episode key carries the correlation instead.
-	_, err := db.ExecContext(ctx,
+	release, err := claims.AcquireTarget(ctx, ev.ThreadKey)
+	if err != nil {
+		return fmt.Errorf("delivery: surface interrupted event %s: acquire target %s: %w", ev.DedupKey, ev.ThreadKey, err)
+	}
+	defer release()
+	_, err = db.ExecContext(ctx,
 		`INSERT INTO deliveries (delivery_key, target, payload)
 		 SELECT 'interrupted:' || e.dedup_key || ':' || e.parks, ?, ?
 		 FROM events e WHERE e.id = ? AND e.status = 'interrupted'
