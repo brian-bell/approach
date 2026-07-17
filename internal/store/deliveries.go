@@ -168,6 +168,26 @@ func OwedDeliveriesBefore(ctx context.Context, db *sql.DB, target string, before
 	return n, nil
 }
 
+// HasOwedDeliveries reports whether target already has backlog under
+// the resend-scan predicate (unacked, not failed). The live relay
+// checks this BEFORE an engine turn starts: once a partial is visible,
+// a later ordering check and best-effort retract cannot make an older
+// message appear first (§4.1).
+func HasOwedDeliveries(ctx context.Context, db *sql.DB, target string) (bool, error) {
+	var owed bool
+	err := db.QueryRowContext(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM deliveries
+			WHERE target = ? AND acked IS NULL AND status <> 'failed'
+		)`,
+		target,
+	).Scan(&owed)
+	if err != nil {
+		return false, fmt.Errorf("store: check owed deliveries for %s: %w", target, err)
+	}
+	return owed, nil
+}
+
 // ResendableDelivery is one row of the §4.6 restart resend scan:
 // everything a re-send needs, read in one query. EventID is 0 when the
 // row has no originating event (§4.2 notifies); Attempts rides along

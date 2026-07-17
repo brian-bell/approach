@@ -458,9 +458,9 @@ func TestProductionTurnMalformedPayloadDeadLetters(t *testing.T) {
 
 // TestProductionTurnDefersToPumpWhenOlderRowOwed: an OLDER delivery is
 // still owed to this thread (a prior turn's unsent reply, a park
-// notice) — a direct relay send would jump the queue and deliver this
-// thread's messages out of order (§4.1). The reply composes durably
-// but sending defers to the pump, which drains in compose order.
+// notice) — even a live partial would jump the queue and become
+// visible out of order (§4.1). The relay therefore stays disabled for
+// the whole turn; the reply composes durably for the ordered pump.
 func TestProductionTurnDefersToPumpWhenOlderRowOwed(t *testing.T) {
 	runner := &fakeTurnRunner{deltas: []string{"hello"}}
 	relay := &fakeTurnRelay{acks: []string{"discord:msg:900"}}
@@ -473,8 +473,9 @@ func TestProductionTurnDefersToPumpWhenOlderRowOwed(t *testing.T) {
 
 	productionTurn(f.deps)(context.Background(), f.ev)
 
-	if relay.finished || !relay.retracted {
-		t.Errorf("relay finished=%v retracted=%v — the pump re-sends this text, so the partial must come down", relay.finished, relay.retracted)
+	if len(relay.pushes) != 0 || relay.finished || relay.retracted {
+		t.Errorf("relay pushes=%q finished=%v retracted=%v — backlog must suppress live output before it becomes visible",
+			relay.pushes, relay.finished, relay.retracted)
 	}
 	rows := deliveryRows(t, f.db, f.ev.ID)
 	if len(rows) != 1 || rows[0].Acked || rows[0].Att != 0 {
@@ -510,8 +511,8 @@ func TestProductionTurnComposeFailureParks(t *testing.T) {
 	if len(f.readmit) != 0 {
 		t.Errorf("readmitted %+v — a parked event must never auto-retry", f.readmit)
 	}
-	if relay.finished || !relay.cancelled {
-		t.Errorf("relay finished=%v cancelled=%v, want cancelled only", relay.finished, relay.cancelled)
+	if len(relay.pushes) != 0 || relay.finished || relay.cancelled || relay.retracted {
+		t.Errorf("relay changed after backlog check failed: %+v — failure must suppress live output", relay)
 	}
 }
 
@@ -667,9 +668,9 @@ func (h *hookedRelay) Finish() ([]string, error) {
 }
 
 // TestProductionTurnDuplicateComposeDefersToPump: a prior life already
-// composed this reply (crash between compose and completion) — the
-// first write wins, nothing re-sends directly, and the pump owns
-// whatever is still owed.
+// composed this reply (crash between compose and completion) — that
+// owed row suppresses the relay before the turn, the first write wins,
+// and the pump owns whatever is still owed.
 func TestProductionTurnDuplicateComposeDefersToPump(t *testing.T) {
 	runner := &fakeTurnRunner{deltas: []string{"hello"}}
 	relay := &fakeTurnRelay{acks: []string{"discord:msg:900"}}
@@ -692,8 +693,8 @@ func TestProductionTurnDuplicateComposeDefersToPump(t *testing.T) {
 	if rows[0].Acked {
 		t.Error("row acked without a send — the pump owns it")
 	}
-	if relay.finished || !relay.retracted {
-		t.Errorf("relay finished=%v retracted=%v, want retracted — the pump owns this reply, a standing partial would duplicate it", relay.finished, relay.retracted)
+	if len(relay.pushes) != 0 || relay.finished || relay.cancelled || relay.retracted {
+		t.Errorf("relay changed despite pre-existing owed reply: %+v — backlog must suppress it before output", relay)
 	}
 	if got := eventStatus(t, f.db, f.ev.ID); got != "completed" {
 		t.Errorf("event status = %q, want completed", got)

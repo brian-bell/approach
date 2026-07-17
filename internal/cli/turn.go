@@ -111,12 +111,25 @@ func productionTurn(d turnDeps) router.Handler {
 			return
 		}
 
-		// The relay is minted per turn and is pure UX until Finish: a
-		// missing adapter (still booting, or none configured) costs the
-		// typing indicator, never the reply — the outbox owns that.
+		// The relay is minted per turn and is pure UX until Finish. It is
+		// suppressed while this target has backlog: even a partial posted
+		// during the engine turn would expose this newer reply before the
+		// pump sends the older row, and a later best-effort retract cannot
+		// undo that observation (§4.1). A failed check fails toward the
+		// ordered pump. A missing adapter likewise costs only the typing
+		// indicator; the outbox still owns the durable reply.
 		var relay turnRelay
 		if d.relay != nil {
-			relay = d.relay(ctx, ev.ThreadKey)
+			owed, err := store.HasOwedDeliveries(ctx, d.db, ev.ThreadKey)
+			if err != nil {
+				d.logger.Error("backlog check failed — suppressing live relay for ordered pump delivery",
+					"dedup_key", ev.DedupKey, "error", err.Error())
+			} else if owed {
+				d.logger.Info("delivery backlog exists — suppressing live relay for order (§4.1)",
+					"dedup_key", ev.DedupKey)
+			} else {
+				relay = d.relay(ctx, ev.ThreadKey)
+			}
 		}
 
 		// The reply accumulates handler-side while the same deltas
